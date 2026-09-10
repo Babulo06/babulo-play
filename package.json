@@ -23,7 +23,6 @@
     "typecheck:web": "npm --workspace apps/web run typecheck",
     "start:api": "npm --workspace apps/api run start",
     "start:web": "npm --workspace apps/web run start",
-    "install": "npm install"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"
