@@ -1,0 +1,31 @@
+{
+  "name": "babulo-play",
+  "version": "0.10.0",
+  "private": true,
+  "description": "BaBuLo Play monorepo — streaming, distribuição e promoção musical",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=20 <23",
+    "npm": ">=10"
+  },
+  "scripts": {
+    "dev": "concurrently \"npm:dev:web\" \"npm:dev:api\"",
+    "dev:web": "npm --workspace apps/web run dev",
+    "dev:api": "npm --workspace apps/api run dev",
+    "build": "npm run build:api && npm run build:web",
+    "build:api": "npm --workspace apps/api run build",
+    "build:web": "npm --workspace apps/web run build",
+    "typecheck": "npm run typecheck:api && npm run typecheck:web",
+    "typecheck:api": "npm --workspace apps/api run typecheck",
+    "typecheck:web": "npm --workspace apps/web run typecheck",
+    "start:api": "npm --workspace apps/api run start",
+    "start:web": "npm --workspace apps/web run start",
+    "install": "npm install"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

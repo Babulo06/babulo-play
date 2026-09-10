@@ -1,0 +1,50 @@
+services:
+  - type: web
+    name: babulo-play-api
+    runtime: node
+    rootDir: .
+    buildCommand: npm install && npm run build:api
+    startCommand: npm --workspace apps/api run start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 22.0.0
+      - key: PORT
+        value: 4000
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: babulo-play-db
+          property: connectionString
+      - key: WEB_ORIGIN
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: PAYMENT_WEBHOOK_SECRET
+        generateValue: true
+      - key: PAYMENT_DEMO_MODE
+        value: "false"
+      - key: UPLOAD_DIR
+        value: ./storage
+
+  - type: web
+    name: babulo-play-web
+    runtime: node
+    rootDir: .
+    buildCommand: npm install && npm run build:web
+    startCommand: npm --workspace apps/web run start
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 22.0.0
+      - key: NODE_ENV
+        value: production
+      - key: NEXT_PUBLIC_API_URL
+        sync: false
+
+databases:
+  - name: babulo-play-db
+    databaseName: babulo_play
+    user: babulo
