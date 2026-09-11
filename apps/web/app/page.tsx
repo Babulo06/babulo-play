@@ -7,7 +7,7 @@ const API=process.env.NEXT_PUBLIC_API_URL||'http://localhost:4000';
 const img={logo:'/media/babulo-play-logo.jpg',cover:'/media/amanha-de-manha.jpeg',face:'/media/young-black-baby-portrait.jpeg',main:'/media/young-black-baby-main.jpg',live:'/media/young-black-baby-live.jpeg'};
 const demoTracks:Track[]=[
  {id:'1',title:'Amanhã De Manhã',artist:'Young Black Baby',genre:'Rap / Hip-Hop',coverUrl:img.cover,audioUrl:'/media/amanha-de-manha.mp3'},
- {id:'2',title:'Ao Vivo',artist:'Young Black Baby',genre:'Performance',coverUrl:img.live,audioUrl:'/media/amanha-de-manha.mp3'},
+ {id:'2',title:'Ao Vivo',artist:'Young Black Baby',genre:'Performance',coverUrl:img.live},
  {id:'3',title:'Amanhã De Manhã — Remix',artist:'Young Black Baby',genre:'Afro Rap',coverUrl:img.cover},
  {id:'4',title:'Young Black Baby',artist:'Young Black Baby',genre:'Artista em destaque',coverUrl:img.face},
 ];
@@ -23,27 +23,32 @@ const [duration,setDuration]=useState(0);
 const [audioError,setAudioError]=useState('');
  const [volume,setVolume]=useState(1);
  
- useEffect(()=>{
-  if(audioRef.current){
-    audioRef.current.volume=volume;
-  }
-},[volume]);
- const [releaseOpen,setReleaseOpen]=useState(false),[releases,setReleases]=useState<Release[]>([]),[releaseMsg,setReleaseMsg]=useState(''); const [distOpen,setDistOpen]=useState(false);
- useEffect(()=>{fetch(`${API}/api/tracks`).then(r=>r.json()).then(d=>{if(d.tracks?.length)setTracks(d.tracks.map((t:Track)=>t.title==='Amanhã De Manhã'?{...t,audioUrl:t.audioUrl||'/media/amanha-de-manha.mp3'}:t))}).catch(()=>{}); const t=localStorage.getItem('babulo_token'); if(t){setToken(t);fetch(`${API}/api/auth/me`,{headers:{Authorization:`Bearer ${t}`}}).then(r=>r.ok?r.json():null).then(setMe).catch(()=>{});}},[]);
 useEffect(()=>{
-  if(!audioRef.current || !current?.audioUrl)return;
-
   const audio=audioRef.current;
 
-  audio.pause();
-  audio.src=current.audioUrl;
-  audio.currentTime=0;
-  audio.load();
+  if(!audio)return;
 
+  // Para sempre a música anterior
+  audio.pause();
+
+  setPlaying(false);
   setCurrentTime(0);
   setDuration(0);
   setAudioError('');
 
+  // Se a nova faixa não tiver áudio, limpa o player
+  if(!current?.audioUrl){
+    audio.removeAttribute('src');
+    audio.load();
+    return;
+  }
+
+  // Carrega a nova faixa
+  audio.src=current.audioUrl;
+  audio.currentTime=0;
+  audio.load();
+
+  // Reproduz automaticamente
   audio.play()
     .then(()=>{
       setPlaying(true);
@@ -52,6 +57,7 @@ useEffect(()=>{
       setPlaying(false);
       setAudioError('Clique em ▶ para reproduzir.');
     });
+
 },[current]);
  
  const filtered=useMemo(()=>tracks.filter(t=>`${t.title} ${t.artist} ${t.genre}`.toLowerCase().includes(query.toLowerCase())),[tracks,query]);
@@ -73,29 +79,27 @@ useEffect(()=>{
   }
 }
 
- function previousTrack(){
-  if(!current || tracks.length === 0)return;
+function previousTrack(){
+  if(!current || tracks.length===0)return;
 
-  const index = tracks.findIndex(t => t.id === current.id);
+  const index=tracks.findIndex(t=>t.id===current.id);
 
   for(let i=index-1;i>=0;i--){
     if(tracks[i].audioUrl){
       setCurrent(tracks[i]);
-      setPlaying(true);
       return;
     }
   }
 }
 
 function nextTrack(){
-  if(!current || tracks.length === 0)return;
+  if(!current || tracks.length===0)return;
 
-  const index = tracks.findIndex(t => t.id === current.id);
+  const index=tracks.findIndex(t=>t.id===current.id);
 
   for(let i=index+1;i<tracks.length;i++){
     if(tracks[i].audioUrl){
       setCurrent(tracks[i]);
-      setPlaying(true);
       return;
     }
   }
@@ -133,9 +137,9 @@ function formatTime(value:number){
     <small>{current.artist}</small>
   </div>
 
-  <button
+<button
   onClick={previousTrack}
-  disabled={!current.audioUrl}
+  disabled={!current || tracks.findIndex(t=>t.id===current.id)<=0}
   title="Música anterior"
 >
   ⏮
@@ -151,7 +155,7 @@ function formatTime(value:number){
 
 <button
   onClick={nextTrack}
-  disabled={!current.audioUrl}
+  disabled={!current || tracks.findIndex(t=>t.id===current.id)>=tracks.length-1}
   title="Próxima música"
 >
   ⏭
