@@ -7,7 +7,7 @@ const API=process.env.NEXT_PUBLIC_API_URL||'http://localhost:4000';
 const img={logo:'/media/babulo-play-logo.jpg',cover:'/media/amanha-de-manha.jpeg',face:'/media/young-black-baby-portrait.jpeg',main:'/media/young-black-baby-main.jpg',live:'/media/young-black-baby-live.jpeg'};
 const demoTracks:Track[]=[
  {id:'1',title:'Amanhã De Manhã',artist:'Young Black Baby',genre:'Rap / Hip-Hop',coverUrl:img.cover,audioUrl:'/media/amanha-de-manha.mp3'},
- {id:'2',title:'Ao Vivo',artist:'Young Black Baby',genre:'Performance',coverUrl:img.live},
+ {id:'2',title:'Café',artist:'Young Black Baby',genre:'Rap / Hip-Hop',coverUrl:img.live,audioUrl:'/media/cafe.mp3'},
  {id:'3',title:'Amanhã De Manhã — Remix',artist:'Young Black Baby',genre:'Afro Rap',coverUrl:img.cover},
  {id:'4',title:'Young Black Baby',artist:'Young Black Baby',genre:'Artista em destaque',coverUrl:img.face},
 ];
