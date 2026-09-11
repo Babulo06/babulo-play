@@ -60,6 +60,28 @@ const [audioError,setAudioError]=useState('');
   }
 }
 
+ function previousTrack(){
+  if(!current || tracks.length === 0) return;
+
+  const index = tracks.findIndex(t => t.id === current.id);
+
+  if(index > 0){
+    setCurrent(tracks[index - 1]);
+    setPlaying(true);
+  }
+}
+
+function nextTrack(){
+  if(!current || tracks.length === 0) return;
+
+  const index = tracks.findIndex(t => t.id === current.id);
+
+  if(index < tracks.length - 1){
+    setCurrent(tracks[index + 1]);
+    setPlaying(true);
+  }
+}
+ 
 function formatTime(value:number){
   if(!Number.isFinite(value))return '0:00';
   const minutes=Math.floor(value/60);
@@ -85,10 +107,30 @@ function formatTime(value:number){
     <small>{current.artist}</small>
   </div>
 
-  <button onClick={togglePlay} disabled={!current.audioUrl}>
-    {playing?'Ⅱ':'▶'}
-  </button>
+  <button
+  onClick={previousTrack}
+  disabled={!current.audioUrl}
+  title="Música anterior"
+>
+  ⏮
+</button>
 
+<button
+  onClick={togglePlay}
+  disabled={!current.audioUrl}
+  title={playing ? 'Pausar' : 'Reproduzir'}
+>
+  {playing ? 'Ⅱ' : '▶'}
+</button>
+
+<button
+  onClick={nextTrack}
+  disabled={!current.audioUrl}
+  title="Próxima música"
+>
+  ⏭
+</button>
+    
   <div className="progress">
     <span style={{width:duration?`${(currentTime/duration)*100}%`:'0%'}}/>
   </div>
