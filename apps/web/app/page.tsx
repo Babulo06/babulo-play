@@ -22,7 +22,7 @@ const [currentTime,setCurrentTime]=useState(0);
 const [duration,setDuration]=useState(0);
 const [audioError,setAudioError]=useState('');
  const [releaseOpen,setReleaseOpen]=useState(false),[releases,setReleases]=useState<Release[]>([]),[releaseMsg,setReleaseMsg]=useState(''); const [distOpen,setDistOpen]=useState(false);
- useEffect(()=>{fetch(`${API}/api/tracks`).then(r=>r.json()).then(d=>{if(d.tracks?.length)setTracks(d.tracks)}).catch(()=>{}); const t=localStorage.getItem('babulo_token'); if(t){setToken(t);fetch(`${API}/api/auth/me`,{headers:{Authorization:`Bearer ${t}`}}).then(r=>r.ok?r.json():null).then(setMe).catch(()=>{});}},[]);
+ useEffect(()=>{fetch(`${API}/api/tracks`).then(r=>r.json()).then(d=>{if(d.tracks?.length)setTracks(d.tracks.map((t:Track)=>t.title==='Amanhã De Manhã'?{...t,audioUrl:t.audioUrl||'/media/amanha-de-manha.mp3'}:t)))}).catch(()=>{}); const t=localStorage.getItem('babulo_token'); if(t){setToken(t);fetch(`${API}/api/auth/me`,{headers:{Authorization:`Bearer ${t}`}}).then(r=>r.ok?r.json():null).then(setMe).catch(()=>{});}},[]);
  useEffect(()=>{
   if(!audioRef.current||!current?.audioUrl)return;
 
@@ -129,17 +129,9 @@ function SectionTitle({title,link}:{title:string;link?:string}){return <div clas
 function ReleaseWizard({token,onClose,onDone}:{token:string;onClose:()=>void;onDone:()=>void}){
  const [step,setStep]=useState(1); const [releaseId,setReleaseId]=useState<string|null>(null); const [preflight,setPreflight]=useState<any>(null),[msg,setMsg]=useState(''),[busy,setBusy]=useState(false),[genres,setGenres]=useState<any[]>([]);
  const [form,setForm]=useState({title:'',type:'SINGLE',genreId:'',language:'Português',country:'Angola',releaseDate:'',preReleaseDate:'',coverUrl:'',description:'',upc:'',ean:'',labelName:'',phonographicCopyright:'',copyrightText:'',trackTitle:'',trackVersion:'',trackLanguage:'Português',trackGenreId:'',isExplicit:false,explicitReason:'',isrc:'',composer:'',lyricist:'',producer:'',performer:'',publisher:'',audioUrl:'',audioName:'',coverName:'',rightsHolder:'',rightsRole:'RIGHTS_HOLDER',rightsType:'STREAMING',rightsPercentage:'100',rightsTerritory:'WORLDWIDE'});
- useEffect(()=>{fetch(`${API}/api/genres`).then(r=>r.json()).then(d=>setGenres(d.genres||[])).catch(()=>{})},[]);useEffect(()=>{
-  if(!audioRef.current||!current?.audioUrl)return;
-
-  audioRef.current.src=current.audioUrl;
-  audioRef.current.currentTime=0;
-
-  audioRef.current.play()
-    .then(()=>setPlaying(true))
-    .catch(()=>setAudioError('Clique novamente em ▶ para iniciar.'));
-},[current]);
- const set=(k:string,v:any)=>setForm(f=>({...f,[k]:v}));
+ useEffect(()=>{fetch(`${API}/api/genres`).then(r=>r.json()).then(d=>setGenres(d.genres||[])).catch(()=>{})},[])
+  
+  const set=(k:string,v:any)=>setForm(f=>({...f,[k]:v}));
  async function upload(file:File,kind:'audio'|'cover'){const fd=new FormData();fd.append('file',file);fd.append('kind',kind);const r=await fetch(API+'/api/uploads',{method:'POST',headers:{Authorization:`Bearer ${token}`},body:fd});const d=await r.json();if(!r.ok)throw Error(d.error||'Falha no upload');return d.file.url as string}
  function next(){setMsg('');if(step===1&&!form.title.trim())return setMsg('Informe o título do lançamento.');if(step===2&&!form.trackTitle.trim())return setMsg('Informe o título da faixa principal.');if(step===2&&!form.rightsHolder.trim())return setMsg('Informe o titular dos direitos da faixa.');if(step===2&&(Number(form.rightsPercentage)!==100))return setMsg('Para esta primeira declaração, a participação deve totalizar 100%.');setStep(s=>Math.min(4,s+1))}
  async function finish(){setBusy(true);setMsg('');try{let releaseCover=form.coverUrl||null;let audio=form.audioUrl||null;const body={...form,coverUrl:releaseCover};delete (body as any).audioName;delete (body as any).coverName;const rr=await fetch(API+'/api/releases',{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(body)});const rd=await rr.json();if(!rr.ok)throw Error(rd.error||'Não foi possível criar o lançamento');const tr=await fetch(API+'/api/tracks',{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({title:form.trackTitle,releaseId:rd.release.id,genreId:form.trackGenreId||form.genreId,language:form.trackLanguage,version:form.trackVersion,durationMs:null,isExplicit:form.isExplicit,isrc:form.isrc,originalReleaseDate:form.releaseDate,fileUrl:audio,fileType:'AUDIO',composer:form.composer,lyricist:form.lyricist,producer:form.producer,performer:form.performer,publisher:form.publisher,explicitReason:form.explicitReason})});const td=await tr.json();if(!tr.ok)throw Error(td.error||'Lançamento criado, mas a faixa não pôde ser guardada');
