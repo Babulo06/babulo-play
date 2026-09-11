@@ -19,6 +19,14 @@ app.use(cors({ origin: process.env.WEB_ORIGIN || 'http://localhost:3000' }));
 app.use(express.json({ limit: '2mb' }));
 app.use('/media', express.static(uploadDir));
 
+app.get('/', (_req, res) => {
+  res.json({
+    name: 'BaBuLo Play API',
+    status: 'online',
+    version: '0.10.1'
+  });
+});
+
 function hashPassword(password: string) {
   const salt = crypto.randomBytes(16).toString('hex');
   const derived = crypto.scryptSync(password, salt, 64).toString('hex');
