@@ -22,6 +22,12 @@ const [currentTime,setCurrentTime]=useState(0);
 const [duration,setDuration]=useState(0);
 const [audioError,setAudioError]=useState('');
  const [volume,setVolume]=useState(1);
+ 
+ useEffect(()=>{
+  if(audioRef.current){
+    audioRef.current.volume=volume;
+  }
+},[volume]);
  const [releaseOpen,setReleaseOpen]=useState(false),[releases,setReleases]=useState<Release[]>([]),[releaseMsg,setReleaseMsg]=useState(''); const [distOpen,setDistOpen]=useState(false);
  useEffect(()=>{fetch(`${API}/api/tracks`).then(r=>r.json()).then(d=>{if(d.tracks?.length)setTracks(d.tracks.map((t:Track)=>t.title==='Amanhã De Manhã'?{...t,audioUrl:t.audioUrl||'/media/amanha-de-manha.mp3'}:t))}).catch(()=>{}); const t=localStorage.getItem('babulo_token'); if(t){setToken(t);fetch(`${API}/api/auth/me`,{headers:{Authorization:`Bearer ${t}`}}).then(r=>r.ok?r.json():null).then(setMe).catch(()=>{});}},[]);
  useEffect(()=>{
@@ -114,7 +120,6 @@ function formatTime(value:number){
   <audio
   ref={audioRef}
   preload="metadata"
-   volume={volume}
   onLoadedMetadata={e=>setDuration(e.currentTarget.duration)}
   onTimeUpdate={e=>setCurrentTime(e.currentTarget.currentTime)}
   onPlay={()=>setPlaying(true)}
