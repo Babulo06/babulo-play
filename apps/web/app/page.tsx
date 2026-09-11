@@ -21,6 +21,7 @@ export default function Home(){
 const [currentTime,setCurrentTime]=useState(0);
 const [duration,setDuration]=useState(0);
 const [audioError,setAudioError]=useState('');
+ const [volume,setVolume]=useState(1);
  const [releaseOpen,setReleaseOpen]=useState(false),[releases,setReleases]=useState<Release[]>([]),[releaseMsg,setReleaseMsg]=useState(''); const [distOpen,setDistOpen]=useState(false);
  useEffect(()=>{fetch(`${API}/api/tracks`).then(r=>r.json()).then(d=>{if(d.tracks?.length)setTracks(d.tracks.map((t:Track)=>t.title==='Amanhã De Manhã'?{...t,audioUrl:t.audioUrl||'/media/amanha-de-manha.mp3'}:t))}).catch(()=>{}); const t=localStorage.getItem('babulo_token'); if(t){setToken(t);fetch(`${API}/api/auth/me`,{headers:{Authorization:`Bearer ${t}`}}).then(r=>r.ok?r.json():null).then(setMe).catch(()=>{});}},[]);
  useEffect(()=>{
@@ -88,7 +89,20 @@ function formatTime(value:number){
 
   <small>{formatTime(currentTime)} / {formatTime(duration)}</small>
 
-  <button>↗</button>
+  <div className="volumeControl">
+  <button onClick={()=>setVolume(v=>Math.max(0,v-0.1))}>−</button>
+
+  <input
+    type="range"
+    min="0"
+    max="1"
+    step="0.05"
+    value={volume}
+    onChange={e=>setVolume(Number(e.target.value))}
+  />
+
+  <button onClick={()=>setVolume(v=>Math.min(1,v+0.1))}>+</button>
+</div>
 
   <button onClick={()=>{
     if(audioRef.current) audioRef.current.pause();
@@ -100,6 +114,7 @@ function formatTime(value:number){
   <audio
   ref={audioRef}
   preload="metadata"
+   volume={volume}
   onLoadedMetadata={e=>setDuration(e.currentTarget.duration)}
   onTimeUpdate={e=>setCurrentTime(e.currentTarget.currentTime)}
   onPlay={()=>setPlaying(true)}
