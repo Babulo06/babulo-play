@@ -107,6 +107,13 @@ function formatTime(value:number){
   const seconds=Math.floor(value%60).toString().padStart(2,'0');
   return `${minutes}:${seconds}`;
 }
+ function seek(value:number){
+  if(!audioRef.current)return;
+
+  audioRef.current.currentTime=value;
+  setCurrentTime(value);
+}
+ 
  async function submitAuth(e:React.FormEvent){e.preventDefault();setAuthMsg(''); const url=authMode==='login'?'/api/auth/login':'/api/auth/register'; const body=authMode==='login'?{email,password}:{email,password,role:accountRole,stageName:accountRole==='ARTIST'?stageName:undefined}; try{const r=await fetch(API+url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw Error(d.error||'Não foi possível continuar');localStorage.setItem('babulo_token',d.token);setToken(d.token);const mr=await fetch(API+'/api/auth/me',{headers:{Authorization:`Bearer ${d.token}`}});setMe(mr.ok?await mr.json():d);setAuthOpen(false);setAuthMsg('');}catch(err:any){setAuthMsg(err.message)}}
  function logout(){localStorage.removeItem('babulo_token');setToken(null);setMe(null);setDashboard(false);setReleases([])}
  async function loadReleases(){if(!token)return;const r=await fetch(API+'/api/artists/me/releases',{headers:{Authorization:`Bearer ${token}`}});const d=await r.json();if(r.ok)setReleases(d.releases||[])}
@@ -150,12 +157,17 @@ function formatTime(value:number){
   ⏭
 </button>
     
-  <div className="progress">
-    <span style={{width:duration?`${(currentTime/duration)*100}%`:'0%'}}/>
-  </div>
-
+  <input
+  className="progress"
+  type="range"
+  min="0"
+  max={duration || 0}
+  step="0.1"
+  value={currentTime}
+  onChange={(e)=>seek(Number(e.target.value))}
+  disabled={!duration}
+/>
   <small>{formatTime(currentTime)} / {formatTime(duration)}</small>
-
   <div className="volumeControl">
   <button onClick={()=>setVolume(v=>Math.max(0,v-0.1))}>−</button>
 
