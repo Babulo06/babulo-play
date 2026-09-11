@@ -7,16 +7,16 @@
     "start": "next start",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
-    "next": "^15.5.0",
-    "react": "^19.1.1",
-    "react-dom": "^19.1.1"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.2",
-    "@types/node": "^24.3.0",
-    "@types/react": "^19.1.10",
-    "@types/react-dom": "^19.1.7"
+"dependencies": {
+  "next": "^15.5.0",
+  "react": "^19.1.1",
+  "react-dom": "^19.1.1",
+  "typescript": "^5.9.2",
+  "@types/node": "^24.3.0",
+  "@types/react": "^19.1.10",
+  "@types/react-dom": "^19.1.7"
+},
+"devDependencies": {}
   },
   "version": "0.10.1"
 }
