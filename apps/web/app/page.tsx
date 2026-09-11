@@ -7,7 +7,7 @@ const API=process.env.NEXT_PUBLIC_API_URL||'http://localhost:4000';
 const img={logo:'/media/babulo-play-logo.jpg',cover:'/media/amanha-de-manha.jpeg',face:'/media/young-black-baby-portrait.jpeg',main:'/media/young-black-baby-main.jpg',live:'/media/young-black-baby-live.jpeg'};
 const demoTracks:Track[]=[
  {id:'1',title:'Amanhã De Manhã',artist:'Young Black Baby',genre:'Rap / Hip-Hop',coverUrl:img.cover,audioUrl:'/media/amanha-de-manha.mp3'},
- {id:'2',title:'Ao Vivo',artist:'Young Black Baby',genre:'Performance',coverUrl:img.live},
+ {id:'2',title:'Ao Vivo',artist:'Young Black Baby',genre:'Performance',coverUrl:img.live,audioUrl:'/media/amanha-de-manha.mp3'},
  {id:'3',title:'Amanhã De Manhã — Remix',artist:'Young Black Baby',genre:'Afro Rap',coverUrl:img.cover},
  {id:'4',title:'Young Black Baby',artist:'Young Black Baby',genre:'Artista em destaque',coverUrl:img.face},
 ];
@@ -30,15 +30,28 @@ const [audioError,setAudioError]=useState('');
 },[volume]);
  const [releaseOpen,setReleaseOpen]=useState(false),[releases,setReleases]=useState<Release[]>([]),[releaseMsg,setReleaseMsg]=useState(''); const [distOpen,setDistOpen]=useState(false);
  useEffect(()=>{fetch(`${API}/api/tracks`).then(r=>r.json()).then(d=>{if(d.tracks?.length)setTracks(d.tracks.map((t:Track)=>t.title==='Amanhã De Manhã'?{...t,audioUrl:t.audioUrl||'/media/amanha-de-manha.mp3'}:t))}).catch(()=>{}); const t=localStorage.getItem('babulo_token'); if(t){setToken(t);fetch(`${API}/api/auth/me`,{headers:{Authorization:`Bearer ${t}`}}).then(r=>r.ok?r.json():null).then(setMe).catch(()=>{});}},[]);
- useEffect(()=>{
-  if(!audioRef.current||!current?.audioUrl)return;
+useEffect(()=>{
+  if(!audioRef.current || !current?.audioUrl)return;
 
-  audioRef.current.src=current.audioUrl;
-  audioRef.current.currentTime=0;
+  const audio=audioRef.current;
 
-  audioRef.current.play()
-    .then(()=>setPlaying(true))
-    .catch(()=>setAudioError('Clique novamente em ▶ para iniciar.'));
+  audio.pause();
+  audio.src=current.audioUrl;
+  audio.currentTime=0;
+  audio.load();
+
+  setCurrentTime(0);
+  setDuration(0);
+  setAudioError('');
+
+  audio.play()
+    .then(()=>{
+      setPlaying(true);
+    })
+    .catch(()=>{
+      setPlaying(false);
+      setAudioError('Clique em ▶ para reproduzir.');
+    });
 },[current]);
  
  const filtered=useMemo(()=>tracks.filter(t=>`${t.title} ${t.artist} ${t.genre}`.toLowerCase().includes(query.toLowerCase())),[tracks,query]);
@@ -61,24 +74,30 @@ const [audioError,setAudioError]=useState('');
 }
 
  function previousTrack(){
-  if(!current || tracks.length === 0) return;
+  if(!current || tracks.length === 0)return;
 
   const index = tracks.findIndex(t => t.id === current.id);
 
-  if(index > 0){
-    setCurrent(tracks[index - 1]);
-    setPlaying(true);
+  for(let i=index-1;i>=0;i--){
+    if(tracks[i].audioUrl){
+      setCurrent(tracks[i]);
+      setPlaying(true);
+      return;
+    }
   }
 }
 
 function nextTrack(){
-  if(!current || tracks.length === 0) return;
+  if(!current || tracks.length === 0)return;
 
   const index = tracks.findIndex(t => t.id === current.id);
 
-  if(index < tracks.length - 1){
-    setCurrent(tracks[index + 1]);
-    setPlaying(true);
+  for(let i=index+1;i<tracks.length;i++){
+    if(tracks[i].audioUrl){
+      setCurrent(tracks[i]);
+      setPlaying(true);
+      return;
+    }
   }
 }
  
