@@ -214,9 +214,20 @@ function formatTime(value:number){
   onPlay={()=>setPlaying(true)}
   onPause={()=>setPlaying(false)}
   onEnded={()=>{
-    setPlaying(false);
-    setCurrentTime(0);
-  }}
+  setPlaying(false);
+  setCurrentTime(0);
+
+  if(!current || tracks.length===0)return;
+
+  const index=tracks.findIndex(t=>t.id===current.id);
+
+  for(let i=index+1;i<tracks.length;i++){
+    if(tracks[i].audioUrl){
+      setCurrent(tracks[i]);
+      return;
+    }
+  }
+}}
   onError={()=>setAudioError('Não foi possível carregar o áudio.')}
 />
   
