@@ -29,6 +29,12 @@ const [duration,setDuration]=useState(0);
 const [audioError,setAudioError]=useState('');
  const [volume,setVolume]=useState(1);
  
+ useEffect(()=>{
+  if(audioRef.current){
+    audioRef.current.volume=volume;
+  }
+},[volume]);
+ 
 useEffect(()=>{
   const audio=audioRef.current;
 
