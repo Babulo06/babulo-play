@@ -17,6 +17,12 @@ export default function Home(){
  const [tracks,setTracks]=useState<Track[]>(demoTracks),[current,setCurrent]=useState<Track|null>(null),[query,setQuery]=useState(''),[playing,setPlaying]=useState(false),[menu,setMenu]=useState('Início');
  const [authOpen,setAuthOpen]=useState(false),[authMode,setAuthMode]=useState<'login'|'register'>('login'),[email,setEmail]=useState(''),[password,setPassword]=useState(''),[stageName,setStageName]=useState(''),[accountRole,setAccountRole]=useState<'LISTENER'|'ARTIST'>('LISTENER'),[authMsg,setAuthMsg]=useState('');
  const [token,setToken]=useState<string|null>(null),[me,setMe]=useState<any>(null),[dashboard,setDashboard]=useState(false);
+ 
+ const [releases,setReleases]=useState<Release[]>([]);
+const [releaseOpen,setReleaseOpen]=useState(false);
+const [releaseMsg,setReleaseMsg]=useState('');
+const [distOpen,setDistOpen]=useState(false);
+ 
  const audioRef=useRef<HTMLAudioElement|null>(null);
 const [currentTime,setCurrentTime]=useState(0);
 const [duration,setDuration]=useState(0);
