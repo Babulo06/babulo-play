@@ -1,12 +1,12 @@
 'use client';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
-type Track={id:string;title:string;artist:string;genre:string;coverUrl:string|null};
+type Track={id:string;title:string;artist:string;genre:string;coverUrl:string|null;audioUrl?:string};
 type Release={id:string;title:string;type:string;cover_url?:string|null;status?:string};
 const API=process.env.NEXT_PUBLIC_API_URL||'http://localhost:4000';
 const img={logo:'/media/babulo-play-logo.jpg',cover:'/media/amanha-de-manha.jpeg',face:'/media/young-black-baby-portrait.jpeg',main:'/media/young-black-baby-main.jpg',live:'/media/young-black-baby-live.jpeg'};
 const demoTracks:Track[]=[
- {id:'1',title:'Amanhã De Manhã',artist:'Young Black Baby',genre:'Rap / Hip-Hop',coverUrl:img.cover},
+ {id:'1',title:'Amanhã De Manhã',artist:'Young Black Baby',genre:'Rap / Hip-Hop',coverUrl:img.cover,audioUrl:'/media/amanha-de-manha.mp3'},
  {id:'2',title:'Ao Vivo',artist:'Young Black Baby',genre:'Performance',coverUrl:img.live},
  {id:'3',title:'Amanhã De Manhã — Remix',artist:'Young Black Baby',genre:'Afro Rap',coverUrl:img.cover},
  {id:'4',title:'Young Black Baby',artist:'Young Black Baby',genre:'Artista em destaque',coverUrl:img.face},
@@ -17,10 +17,48 @@ export default function Home(){
  const [tracks,setTracks]=useState<Track[]>(demoTracks),[current,setCurrent]=useState<Track|null>(null),[query,setQuery]=useState(''),[playing,setPlaying]=useState(false),[menu,setMenu]=useState('Início');
  const [authOpen,setAuthOpen]=useState(false),[authMode,setAuthMode]=useState<'login'|'register'>('login'),[email,setEmail]=useState(''),[password,setPassword]=useState(''),[stageName,setStageName]=useState(''),[accountRole,setAccountRole]=useState<'LISTENER'|'ARTIST'>('LISTENER'),[authMsg,setAuthMsg]=useState('');
  const [token,setToken]=useState<string|null>(null),[me,setMe]=useState<any>(null),[dashboard,setDashboard]=useState(false);
+ const audioRef=useRef<HTMLAudioElement|null>(null);
+const [currentTime,setCurrentTime]=useState(0);
+const [duration,setDuration]=useState(0);
+const [audioError,setAudioError]=useState('');
  const [releaseOpen,setReleaseOpen]=useState(false),[releases,setReleases]=useState<Release[]>([]),[releaseMsg,setReleaseMsg]=useState(''); const [distOpen,setDistOpen]=useState(false);
  useEffect(()=>{fetch(`${API}/api/tracks`).then(r=>r.json()).then(d=>{if(d.tracks?.length)setTracks(d.tracks)}).catch(()=>{}); const t=localStorage.getItem('babulo_token'); if(t){setToken(t);fetch(`${API}/api/auth/me`,{headers:{Authorization:`Bearer ${t}`}}).then(r=>r.ok?r.json():null).then(setMe).catch(()=>{});}},[]);
+ useEffect(()=>{
+  if(!audioRef.current||!current?.audioUrl)return;
+
+  audioRef.current.src=current.audioUrl;
+  audioRef.current.currentTime=0;
+
+  audioRef.current.play()
+    .then(()=>setPlaying(true))
+    .catch(()=>setAudioError('Clique novamente em ▶ para iniciar.'));
+},[current]);
+ 
  const filtered=useMemo(()=>tracks.filter(t=>`${t.title} ${t.artist} ${t.genre}`.toLowerCase().includes(query.toLowerCase())),[tracks,query]);
- function play(t:Track){setCurrent(t);setPlaying(true)}
+ function play(t:Track){
+  setCurrent(t);
+  setPlaying(true);
+  setCurrentTime(0);
+  setAudioError('');
+}
+ function togglePlay(){
+  if(!audioRef.current||!current?.audioUrl)return;
+  if(audioRef.current.paused){
+    audioRef.current.play()
+      .then(()=>setPlaying(true))
+      .catch(()=>setAudioError('Não foi possível reproduzir o áudio.'));
+  }else{
+    audioRef.current.pause();
+    setPlaying(false);
+  }
+}
+
+function formatTime(value:number){
+  if(!Number.isFinite(value))return '0:00';
+  const minutes=Math.floor(value/60);
+  const seconds=Math.floor(value%60).toString().padStart(2,'0');
+  return `${minutes}:${seconds}`;
+}
  async function submitAuth(e:React.FormEvent){e.preventDefault();setAuthMsg(''); const url=authMode==='login'?'/api/auth/login':'/api/auth/register'; const body=authMode==='login'?{email,password}:{email,password,role:accountRole,stageName:accountRole==='ARTIST'?stageName:undefined}; try{const r=await fetch(API+url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw Error(d.error||'Não foi possível continuar');localStorage.setItem('babulo_token',d.token);setToken(d.token);const mr=await fetch(API+'/api/auth/me',{headers:{Authorization:`Bearer ${d.token}`}});setMe(mr.ok?await mr.json():d);setAuthOpen(false);setAuthMsg('');}catch(err:any){setAuthMsg(err.message)}}
  function logout(){localStorage.removeItem('babulo_token');setToken(null);setMe(null);setDashboard(false);setReleases([])}
  async function loadReleases(){if(!token)return;const r=await fetch(API+'/api/artists/me/releases',{headers:{Authorization:`Bearer ${token}`}});const d=await r.json();if(r.ok)setReleases(d.releases||[])}
@@ -33,7 +71,46 @@ export default function Home(){
    <SectionTitle title="Lançamentos recentes"/><div className="cards">{filtered.map(t=><button className="card" key={t.id} onClick={()=>play(t)}><div className="cardImg"><img src={t.coverUrl || img.cover} alt="" /><span>▶</span></div><strong>{t.title}</strong><small>{t.artist}</small></button>)}</div>
    <section className="platformBanner"><img src={img.main} alt="BaBuLo Play"/><div><small>A TUA PLATAFORMA MUSICAL</small><h2>A música africana<br/>tem uma nova casa.</h2><p>Ouve, descobre, apoia artistas e promove os teus lançamentos.</p><button className="primary">Explorar BaBuLo Play</button></div></section>
    <SectionTitle title="Artista propaganda" link="Ver artista →"/><section className="artistPromo"><div className="artistPhoto"><img src={img.live} alt="Young Black Baby em atuação"/></div><div><small>ARTISTA EM DESTAQUE</small><h2>Young Black Baby</h2><p>Uma apresentação baseada nas imagens reais fornecidas para a plataforma.</p><button className="outline">Ver perfil do artista</button></div><img className="release" src={img.cover} alt="Amanhã De Manhã"/></section><footer>© 2026 BaBuLo Play · Streaming · Distribuição · Promoção · Publicidade</footer></section>
-  {current&&<div className="player"><img src={current.coverUrl||img.cover} alt=""/><div className="now"><b>{current.title}</b><small>{current.artist}</small></div><button onClick={()=>setPlaying(!playing)}>{playing?'Ⅱ':'▶'}</button><div className="progress"><span/></div><small>1:42 / 3:56</small><button>↗</button><button onClick={()=>setCurrent(null)}>✕</button></div>}
+  {current&&<div className="player">
+  <img src={current.coverUrl||img.cover} alt=""/>
+  <div className="now">
+    <b>{current.title}</b>
+    <small>{current.artist}</small>
+  </div>
+
+  <button onClick={togglePlay} disabled={!current.audioUrl}>
+    {playing?'Ⅱ':'▶'}
+  </button>
+
+  <div className="progress">
+    <span style={{width:duration?`${(currentTime/duration)*100}%`:'0%'}}/>
+  </div>
+
+  <small>{formatTime(currentTime)} / {formatTime(duration)}</small>
+
+  <button>↗</button>
+
+  <button onClick={()=>{
+    if(audioRef.current) audioRef.current.pause();
+    setPlaying(false);
+    setCurrent(null);
+  }}>✕</button>
+</div>}
+  
+  <audio
+  ref={audioRef}
+  preload="metadata"
+  onLoadedMetadata={e=>setDuration(e.currentTarget.duration)}
+  onTimeUpdate={e=>setCurrentTime(e.currentTarget.currentTime)}
+  onPlay={()=>setPlaying(true)}
+  onPause={()=>setPlaying(false)}
+  onEnded={()=>{
+    setPlaying(false);
+    setCurrentTime(0);
+  }}
+  onError={()=>setAudioError('Não foi possível carregar o áudio.')}
+/>
+  
   {distOpen&&token&&<DistributionPanel token={token} releases={releases} onClose={()=>setDistOpen(false)}/>}{releaseOpen&&token&&<ReleaseWizard token={token} onClose={()=>setReleaseOpen(false)} onDone={()=>{setReleaseOpen(false);loadReleases()}}/>}
   {authOpen&&<div className="modalBackdrop" onMouseDown={()=>setAuthOpen(false)}><div className="authModal" onMouseDown={e=>e.stopPropagation()}><button className="modalClose" onClick={()=>setAuthOpen(false)}>✕</button><img src={img.logo} alt="BaBuLo Play"/><h2>{authMode==='login'?'Entrar na BaBuLo Play':'Criar conta'}</h2><form onSubmit={submitAuth}>{authMode==='register'&&<><div className="roleSwitch"><button type="button" className={accountRole==='LISTENER'?'selected':''} onClick={()=>setAccountRole('LISTENER')}>Ouvinte</button><button type="button" className={accountRole==='ARTIST'?'selected':''} onClick={()=>setAccountRole('ARTIST')}>Artista</button></div>{accountRole==='ARTIST'&&<input value={stageName} onChange={e=>setStageName(e.target.value)} placeholder="Nome artístico" required/>}</>}<input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="Email" required/><input type="password" value={password} onChange={e=>setPassword(e.target.value)} placeholder="Palavra-passe (mín. 8 caracteres)" required/><button className="primary full">{authMode==='login'?'Entrar':'Criar conta'}</button>{authMsg&&<div className="formError">{authMsg}</div>}</form><button className="switchAuth" onClick={()=>{setAuthMode(authMode==='login'?'register':'login');setAuthMsg('')}}>{authMode==='login'?'Ainda não tenho conta':'Já tenho conta'}</button></div></div>}
  </main>
@@ -52,7 +129,16 @@ function SectionTitle({title,link}:{title:string;link?:string}){return <div clas
 function ReleaseWizard({token,onClose,onDone}:{token:string;onClose:()=>void;onDone:()=>void}){
  const [step,setStep]=useState(1); const [releaseId,setReleaseId]=useState<string|null>(null); const [preflight,setPreflight]=useState<any>(null),[msg,setMsg]=useState(''),[busy,setBusy]=useState(false),[genres,setGenres]=useState<any[]>([]);
  const [form,setForm]=useState({title:'',type:'SINGLE',genreId:'',language:'Português',country:'Angola',releaseDate:'',preReleaseDate:'',coverUrl:'',description:'',upc:'',ean:'',labelName:'',phonographicCopyright:'',copyrightText:'',trackTitle:'',trackVersion:'',trackLanguage:'Português',trackGenreId:'',isExplicit:false,explicitReason:'',isrc:'',composer:'',lyricist:'',producer:'',performer:'',publisher:'',audioUrl:'',audioName:'',coverName:'',rightsHolder:'',rightsRole:'RIGHTS_HOLDER',rightsType:'STREAMING',rightsPercentage:'100',rightsTerritory:'WORLDWIDE'});
- useEffect(()=>{fetch(`${API}/api/genres`).then(r=>r.json()).then(d=>setGenres(d.genres||[])).catch(()=>{})},[]);
+ useEffect(()=>{fetch(`${API}/api/genres`).then(r=>r.json()).then(d=>setGenres(d.genres||[])).catch(()=>{})},[]);useEffect(()=>{
+  if(!audioRef.current||!current?.audioUrl)return;
+
+  audioRef.current.src=current.audioUrl;
+  audioRef.current.currentTime=0;
+
+  audioRef.current.play()
+    .then(()=>setPlaying(true))
+    .catch(()=>setAudioError('Clique novamente em ▶ para iniciar.'));
+},[current]);
  const set=(k:string,v:any)=>setForm(f=>({...f,[k]:v}));
  async function upload(file:File,kind:'audio'|'cover'){const fd=new FormData();fd.append('file',file);fd.append('kind',kind);const r=await fetch(API+'/api/uploads',{method:'POST',headers:{Authorization:`Bearer ${token}`},body:fd});const d=await r.json();if(!r.ok)throw Error(d.error||'Falha no upload');return d.file.url as string}
  function next(){setMsg('');if(step===1&&!form.title.trim())return setMsg('Informe o título do lançamento.');if(step===2&&!form.trackTitle.trim())return setMsg('Informe o título da faixa principal.');if(step===2&&!form.rightsHolder.trim())return setMsg('Informe o titular dos direitos da faixa.');if(step===2&&(Number(form.rightsPercentage)!==100))return setMsg('Para esta primeira declaração, a participação deve totalizar 100%.');setStep(s=>Math.min(4,s+1))}
