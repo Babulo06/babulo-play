@@ -12,9 +12,7 @@
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "pg": "^8.16.3",
-    "multer": "^2.0.2"
-  },
-  "devDependencies": {
+    "multer": "^2.0.2",
     "tsx": "^4.20.3",
     "typescript": "^5.9.2",
     "@types/express": "^5.0.3",
@@ -23,5 +21,5 @@
     "@types/pg": "^8.15.5",
     "@types/multer": "^2.0.0"
   },
-  "version": "0.10.1"
+  "version": "0.10.2"
 }
