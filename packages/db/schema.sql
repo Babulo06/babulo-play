@@ -174,3 +174,7 @@ alter table users add column if not exists kyc_status text not null default 'NOT
 \i migrations/004_payment_engine.sql
 
 \i migrations/005_distribution_engine.sql
+
+
+-- BaBuLo Play V10.2: Track Metadata
+\i migrations/006_track_metadata.sql

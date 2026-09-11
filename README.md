@@ -79,3 +79,7 @@ Variáveis que precisam de configuração no serviço Web/API: `NEXT_PUBLIC_API_
 As migrações devem ser executadas pela ordem: `schema.sql`, `001_preflight_isrc.sql`, `002_rights_approval.sql`, `003_royalties_ledger.sql`, `004_payment_engine.sql`, `005_distribution_engine.sql`.
 
 O armazenamento local de uploads é adequado apenas para desenvolvimento. Em produção, a próxima etapa deve migrar os ficheiros para object storage + CDN.
+\n\n## V10.2 — Metadados profissionais
+O fluxo de Novo Lançamento agora inclui participação/feat., tipo de áudio (música, instrumental, acapella, live, remix e cover), uso de IA, onde a IA foi usada e letra. A migração `006_track_metadata.sql` cria o suporte no banco sem remover os dados existentes.
+
+**Mídia:** esta versão inclui `amanha-de-manha.mp3` e `cafe.mp3`. A fotografia principal `young-black-baby-main.jpg` continua referenciada pelo site e deve ser preservada no repositório atual se já estiver publicada.

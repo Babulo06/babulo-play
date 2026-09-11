@@ -19,14 +19,6 @@ app.use(cors({ origin: process.env.WEB_ORIGIN || 'http://localhost:3000' }));
 app.use(express.json({ limit: '2mb' }));
 app.use('/media', express.static(uploadDir));
 
-app.get('/', (_req, res) => {
-  res.json({
-    name: 'BaBuLo Play API',
-    status: 'online',
-    version: '0.10.1'
-  });
-});
-
 function hashPassword(password: string) {
   const salt = crypto.randomBytes(16).toString('hex');
   const derived = crypto.scryptSync(password, salt, 64).toString('hex');
@@ -151,14 +143,25 @@ app.get('/api/artists/me/releases', auth, artistOnly, async (req:AuthedRequest,r
 });
 
 app.post('/api/tracks', auth, artistOnly, async (req:AuthedRequest,res) => {
-  const { title, releaseId, genreId, language, version, durationMs, isExplicit=false, explicitReason, isrc, originalReleaseDate, fileUrl, fileType='AUDIO', composer, lyricist, producer, performer, publisher } = req.body || {};
+  const { title, releaseId, genreId, language, version, durationMs, isExplicit=false, explicitReason, isrc, originalReleaseDate, fileUrl, fileType='AUDIO', composer, lyricist, producer, performer, publisher, featuredArtists='', audioType='SONG', aiGenerated='NO', aiUsage='', lyrics='' } = req.body || {};
   if(!title || !releaseId) return res.status(400).json({error:'Título e lançamento são obrigatórios'});
+  const safeAudioTypes=['SONG','INSTRUMENTAL','ACAPELLA','LIVE','REMIX','COVER'];
+  const safeAi=['NO','PARTIAL','FULL'];
+  if(!safeAudioTypes.includes(String(audioType))) return res.status(400).json({error:'Tipo de áudio inválido'});
+  if(!safeAi.includes(String(aiGenerated))) return res.status(400).json({error:'Estado de IA inválido'});
+  const safeFeaturedArtists=Array.isArray(featuredArtists)
+    ? featuredArtists.map((x:any)=>String(x).trim()).filter(Boolean).slice(0,20).join(', ')
+    : String(featuredArtists||'').trim().slice(0,2000);
+  const safeAiUsage=Array.isArray(aiUsage)
+    ? aiUsage.map((x:any)=>String(x).trim()).filter(Boolean).slice(0,20).join(', ')
+    : String(aiUsage||'').trim().slice(0,2000);
+  const safeLyrics=String(lyrics||'').slice(0,100000);
   const artist=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];
   const release=(await pool.query('select id from releases where id=$1 and primary_artist_id=$2',[releaseId,artist?.id])).rows[0];
   if(!release) return res.status(404).json({error:'Lançamento não encontrado'});
   const client=await pool.connect();
   try{ await client.query('begin');
-    const t=(await client.query(`insert into tracks(title,version,duration_ms,language,genre_id,is_explicit,explicit_reason,isrc,isrc_status,isrc_source,original_release_date,composer,lyricist,producer,performer,publisher,primary_release_id) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) returning *`,[title,version||null,durationMs||null,language||null,genreId||null,Boolean(isExplicit),explicitReason||null,isrc||null,isrc?'ASSIGNED':'PENDING_ASSIGNMENT',isrc?'ARTIST_PROVIDED':'NOT_PROVIDED',originalReleaseDate||null,composer||null,lyricist||null,producer||null,performer||null,publisher||null,releaseId])).rows[0];
+    const t=(await client.query(`insert into tracks(title,version,duration_ms,language,genre_id,is_explicit,explicit_reason,isrc,isrc_status,isrc_source,original_release_date,composer,lyricist,producer,performer,publisher,featured_artists,audio_type,ai_generated,ai_usage,lyrics,primary_release_id) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) returning *`,[title,version||null,durationMs||null,language||null,genreId||null,Boolean(isExplicit),explicitReason||null,isrc||null,isrc?'ASSIGNED':'PENDING_ASSIGNMENT',isrc?'ARTIST_PROVIDED':'NOT_PROVIDED',originalReleaseDate||null,composer||null,lyricist||null,producer||null,performer||null,publisher||null,safeFeaturedArtists||null,String(audioType),String(aiGenerated),safeAiUsage||null,safeLyrics||null,releaseId])).rows[0];
     await client.query(`insert into track_artists(track_id,artist_id,role) values($1,$2,'PRIMARY')`,[t.id,artist.id]);
     if(fileUrl){ await client.query(`insert into track_files(track_id,storage_key,file_type,format,status) values($1,$2,$3,$4,'UPLOADED')`,[t.id,fileUrl,fileType,'unknown']); }
     await client.query('commit'); res.status(201).json({track:t});
