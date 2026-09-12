@@ -27,7 +27,11 @@ services:
       - key: PAYMENT_DEMO_MODE
         value: "false"
       - key: UPLOAD_DIR
-        value: ./storage
+        value: /var/data/babulo-play-media
+    disk:
+      name: babulo-play-media
+      mountPath: /var/data/babulo-play-media
+      sizeGB: 10
 
   - type: web
     name: babulo-play-web
