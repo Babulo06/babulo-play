@@ -3,7 +3,7 @@ services:
     name: babulo-play-api
     runtime: node
     rootDir: .
-    buildCommand: npm install --no-audit --no-fund && npm run build:api
+    buildCommand: npm install --include=dev --no-audit --no-fund && npm run build:api
     startCommand: npm --workspace apps/api run start
     healthCheckPath: /api/health
     autoDeploy: true
@@ -33,7 +33,7 @@ services:
     name: babulo-play-web
     runtime: node
     rootDir: .
-    buildCommand: npm install --no-audit --no-fund && npm run build:web
+    buildCommand: npm install --include=dev --no-audit --no-fund && npm run build:web
     startCommand: npm --workspace apps/web run start
     autoDeploy: true
     envVars:

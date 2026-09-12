@@ -21,7 +21,7 @@ create table if not exists releases(
  status text not null default 'DRAFT', created_at timestamptz not null default now()
 );
 create table if not exists tracks(
- id uuid primary key default gen_random_uuid(), title text not null, version text, duration_ms integer,
+ id uuid primary key default gen_random_uuid(), title text not null, version text, duration_ms integer, track_number integer,
  language text, genre_id uuid references genres(id), is_explicit boolean not null default false,
  explicit_reason text, isrc text, isrc_status text not null default 'NOT_PROVIDED', isrc_source text, original_release_date date, composer text, lyricist text, producer text, performer text, publisher text, status text not null default 'DRAFT',
  primary_release_id uuid references releases(id), created_at timestamptz not null default now()
@@ -29,7 +29,14 @@ create table if not exists tracks(
 create table if not exists track_artists(track_id uuid references tracks(id) on delete cascade,artist_id uuid references artists(id) on delete cascade,role text not null,display_order integer not null default 0,primary key(track_id,artist_id,role));
 create table if not exists track_files(id uuid primary key default gen_random_uuid(),track_id uuid references tracks(id) on delete cascade,storage_key text not null,file_type text not null,format text,size_bytes bigint,checksum text,status text not null default 'UPLOADED',created_at timestamptz not null default now());
 
-insert into genres(name) values ('Kuduro'),('Kizomba'),('Semba'),('Rap'),('Amapiano'),('Afrobeat') on conflict do nothing;
+insert into genres(name) values
+('Kuduro'),('Kizomba'),('Semba'),('Rap'),('Hip-Hop'),('Trap'),('Drill'),('Boom Bap'),('Gangsta Rap'),('Conscious Rap'),('Melodic Rap'),('Alternative Rap'),('Rap Lusófono'),('Rap Angolano'),('Afro Rap'),('Afro Trap'),
+('Amapiano'),('Afrobeat'),('Afrobeats'),('Afro House'),('Afro Tech'),('Afro Soul'),('Afro Pop'),('Afro Dancehall'),('Dancehall'),('Reggae'),('Bashment'),('Zouk'),('Ghetto Zouk'),('Tarraxinha'),('Tarraxada'),('Rebita'),('Kazukuta'),('Kilapanga'),('Merengue Angolano'),('Gospel Africano'),
+('R&B'),('Soul'),('Funk'),('Pop'),('Urban Pop'),('Alternative'),('Indie'),('Lo-fi'),('Reggaeton'),('Latin Pop'),('Salsa'),('Bachata'),
+('House'),('Deep House'),('Afro Deep House'),('Tech House'),('Techno'),('Electronic'),('EDM'),('Lounge'),('Chillout'),('Drum & Bass'),('Jungle'),('Dubstep'),
+('Rock'),('Alternative Rock'),('Hard Rock'),('Metal'),('Jazz'),('Blues'),('Folk'),('Country'),('Acoustic'),('Instrumental'),('Classical'),('Orchestral'),
+('Gospel'),('Worship'),('Spoken Word')
+on conflict do nothing;
 
 
 -- BaBuLo Play V7: Direitos, aprovação e reclamações
@@ -178,3 +185,6 @@ alter table users add column if not exists kyc_status text not null default 'NOT
 
 -- BaBuLo Play V10.2: Track Metadata
 \i migrations/006_track_metadata.sql
+
+-- BaBuLo Play V10.3: Multi-track ordering
+\i migrations/007_track_order.sql
