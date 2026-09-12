@@ -17,5 +17,5 @@
     "@types/react-dom": "^19.1.7"
   },
   "devDependencies": {},
-  "version": "0.10.2"
+  "version": "0.10.2.2"
 }
