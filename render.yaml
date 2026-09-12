@@ -19,7 +19,7 @@ services:
           name: babulo-play-db
           property: connectionString
       - key: WEB_ORIGIN
-        sync: false
+        value: https://babulo-play-web.onrender.com
       - key: JWT_SECRET
         generateValue: true
       - key: PAYMENT_WEBHOOK_SECRET
@@ -42,7 +42,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: NEXT_PUBLIC_API_URL
-        sync: false
+        value: https://babulo-play-api.onrender.com
 
 databases:
   - name: babulo-play-db
