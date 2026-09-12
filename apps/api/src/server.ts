@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -557,6 +557,23 @@ app.get('/api/admin/audit-logs', auth, adminOnly, async (_req,res) => {
 });
 
 // ===== Streaming events + Royalty Engine =====
+function firstHeader(req:Request, names:string[]){
+  for(const name of names){
+    const value=req.headers[name.toLowerCase()];
+    if(typeof value==='string' && value.trim()) return value.split(',')[0].trim();
+  }
+  return null;
+}
+function safeGeo(value:string|null){
+  if(!value) return null;
+  try { value=decodeURIComponent(value); } catch {}
+  return value.replace(/[\x00-\x1f<>]/g,'').trim().slice(0,120)||null;
+}
+function listenerKey(userId:string|null,sessionId:string|null){
+  const raw=userId?`user:${userId}`:(sessionId?`session:${sessionId}`:`anon:${crypto.randomUUID()}`);
+  return crypto.createHash('sha256').update(raw+'|'+JWT_SECRET).digest('hex');
+}
+
 app.post('/api/streams/events', async (req,res) => {
   const { trackId, eventType='PLAY_30S', playedSeconds=0, sessionId } = req.body || {};
   if(!trackId) return res.status(400).json({error:'trackId é obrigatório'});
@@ -565,8 +582,44 @@ app.post('/api/streams/events', async (req,res) => {
   const validEvents=['PLAY_30S','COMPLETED'];
   const isValid=validEvents.includes(String(eventType)) && Number(playedSeconds)>=30;
   const userIdHeader=(req.headers['x-user-id'] as string)||null;
-  const q=await pool.query(`insert into stream_events(user_id,track_id,event_type,played_seconds,session_id,is_valid) values($1,$2,$3,$4,$5,$6) returning id,event_type,is_valid,occurred_at`,[userIdHeader,trackId,String(eventType),Number(playedSeconds)||0,sessionId||null,isValid]);
+  const country=safeGeo(firstHeader(req,['cf-ipcountry','x-country','x-geo-country']));
+  const city=safeGeo(firstHeader(req,['cf-ipcity','x-city','x-geo-city']));
+  const key=listenerKey(userIdHeader,sessionId||null);
+  const q=await pool.query(`insert into stream_events(user_id,track_id,event_type,played_seconds,session_id,is_valid,listener_country,listener_city,listener_key) values($1,$2,$3,$4,$5,$6,$7,$8,$9) returning id,event_type,is_valid,occurred_at,listener_country,listener_city`,[userIdHeader,trackId,String(eventType),Number(playedSeconds)||0,sessionId||null,isValid,country,city,key]);
   res.status(201).json({event:q.rows[0]});
+});
+
+function dateRange(req:Request){
+  const now=new Date();
+  const toRaw=typeof req.query.to==='string'?req.query.to:'';
+  const fromRaw=typeof req.query.from==='string'?req.query.from:'';
+  const to=toRaw?new Date(`${toRaw}T23:59:59.999Z`):now;
+  const from=fromRaw?new Date(`${fromRaw}T00:00:00Z`):new Date(now.getTime()-29*24*60*60*1000);
+  if(Number.isNaN(from.getTime())||Number.isNaN(to.getTime())||from>to) return null;
+  return {from,to};
+}
+async function streamAnalytics(artistId:string|null, from:Date, to:Date){
+  const where=artistId?`and r.primary_artist_id=$3`:'';
+  const params:any[]=[from,to]; if(artistId) params.push(artistId);
+  const totals=(await pool.query(`select count(*) filter(where se.is_valid) valid_streams,count(distinct se.listener_key) filter(where se.is_valid) unique_listeners,count(distinct se.listener_key) filter(where se.is_valid and se.occurred_at >= $1) listeners_in_period from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where se.occurred_at between $1 and $2 ${where}` ,params)).rows[0]||{};
+  const countries=(await pool.query(`select coalesce(nullif(se.listener_country,''),'Desconhecido') country,count(*)::int streams,count(distinct se.listener_key)::int unique_listeners from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where se.is_valid=true and se.occurred_at between $1 and $2 ${where} group by 1 order by streams desc limit 20`,params)).rows;
+  const cities=(await pool.query(`select coalesce(nullif(se.listener_city,''),'Desconhecida') city,coalesce(nullif(se.listener_country,''),'--') country,count(*)::int streams,count(distinct se.listener_key)::int unique_listeners from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where se.is_valid=true and se.occurred_at between $1 and $2 ${where} group by 1,2 order by streams desc limit 30`,params)).rows;
+  const tracks=(await pool.query(`select t.id,t.title,count(*)::int streams,count(distinct se.listener_key)::int unique_listeners from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where se.is_valid=true and se.occurred_at between $1 and $2 ${where} group by t.id,t.title order by streams desc limit 20`,params)).rows;
+  const daily=(await pool.query(`select to_char(date_trunc('day',se.occurred_at),'YYYY-MM-DD') day,count(*) filter(where se.is_valid)::int streams,count(distinct se.listener_key) filter(where se.is_valid)::int unique_listeners from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where se.occurred_at between $1 and $2 ${where} group by 1 order by 1`,params)).rows;
+  const hours=(await pool.query(`select extract(hour from se.occurred_at)::int hour,count(*)::int streams from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where se.is_valid=true and se.occurred_at between $1 and $2 ${where} group by 1 order by streams desc`,params)).rows;
+  return {from,to,totals:{validStreams:Number(totals.valid_streams||0),uniqueListeners:Number(totals.unique_listeners||0)},countries,cities,tracks,daily,peakHours:hours};
+}
+
+app.get('/api/artists/me/analytics', auth, artistOnly, async (req:AuthedRequest,res)=>{
+  const artist=(await pool.query('select id,stage_name from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];
+  if(!artist) return res.status(404).json({error:'Perfil de artista não encontrado'});
+  const range=dateRange(req); if(!range) return res.status(400).json({error:'Período inválido'});
+  res.json({artist,analytics:await streamAnalytics(artist.id,range.from,range.to)});
+});
+
+app.get('/api/admin/analytics/streams', auth, adminOnly, async (req,res)=>{
+  const range=dateRange(req); if(!range) return res.status(400).json({error:'Período inválido'});
+  res.json({analytics:await streamAnalytics(null,range.from,range.to)});
 });
 
 app.get('/api/artists/me/royalties', auth, artistOnly, async (req:AuthedRequest,res) => {
@@ -605,6 +658,21 @@ app.post('/api/artists/me/withdrawals', auth, artistOnly, async (req:AuthedReque
     await audit(req.user!.id,'WITHDRAWAL_CREATED','WITHDRAWAL',w.id,{amount:value,method});
     res.status(201).json({withdrawal:w,balance:after});
   }catch(e){await client.query('rollback');console.error(e);res.status(500).json({error:'Não foi possível solicitar o levantamento'});}finally{client.release();}
+});
+
+app.get('/api/admin/finance/summary', auth, adminOnly, async (_req,res)=>{
+  const q=await pool.query(`select
+    (select count(*) from stream_events where is_valid=true)::int as valid_streams,
+    coalesce((select sum(amount) from payment_transactions where status='PAID' and payment_method<>'WALLET'),0) as external_paid,
+    coalesce((select sum(net_amount) from payment_transactions where status='PAID' and payment_method<>'WALLET'),0) as external_net,
+    coalesce((select sum(amount) from payment_transactions where status='PENDING'),0) as pending_payments,
+    coalesce((select sum(amount) from payment_transactions where status='REFUNDED'),0) as refunds,
+    coalesce((select sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount else 0 end) from financial_ledger),0) as artist_royalty_balance,
+    coalesce((select sum(w.amount) from withdrawals w where w.status='PAID'),0) as artist_payments_paid,
+    coalesce((select sum(w.amount) from withdrawals w where w.status='PENDING'),0) as artist_payments_pending`);
+  const row=q.rows[0];
+  const externalNet=Number(row.external_net||0),royalty=Number(row.artist_royalty_balance||0);
+  res.json({currency:'AOA',balances:{streamBalance:{validStreams:Number(row.valid_streams||0)},artistPayments:{paid:Number(row.artist_payments_paid||0),pending:Number(row.artist_payments_pending||0)},artistRoyalties:royalty,pendingPayments:Number(row.pending_payments||0),refunds:Number(row.refunds||0),babuloRevenue:externalNet,netAfterArtistPayments:externalNet-Number(row.artist_payments_paid||0)},updatedAt:new Date().toISOString()});
 });
 
 app.get('/api/admin/royalty-periods', auth, adminOnly, async (_req,res) => {

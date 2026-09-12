@@ -90,3 +90,10 @@ O fluxo de Novo Lançamento agora inclui participação/feat., tipo de áudio (m
 A API passa a verificar e aplicar o schema e as migrações SQL de forma idempotente durante o arranque. Isso evita depender do `PSQL Command` do Render para preparar a estrutura V10.2.
 
 Inclui as funcionalidades V10.2 de participação/feat, tipo de áudio, utilização de IA e letra.
+
+
+## V10.4
+- Workspaces separados para Ouvinte, Artista e Administração/Owner.
+- Analytics de streams por país, cidade, ouvintes únicos e faixas.
+- Dashboard financeiro administrativo com saldos separados.
+- Sessão do artista isolada da área de ouvinte.
