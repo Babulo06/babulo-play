@@ -1,169 +1,7 @@
-'use client';
-import { useEffect, useMemo, useRef, useState } from 'react';
-
-type Track={id:string;title:string;artist:string;genre:string;coverUrl:string|null;audioUrl?:string};
-type Release={id:string;title:string;type:string;cover_url?:string|null;status?:string};
-const API=process.env.NEXT_PUBLIC_API_URL||'http://localhost:4000';
-const img={logo:'/media/babulo-play-logo.jpg',cover:'/media/amanha-de-manha.jpeg',face:'/media/young-black-baby-portrait.jpeg',main:'/media/young-black-baby-main.jpg',live:'/media/young-black-baby-live.jpeg'};
-const demoTracks:Track[]=[
- {id:'1',title:'Amanhã De Manhã',artist:'Young Black Baby',genre:'Rap / Hip-Hop',coverUrl:img.cover,audioUrl:'/media/amanha-de-manha.mp3'},
- {id:'2',title:'Café',artist:'Young Black Baby',genre:'Rap / Hip-Hop',coverUrl:img.live,audioUrl:'/media/cafe.mp3'},
- {id:'3',title:'Amanhã De Manhã — Remix',artist:'Young Black Baby',genre:'Afro Rap',coverUrl:img.cover},
- {id:'4',title:'Young Black Baby',artist:'Young Black Baby',genre:'Artista em destaque',coverUrl:img.face},
-];
-const nav=['Início','Explorar','Biblioteca','Playlists','Artistas','Álbuns','Géneros','Premium'];
-const releaseTypes=[['SINGLE','Single'],['EP','EP'],['ALBUM','Álbum'],['ALBUM_PRO','Álbum Pro']];
-export default function Home(){
- const [tracks,setTracks]=useState<Track[]>(demoTracks),[current,setCurrent]=useState<Track|null>(null),[query,setQuery]=useState(''),[playing,setPlaying]=useState(false),[menu,setMenu]=useState('Início');
- const [authOpen,setAuthOpen]=useState(false),[authMode,setAuthMode]=useState<'login'|'register'>('login'),[email,setEmail]=useState(''),[password,setPassword]=useState(''),[stageName,setStageName]=useState(''),[accountRole,setAccountRole]=useState<'LISTENER'|'ARTIST'>('LISTENER'),[authMsg,setAuthMsg]=useState('');
- const [token,setToken]=useState<string|null>(null),[me,setMe]=useState<any>(null),[dashboard,setDashboard]=useState(false);
- const [sessionReady,setSessionReady]=useState(false);
- 
- const [releases,setReleases]=useState<Release[]>([]);
- const draftReleases=useMemo(()=>releases.filter(r=>['DRAFT','FAILED','PENDING_APPROVAL'].includes(String(r.status||'DRAFT'))),[releases]);
-const [releaseOpen,setReleaseOpen]=useState(false);
-const [releaseMsg,setReleaseMsg]=useState('');
-const [distOpen,setDistOpen]=useState(false);
- 
- const audioRef=useRef<HTMLAudioElement|null>(null);
- useEffect(()=>{
-  let cancelled=false;
-  const saved=localStorage.getItem('babulo_token');
-  const savedDashboard=localStorage.getItem('babulo_dashboard')==='1';
-  if(!saved){setSessionReady(true);return;}
-  setToken(saved);
-  fetch(API+'/api/auth/me',{headers:{Authorization:`Bearer ${saved}`}})
-   .then(async r=>{if(!r.ok)throw Error('Sessão expirada'); return r.json();})
-   .then(async data=>{
-    if(cancelled)return;
-    setMe(data);
-    localStorage.setItem('babulo_profile',JSON.stringify(data));
-    setDashboard(savedDashboard);
-    setSessionReady(true);
-   })
-   .catch(()=>{
-    const cached=localStorage.getItem('babulo_profile');
-    if(cancelled)return;
-    if(cached){try{const profile=JSON.parse(cached);setMe(profile);setToken(saved);setDashboard(savedDashboard);setSessionReady(true);return;}catch{}}
-    setToken(saved);
-    setDashboard(savedDashboard);
-    setSessionReady(true);
-   });
-  return()=>{cancelled=true};
- },[]);
- useEffect(()=>{if(token&&isArtist)loadReleases()},[token]);
- 
- const [currentTime,setCurrentTime]=useState(0);
-const [duration,setDuration]=useState(0);
-const [audioError,setAudioError]=useState('');
- const [volume,setVolume]=useState(1);
- 
- useEffect(()=>{
-  if(audioRef.current){
-    audioRef.current.volume=volume;
-  }
-},[volume]);
- 
-useEffect(()=>{
-  const audio=audioRef.current;
-
-  if(!audio)return;
-
-  // Para sempre a música anterior
-  audio.pause();
-
-  setPlaying(false);
-  setCurrentTime(0);
-  setDuration(0);
-  setAudioError('');
-
-  // Se a nova faixa não tiver áudio, limpa o player
-  if(!current?.audioUrl){
-    audio.removeAttribute('src');
-    audio.load();
-    return;
-  }
-
-  // Carrega a nova faixa
-  audio.src=current.audioUrl;
-  audio.currentTime=0;
-  audio.load();
-
-  // Reproduz automaticamente
-  audio.play()
-    .then(()=>{
-      setPlaying(true);
-    })
-    .catch(()=>{
-      setPlaying(false);
-      setAudioError('Clique em ▶ para reproduzir.');
-    });
-
-},[current]);
- 
- const filtered=useMemo(()=>tracks.filter(t=>`${t.title} ${t.artist} ${t.genre}`.toLowerCase().includes(query.toLowerCase())),[tracks,query]);
- function play(t:Track){
-  setCurrent(t);
-  setPlaying(false);
-  setCurrentTime(0);
-  setAudioError('');
-}
- function togglePlay(){
-  if(!audioRef.current||!current?.audioUrl)return;
-  if(audioRef.current.paused){
-    audioRef.current.play()
-      .then(()=>setPlaying(true))
-      .catch(()=>setAudioError('Não foi possível reproduzir o áudio.'));
-  }else{
-    audioRef.current.pause();
-    setPlaying(false);
-  }
-}
-
-function previousTrack(){
-  if(!current || tracks.length===0)return;
-
-  const index=tracks.findIndex(t=>t.id===current.id);
-
-  for(let i=index-1;i>=0;i--){
-    if(tracks[i].audioUrl){
-      setCurrent(tracks[i]);
-      return;
-    }
-  }
-}
-
-function nextTrack(){
-  if(!current || tracks.length===0)return;
-
-  const index=tracks.findIndex(t=>t.id===current.id);
-
-  for(let i=index+1;i<tracks.length;i++){
-    if(tracks[i].audioUrl){
-      setCurrent(tracks[i]);
-      return;
-    }
-  }
-}
- 
-function formatTime(value:number){
-  if(!Number.isFinite(value))return '0:00';
-  const minutes=Math.floor(value/60);
-  const seconds=Math.floor(value%60).toString().padStart(2,'0');
-  return `${minutes}:${seconds}`;
-}
- function seek(value:number){
-  if(!audioRef.current)return;
-
-  audioRef.current.currentTime=value;
-  setCurrentTime(value);
-}
- 
- async function submitAuth(e:React.FormEvent){e.preventDefault();setAuthMsg(''); const url=authMode==='login'?'/api/auth/login':'/api/auth/register'; const body=authMode==='login'?{email,password}:{email,password,role:accountRole,stageName:accountRole==='ARTIST'?stageName:undefined}; try{const r=await fetch(API+url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw Error(d.error||'Não foi possível continuar');localStorage.setItem('babulo_token',d.token);setToken(d.token);const mr=await fetch(API+'/api/auth/me',{headers:{Authorization:`Bearer ${d.token}`}});const profile=mr.ok?await mr.json():d;setMe(profile);localStorage.setItem('babulo_profile',JSON.stringify(profile));const artist=profile?.user?.role==='ARTIST'||profile?.role==='ARTIST';setDashboard(Boolean(artist));localStorage.setItem('babulo_dashboard',artist?'1':'0');setAuthOpen(false);setAuthMsg('');}catch(err:any){setAuthMsg(err.message)}}
- function logout(){localStorage.removeItem('babulo_token');localStorage.removeItem('babulo_dashboard');localStorage.removeItem('babulo_profile');setToken(null);setMe(null);setDashboard(false);setReleases([])}
+ async function submitAuth(e:React.FormEvent){e.preventDefault();setAuthMsg(''); const url=authMode==='login'?'/api/auth/login':'/api/auth/register'; const body=authMode==='login'?{email,password}:{email,password,role:accountRole,stageName:accountRole==='ARTIST'?stageName:undefined}; try{const r=await fetch(API+url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw Error(d.error||'Não foi possível continuar');localStorage.setItem('babulo_token',d.token);setToken(d.token);const mr=await fetch(API+'/api/auth/me',{headers:{Authorization:`Bearer ${d.token}`}});setMe(mr.ok?await mr.json():d);setAuthOpen(false);setAuthMsg('');}catch(err:any){setAuthMsg(err.message)}}
+ function logout(){localStorage.removeItem('babulo_token');localStorage.removeItem('babulo_dashboard');setToken(null);setMe(null);setDashboard(false);setReleases([])}
  async function loadReleases(){if(!token)return;const r=await fetch(API+'/api/artists/me/releases',{headers:{Authorization:`Bearer ${token}`}});const d=await r.json();if(r.ok)setReleases(d.releases||[])}
  const isArtist=me?.user?.role==='ARTIST'||me?.role==='ARTIST';
- if(!sessionReady)return <main className="app"><section className="content"><div className="authModal" style={{margin:'12vh auto',maxWidth:520,textAlign:'center'}}><img src={img.logo} alt="BaBuLo Play" style={{width:140}}/><h2>A restaurar a tua sessão…</h2><p>Não é necessário fazer login novamente.</p></div></section></main>;
  return <main className="app">
   <aside className="sidebar"><div className="logoWrap"><img src={img.logo} alt="BaBuLo Play"/></div><div className="navGroup">{nav.map((n,i)=><button key={n} className={menu===n?'active':''} onClick={()=>setMenu(n)}><span>{['⌂','◉','▣','♫','♙','◉','♬','★'][i]}</span>{n}</button>)}</div><div className="library"><p>SUA BIBLIOTECA</p><button>♡ Músicas Curtidas</button><button>⇩ Downloads</button><button>◷ Histórico</button></div><div className="sidePremium"><img src={img.logo} alt=""/><b>BaBuLo Premium</b><span>Mais música. Menos anúncios.</span><button>Conhecer Premium</button></div></aside>
   <section className="content"><header className="topbar"><div className="mobileBrand"><img src={img.logo} alt="BaBuLo Play"/></div><div className="search"><span>⌕</span><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Pesquisar artistas, músicas, álbuns, playlists..."/></div><button className="bell">♧</button>{token?<div className="profile clickable" onClick={()=>{const next=!dashboard;setDashboard(next);localStorage.setItem('babulo_dashboard',next?'1':'0');if(next&&isArtist)loadReleases()}}><img src={img.face} alt="Perfil"/><div><b>{me?.user?.email||'Minha conta'}</b><small>{isArtist?'Artista':'Ouvinte'}</small></div><span>⌄</span></div>:<button className="loginTop" onClick={()=>{setAuthMode('login');setAuthOpen(true)}}>Entrar</button>}</header>
@@ -288,7 +126,7 @@ function ReleaseWizard({token,onClose,onDone}:{token:string;onClose:()=>void;onD
  const [step,setStep]=useState(1); const [releaseId,setReleaseId]=useState<string|null>(null); const [preflight,setPreflight]=useState<any>(null),[msg,setMsg]=useState(''),[busy,setBusy]=useState(false),[genres,setGenres]=useState<any[]>([]);
  const [form,setForm]=useState({title:'',type:'SINGLE',genreId:'',language:'Português',country:'Angola',releaseDate:'',preReleaseDate:'',coverUrl:'',description:'',upc:'',ean:'',labelName:'',phonographicCopyright:'',copyrightText:'',coverName:''});
  const [tracks,setTracks]=useState<WizardTrack[]>([emptyWizardTrack()]);
- const [uploadProgress,setUploadProgress]=useState<Record<string,number>>({});
+ const draftReleases=useMemo(()=>releases.filter(r=>['DRAFT','FAILED','PENDING_APPROVAL'].includes(String(r.status||'DRAFT'))),[releases]);
  const [payment,setPayment]=useState<any>(null),[paymentProduct,setPaymentProduct]=useState<any>(null),[paymentPaid,setPaymentPaid]=useState(false),[paymentMethod,setPaymentMethod]=useState('MULTICAIXA_EXPRESS'),[distribution,setDistribution]=useState<any>(null),[distributionMode,setDistributionMode]=useState<'MAIN'|'ALL'>('MAIN');
  useEffect(()=>{fetch(`${API}/api/genres`).then(r=>r.json()).then(d=>setGenres(d.genres||[])).catch(()=>{})},[])
  const set=(k:string,v:any)=>setForm(f=>({...f,[k]:v}));
@@ -348,4 +186,3 @@ function ReleaseWizard({token,onClose,onDone}:{token:string;onClose:()=>void;onD
 }
 function AudioTrackEditor({track,index,onUpdate,onMessage,onBusy}:{track:WizardTrack;index:number;token:string;onUpdate:(i:number,k:string,v:any)=>void;onMessage:(m:string)=>void;onBusy:(v:boolean)=>void}){const ref=useRef<HTMLAudioElement|null>(null);const [playing,setPlaying]=useState(false);const [localDur,setLocalDur]=useState(track.durationMs/1000||0);useEffect(()=>{if(!ref.current)return;const a=ref.current;const onMeta=()=>{setLocalDur(a.duration||track.durationMs/1000||0);if(!track.promoEndMs)onUpdate(index,'promoEndMs',Math.min((a.duration||60)*1000,60000))};const onEnd=()=>setPlaying(false);a.addEventListener('loadedmetadata',onMeta);a.addEventListener('ended',onEnd);return()=>{a.removeEventListener('loadedmetadata',onMeta);a.removeEventListener('ended',onEnd)}} , [track.audioUrl]);const toggle=()=>{if(!ref.current)return;if(ref.current.paused){ref.current.play();setPlaying(true)}else{ref.current.pause();setPlaying(false)}};const start=track.promoStartMs/1000,end=track.promoEndMs/1000;return <div className="audioEditor"><audio ref={ref} src={track.audioUrl} preload="metadata"/><div className="audioControls"><button type="button" className="primary" onClick={toggle}>{playing?'⏸ Pausar':'▶ Reproduzir'}</button><span>{Math.round(localDur/60)}:{String(Math.floor(localDur%60)).padStart(2,'0')}</span></div><div className="clipEditor"><b>✂️ Trecho para redes sociais</b><small>Escolhe pelo menos 1 minuto da música para promoção.</small><div className="clipTimes"><label>Início (seg.)<input type="number" min="0" max={Math.max(0,localDur-60)} step="1" value={start} onChange={e=>{const s=Number(e.target.value)*1000;onUpdate(index,'promoStartMs',s);if(track.promoEndMs<s+60000)onUpdate(index,'promoEndMs',Math.min(localDur*1000,s+60000))}}/></label><label>Fim (seg.)<input type="number" min={Math.min(localDur,start+60)} max={localDur||60} step="1" value={end} onChange={e=>onUpdate(index,'promoEndMs',Number(e.target.value)*1000)}/></label></div><input className="clipRange" type="range" min="0" max={Math.max(0,localDur-60)} step="1" value={start} onChange={e=>{const s=Number(e.target.value);onUpdate(index,'promoStartMs',s*1000);onUpdate(index,'promoEndMs',Math.min(localDur,s+60)*1000)}}/><p>Trecho: {Math.floor(start/60)}:{String(Math.floor(start%60)).padStart(2,'0')} → {Math.floor(end/60)}:{String(Math.floor(end%60)).padStart(2,'0')} · {Math.max(0,end-start).toFixed(0)}s</p></div></div>}
 
-function UploadBox({title,accept,name,progress=0,onChange}:{title:string;accept:string;name:string;progress?:number;onChange:(f:File)=>void}){return <label className="uploadBox"><span>＋</span><b>{title}</b><small>{name||'Selecionar ficheiro'}</small><em>{title==='Capa'?'JPG/PNG · quadrado':'WAV / FLAC / MP3'}</em>{progress>0&&progress<100&&<div className="uploadProgress"><div className="uploadProgressTop"><small>A carregar…</small><b>{progress}%</b></div><div className="uploadProgressBar"><span style={{width:`${progress}%`}}/></div></div>}{progress>=100&&<div className="uploadSuccess">✓ Upload concluído</div>}<input type="file" accept={accept} onChange={e=>{const f=e.target.files?.[0];if(f)onChange(f)}}/></label>}
