@@ -235,7 +235,7 @@ app.post('/api/releases/:id/rights', auth, artistOnly, async (req:AuthedRequest,
 app.delete('/api/releases/:id/rights/:rightId', auth, artistOnly, async (req:AuthedRequest,res) => {
   const q=await pool.query(`delete from rights_declarations rd using releases r,artists a where rd.id=$1 and rd.release_id=r.id and r.primary_artist_id=a.id and r.id=$2 and a.user_id=$3 returning rd.id`,[req.params.rightId,req.params.id,req.user!.id]);
   if(!q.rows[0]) return res.status(404).json({error:'Declaração de direitos não encontrada'});
-  await audit(req.user!.id,'RIGHT_DELETED','RIGHTS',req.params.rightId,{releaseId:req.params.id});
+  await audit(req.user!.id,'RIGHT_DELETED','RIGHTS',String(req.params.rightId),{releaseId:String(req.params.id)});
   res.json({ok:true});
 });
 
