@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -667,7 +667,6 @@ app.post('/api/admin/withdrawals/:id/decision', auth, adminOnly, async (req:Auth
   }catch(e){await client.query('rollback');console.error(e);res.status(500).json({error:'Não foi possível guardar a decisão'});}finally{client.release();}
 });
 
-
 // ===== V10 Distribution Engine =====
 const DIST_PRODUCTS=['DIST_SINGLE','DIST_EP','DIST_ALBUM','DIST_ALBUM_PRO'];
 const DIST_STATUSES=['READY','SUBMITTED','PROCESSING','DELIVERED','PUBLISHED','FAILED','CANCELLED'];
@@ -682,6 +681,18 @@ app.post('/api/distribution/catalog-migrations',auth,artistOnly,async(req:Authed
 app.get('/api/distribution/catalog-migrations',auth,artistOnly,async(req:AuthedRequest,res)=>{const a=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];res.json({migrations:(await pool.query(`select cm.*,r.title release_title from catalog_migrations cm join releases r on r.id=cm.release_id where cm.artist_id=$1 order by cm.created_at desc`,[a?.id])).rows})});
 app.get('/api/admin/distribution/orders',auth,adminOnly,async(_q,res)=>res.json({orders:(await pool.query(`select o.*,r.title release_title,a.stage_name from distribution_orders o join releases r on r.id=o.release_id join artists a on a.id=o.artist_id order by o.created_at desc`)).rows}));
 app.post('/api/admin/distribution/deliveries/:id/status',auth,adminOnly,async(req:AuthedRequest,res)=>{const {status,externalReleaseId,externalUrl,errorCode,errorMessage}=req.body||{};if(!DIST_STATUSES.includes(status))return res.status(400).json({error:'Estado inválido'});const d=(await pool.query(`select d.*,o.id order_id,p.name platform_name from distribution_deliveries d join distribution_orders o on o.id=d.order_id join distribution_platforms p on p.id=d.platform_id where d.id=$1`,[req.params.id])).rows[0];if(!d)return res.status(404).json({error:'Entrega não encontrada'});await pool.query(`update distribution_deliveries set status=$1,external_release_id=coalesce($2,external_release_id),external_url=coalesce($3,external_url),error_code=$4,error_message=$5,delivered_at=case when $1='DELIVERED' then now() else delivered_at end,published_at=case when $1='PUBLISHED' then now() else published_at end,updated_at=now() where id=$6`,[status,externalReleaseId||null,externalUrl||null,errorCode||null,errorMessage||null,d.id]);const c=(await pool.query(`select count(*)::int total,count(*) filter(where status='PUBLISHED')::int published,count(*) filter(where status='FAILED')::int failed from distribution_deliveries where order_id=$1`,[d.order_id])).rows[0];const os=Number(c.published)===Number(c.total)?'PUBLISHED':Number(c.failed)+Number(c.published)===Number(c.total)&&Number(c.failed)>0?'FAILED':'PROCESSING';await pool.query(`update distribution_orders set status=$1,error=$2,completed_at=case when $1 in ('PUBLISHED','FAILED') then now() else completed_at end,updated_at=now() where id=$3`,[os,errorMessage||null,d.order_id]);await distHistory(d.order_id,d.id,d.status,status,`Estado ${d.platform_name}: ${status}`,req.user!.id);await audit(req.user!.id,'DISTRIBUTION_DELIVERY_STATUS','DISTRIBUTION_DELIVERY',d.id,{status});res.json({ok:true,status,orderStatus:os})});
+
+
+// Garantir que erros inesperados da API nunca chegam ao frontend como HTML.
+// Isto evita o erro "Unexpected token '<', '<!DOCTYPE'..." e permite mostrar a causa real.
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+  console.error('Unhandled API error:', err);
+  if (res.headersSent) return;
+  res.status(Number(err?.statusCode || err?.status || 500)).json({
+    error: err?.message || 'Erro interno do servidor.',
+    code: err?.code || undefined
+  });
+});
 
 ensureDatabaseSchema()
   .then(() => app.listen(port,()=>console.log(`BaBuLo API running on :${port}`)))

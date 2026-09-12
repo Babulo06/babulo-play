@@ -339,6 +339,17 @@ type WizardTrack={
 }
 function emptyWizardTrack():WizardTrack{return {id:Math.random().toString(36).slice(2),title:'',version:'',language:'Português',genreId:'',isExplicit:false,explicitReason:'',isrc:'',featuredArtists:'',audioType:'SONG',aiGenerated:'NO',aiUsage:'',lyrics:'',composer:'',lyricist:'',producer:'',performer:'',publisher:'',rightsHolder:'',rightsRole:'RIGHTS_HOLDER',rightsType:'STREAMING',rightsPercentage:'100',rightsTerritory:'WORLDWIDE',audioUrl:'',audioName:'',durationMs:0,promoStartMs:0,promoEndMs:0}}
 
+async function readApiResponse(r:Response){
+ const text=await r.text();
+ let data:any=null;
+ try{data=text?JSON.parse(text):null}catch{
+   const compact=text.replace(/\s+/g,' ').slice(0,240);
+   throw Error(`A API devolveu uma resposta inválida (${r.status}). Verifica se o serviço API do Render está ativo. ${compact}`);
+ }
+ if(!r.ok) throw Error(data?.error||`Pedido recusado pela API (${r.status}).`);
+ return data||{};
+}
+
 function ReleaseWizard({token,onClose,onDone,editReleaseId=null}:{token:string;onClose:()=>void;onDone:()=>void;editReleaseId?:string|null}){
  const [step,setStep]=useState(1); const [releaseId,setReleaseId]=useState<string|null>(editReleaseId);
  const [loadingDraft,setLoadingDraft]=useState(Boolean(editReleaseId)); const [preflight,setPreflight]=useState<any>(null),[msg,setMsg]=useState(''),[busy,setBusy]=useState(false),[genres,setGenres]=useState<any[]>([]);
@@ -385,15 +396,15 @@ function ReleaseWizard({token,onClose,onDone,editReleaseId=null}:{token:string;o
  async function finish(){setBusy(true);setMsg('');try{
    const releaseBody={...form,coverUrl:form.coverUrl||null};delete (releaseBody as any).coverName;
    let rid=releaseId;
-   if(!rid){const rr=await fetch(API+'/api/releases',{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(releaseBody)});const rd=await rr.json();if(!rr.ok)throw Error(rd.error||'Não foi possível criar o lançamento');rid=rd.release.id;setReleaseId(rid);}else{const rr=await fetch(API+`/api/releases/${rid}`,{method:'PUT',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(releaseBody)});const rd=await rr.json();if(!rr.ok)throw Error(rd.error||'Não foi possível atualizar o lançamento');}
+   if(!rid){const rr=await fetch(API+'/api/releases',{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(releaseBody)});const rd=await readApiResponse(rr);rid=rd.release.id;setReleaseId(rid);}else{const rr=await fetch(API+`/api/releases/${rid}`,{method:'PUT',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(releaseBody)});await readApiResponse(rr);}
    for(let i=0;i<tracks.length;i++){
      const t=tracks[i];
      const trackBody={title:t.title,releaseId:rid,trackNumber:i+1,genreId:t.genreId||form.genreId,language:t.language,version:t.version,durationMs:t.durationMs||null,isExplicit:t.isExplicit,isrc:t.isrc,originalReleaseDate:form.releaseDate,fileUrl:t.audioUrl||undefined,fileType:'AUDIO',composer:t.composer,lyricist:t.lyricist,producer:t.producer,performer:t.performer,publisher:t.publisher,explicitReason:t.explicitReason,featuredArtists:t.featuredArtists,audioType:t.audioType,aiGenerated:t.aiGenerated,aiUsage:t.aiUsage,lyrics:t.lyrics,promoStartMs:t.promoStartMs,promoEndMs:t.promoEndMs};
      const tr=t.serverTrackId?await fetch(API+`/api/tracks/${t.serverTrackId}`,{method:'PUT',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(trackBody)}):await fetch(API+'/api/tracks',{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(trackBody)});
-     const td=await tr.json();if(!tr.ok)throw Error(td.error||`A Faixa ${i+1} não pôde ser guardada`);const trackId=td.track.id;
+     const td=await readApiResponse(tr);const trackId=td.track.id;
      const rightsBody={trackId,partyName:t.rightsHolder.trim(),partyRole:t.rightsRole,rightType:t.rightsType,percentage:Number(t.rightsPercentage),territory:t.rightsTerritory};
      const rrh=t.serverRightId?await fetch(API+`/api/releases/${rid}/rights/${t.serverRightId}`,{method:'PUT',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(rightsBody)}):await fetch(API+`/api/releases/${rid}/rights`,{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(rightsBody)});
-     const rhd=await rrh.json();if(!rrh.ok)throw Error(rhd.error||`Os direitos da Faixa ${i+1} não puderam ser guardados`);
+     await readApiResponse(rrh);
    }
    setPreflight(null);setMsg(`Rascunho guardado com ${tracks.length} ${tracks.length===1?'faixa':'faixas'}.`);setStep(4);
   }catch(e:any){setMsg(e.message)}finally{setBusy(false)}}
