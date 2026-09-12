@@ -85,7 +85,7 @@ O fluxo de Novo Lançamento agora inclui participação/feat., tipo de áudio (m
 **Mídia:** esta versão inclui `amanha-de-manha.mp3` e `cafe.mp3`. A fotografia principal `young-black-baby-main.jpg` continua referenciada pelo site e deve ser preservada no repositório atual se já estiver publicada.
 
 
-## V10.2.1 — inicialização automática da base de dados
+## V10.2.2 — inicialização automática da base de dados
 
 A API passa a verificar e aplicar o schema e as migrações SQL de forma idempotente durante o arranque. Isso evita depender do `PSQL Command` do Render para preparar a estrutura V10.2.
 
