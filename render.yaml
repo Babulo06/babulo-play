@@ -28,6 +28,13 @@ services:
         value: "false"
       - key: UPLOAD_DIR
         value: /var/data/babulo-play-media
+      # Bootstrap seguro do primeiro OWNER. Configurar manualmente no Render.
+      - key: BOOTSTRAP_OWNER_ENABLED
+        sync: false
+      - key: BOOTSTRAP_OWNER_EMAIL
+        sync: false
+      - key: BOOTSTRAP_OWNER_PASSWORD
+        sync: false
     disk:
       name: babulo-play-media
       mountPath: /var/data/babulo-play-media

@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -48,6 +48,48 @@ async function ensureDatabaseSchema() {
   } catch (error) {
     console.error('Database schema initialization failed:', error);
     throw error;
+  }
+}
+
+
+async function bootstrapFirstOwner() {
+  const enabled = String(process.env.BOOTSTRAP_OWNER_ENABLED || '').toLowerCase() === 'true';
+  if (!enabled) return;
+  const email = String(process.env.BOOTSTRAP_OWNER_EMAIL || '').trim().toLowerCase();
+  const password = String(process.env.BOOTSTRAP_OWNER_PASSWORD || '');
+  if (!email || !email.includes('@')) throw new Error('BOOTSTRAP_OWNER_EMAIL inválido.');
+  if (password.length < 12) throw new Error('BOOTSTRAP_OWNER_PASSWORD deve ter pelo menos 12 caracteres.');
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const marker = (await client.query("select key from system_settings where key='owner_bootstrap_completed' limit 1")).rows[0];
+    if (marker) {
+      await client.query('ROLLBACK');
+      console.log('Owner bootstrap já foi concluído anteriormente; nenhum novo OWNER será criado.');
+      return;
+    }
+    const existing = (await client.query("select id from users where role='OWNER' limit 1")).rows[0];
+    if (existing) {
+      await client.query("insert into system_settings(key,value) values('owner_bootstrap_completed','existing_owner') on conflict (key) do nothing");
+      await client.query('COMMIT');
+      console.log('Já existe um OWNER; bootstrap inicial não criou outra conta.');
+      return;
+    }
+    const duplicate = (await client.query('select id from users where lower(email)=lower($1) limit 1',[email])).rows[0];
+    if (duplicate) throw new Error('BOOTSTRAP_OWNER_EMAIL já pertence a uma conta existente.');
+    const user = (await client.query(
+      `insert into users(email,password_hash,role,status,email_verified) values($1,$2,'OWNER','ACTIVE',true) returning id,email,role,created_at`,
+      [email, hashPassword(password)]
+    )).rows[0];
+    await client.query("insert into system_settings(key,value) values('owner_bootstrap_completed',$1)", [user.id]);
+    await client.query('COMMIT');
+    console.log('Primeiro OWNER criado com sucesso pelo bootstrap seguro do Render.');
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch {}
+    throw error;
+  } finally {
+    client.release();
   }
 }
 
@@ -763,5 +805,6 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 ensureDatabaseSchema()
+  .then(() => bootstrapFirstOwner())
   .then(() => app.listen(port,()=>console.log(`BaBuLo API running on :${port}`)))
   .catch(() => process.exit(1));

@@ -97,3 +97,17 @@ Inclui as funcionalidades V10.2 de participação/feat, tipo de áudio, utiliza�
 - Analytics de streams por país, cidade, ouvintes únicos e faixas.
 - Dashboard financeiro administrativo com saldos separados.
 - Sessão do artista isolada da área de ouvinte.
+
+## V10.4.1 — primeiro OWNER via Render
+
+A conta OWNER não pode ser criada pelo registo público. Para criar o primeiro OWNER de forma segura, use as variáveis privadas do serviço **babulo-play-api** no Render:
+
+- `BOOTSTRAP_OWNER_ENABLED=true`
+- `BOOTSTRAP_OWNER_EMAIL=seu-email`
+- `BOOTSTRAP_OWNER_PASSWORD=uma-palavra-passe-forte-com-pelo-menos-12-caracteres`
+
+Faça um deploy/redeploy. Na primeira inicialização, se ainda não existir nenhum OWNER, a API cria a conta automaticamente e grava uma marca de conclusão na base de dados. O bootstrap é **one-shot**: mesmo que as variáveis permaneçam no Render, não cria outro OWNER.
+
+Depois de confirmar que consegue entrar como OWNER, altere `BOOTSTRAP_OWNER_ENABLED` para `false` e, por segurança, remova/limpe `BOOTSTRAP_OWNER_PASSWORD` das variáveis do Render.
+
+Nunca coloque estas credenciais no GitHub, `.env` versionado, código-fonte ou screenshots.
