@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 
 type Track={id:string;title:string;artist:string;genre:string;coverUrl:string|null;audioUrl?:string};
 type Release={id:string;title:string;type:string;cover_url?:string|null;status?:string};
-const API=process.env.NEXT_PUBLIC_API_URL||'https://babulo-play-api.onrender.com';
+const API=process.env.NEXT_PUBLIC_API_URL||'http://localhost:4000';
 const img={logo:'/media/babulo-play-logo.jpg',cover:'/media/amanha-de-manha.jpeg',face:'/media/young-black-baby-portrait.jpeg',main:'/media/young-black-baby-main.jpg',live:'/media/young-black-baby-live.jpeg'};
 const demoTracks:Track[]=[
  {id:'1',title:'Amanhã De Manhã',artist:'Young Black Baby',genre:'Rap / Hip-Hop',coverUrl:img.cover,audioUrl:'/media/amanha-de-manha.mp3'},

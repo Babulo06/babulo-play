@@ -15,6 +15,41 @@ const uploadDir = process.env.UPLOAD_DIR || path.resolve(process.cwd(), 'storage
 fs.mkdirSync(uploadDir, { recursive: true });
 const upload = multer({ dest: uploadDir, limits: { fileSize: 200 * 1024 * 1024 } });
 
+async function ensureDatabaseSchema() {
+  if (!process.env.DATABASE_URL) {
+    console.warn('DATABASE_URL não definido; a API continuará sem inicializar o schema.');
+    return;
+  }
+
+  const rootDir = path.resolve(__dirname, '../../../');
+  const schemaPath = path.join(rootDir, 'packages/db/schema.sql');
+  const migrationsDir = path.join(rootDir, 'packages/db/migrations');
+
+  try {
+    if (!fs.existsSync(schemaPath)) {
+      throw new Error(`Schema não encontrado em ${schemaPath}`);
+    }
+
+    // O schema principal contém comandos psql \\i, que não são aceites pelo driver pg.
+    // Executamos o schema base e, em seguida, as migrações SQL de forma idempotente.
+    const schema = fs.readFileSync(schemaPath, 'utf8')
+      .replace(/^\s*\\i\s+.*$/gm, '')
+      .trim();
+    await pool.query(schema);
+
+    for (const file of ['004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql']) {
+      const migrationPath = path.join(migrationsDir, file);
+      if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
+      await pool.query(fs.readFileSync(migrationPath, 'utf8'));
+    }
+
+    console.log('BaBuLo DB schema verified and migrations applied.');
+  } catch (error) {
+    console.error('Database schema initialization failed:', error);
+    throw error;
+  }
+}
+
 app.use(cors({ origin: process.env.WEB_ORIGIN || 'http://localhost:3000' }));
 app.use(express.json({ limit: '2mb' }));
 app.use('/media', express.static(uploadDir));
@@ -235,7 +270,7 @@ app.post('/api/releases/:id/rights', auth, artistOnly, async (req:AuthedRequest,
 app.delete('/api/releases/:id/rights/:rightId', auth, artistOnly, async (req:AuthedRequest,res) => {
   const q=await pool.query(`delete from rights_declarations rd using releases r,artists a where rd.id=$1 and rd.release_id=r.id and r.primary_artist_id=a.id and r.id=$2 and a.user_id=$3 returning rd.id`,[req.params.rightId,req.params.id,req.user!.id]);
   if(!q.rows[0]) return res.status(404).json({error:'Declaração de direitos não encontrada'});
-  await audit(req.user!.id,'RIGHT_DELETED','RIGHTS',String(req.params.rightId),{releaseId:String(req.params.id)});
+  await audit(req.user!.id,'RIGHT_DELETED','RIGHTS',req.params.rightId,{releaseId:req.params.id});
   res.json({ok:true});
 });
 
@@ -446,4 +481,6 @@ app.get('/api/distribution/catalog-migrations',auth,artistOnly,async(req:AuthedR
 app.get('/api/admin/distribution/orders',auth,adminOnly,async(_q,res)=>res.json({orders:(await pool.query(`select o.*,r.title release_title,a.stage_name from distribution_orders o join releases r on r.id=o.release_id join artists a on a.id=o.artist_id order by o.created_at desc`)).rows}));
 app.post('/api/admin/distribution/deliveries/:id/status',auth,adminOnly,async(req:AuthedRequest,res)=>{const {status,externalReleaseId,externalUrl,errorCode,errorMessage}=req.body||{};if(!DIST_STATUSES.includes(status))return res.status(400).json({error:'Estado inválido'});const d=(await pool.query(`select d.*,o.id order_id,p.name platform_name from distribution_deliveries d join distribution_orders o on o.id=d.order_id join distribution_platforms p on p.id=d.platform_id where d.id=$1`,[req.params.id])).rows[0];if(!d)return res.status(404).json({error:'Entrega não encontrada'});await pool.query(`update distribution_deliveries set status=$1,external_release_id=coalesce($2,external_release_id),external_url=coalesce($3,external_url),error_code=$4,error_message=$5,delivered_at=case when $1='DELIVERED' then now() else delivered_at end,published_at=case when $1='PUBLISHED' then now() else published_at end,updated_at=now() where id=$6`,[status,externalReleaseId||null,externalUrl||null,errorCode||null,errorMessage||null,d.id]);const c=(await pool.query(`select count(*)::int total,count(*) filter(where status='PUBLISHED')::int published,count(*) filter(where status='FAILED')::int failed from distribution_deliveries where order_id=$1`,[d.order_id])).rows[0];const os=Number(c.published)===Number(c.total)?'PUBLISHED':Number(c.failed)+Number(c.published)===Number(c.total)&&Number(c.failed)>0?'FAILED':'PROCESSING';await pool.query(`update distribution_orders set status=$1,error=$2,completed_at=case when $1 in ('PUBLISHED','FAILED') then now() else completed_at end,updated_at=now() where id=$3`,[os,errorMessage||null,d.order_id]);await distHistory(d.order_id,d.id,d.status,status,`Estado ${d.platform_name}: ${status}`,req.user!.id);await audit(req.user!.id,'DISTRIBUTION_DELIVERY_STATUS','DISTRIBUTION_DELIVERY',d.id,{status});res.json({ok:true,status,orderStatus:os})});
 
-app.listen(port,()=>console.log(`BaBuLo API running on :${port}`));
+ensureDatabaseSchema()
+  .then(() => app.listen(port,()=>console.log(`BaBuLo API running on :${port}`)))
+  .catch(() => process.exit(1));
