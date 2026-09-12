@@ -185,8 +185,23 @@ app.get('/api/artists/me/releases', auth, artistOnly, async (req:AuthedRequest,r
   res.json({releases:q.rows});
 });
 
+app.delete('/api/releases/:id', auth, artistOnly, async (req:AuthedRequest,res) => {
+  const release=(await pool.query(`select r.id,r.title,r.type,r.status,r.cover_url from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`,[req.params.id,req.user!.id])).rows[0];
+  if(!release) return res.status(404).json({error:'Lançamento não encontrado'});
+  if(['PUBLISHED','TAKEN_DOWN'].includes(String(release.status))) return res.status(409).json({error:'Este lançamento já foi publicado e não pode ser eliminado daqui.'});
+  const order=(await pool.query('select id from distribution_orders where release_id=$1 limit 1',[release.id])).rows[0];
+  if(order) return res.status(409).json({error:'Este lançamento já tem uma ordem de distribuição e não pode ser eliminado.'});
+  const files=(await pool.query(`select tf.storage_key from track_files tf join tracks t on t.id=tf.track_id where t.primary_release_id=$1`,[release.id])).rows;
+  const coverKey=release.cover_url?String(release.cover_url).split('/').pop():'';
+  await pool.query('delete from releases where id=$1',[release.id]);
+  for(const f of files){const key=String(f.storage_key||'').replace(/^.*[\/]/,''); if(key){try{const fp=path.join(uploadDir,key);if(fs.existsSync(fp))fs.unlinkSync(fp);}catch{}}}
+  if(coverKey&&coverKey.startsWith(String(req.user!.id)+'-')){try{const fp=path.join(uploadDir,coverKey);if(fs.existsSync(fp))fs.unlinkSync(fp);}catch{}}
+  await audit(req.user!.id,'RELEASE_DELETED','RELEASE',release.id,{title:release.title});
+  res.json({ok:true,id:release.id});
+});
+
 app.post('/api/tracks', auth, artistOnly, async (req:AuthedRequest,res) => {
-  const { title, releaseId, trackNumber, genreId, language, version, durationMs, isExplicit=false, explicitReason, isrc, originalReleaseDate, fileUrl, fileType='AUDIO', composer, lyricist, producer, performer, publisher, featuredArtists='', audioType='SONG', aiGenerated='NO', aiUsage='', lyrics='' } = req.body || {};
+  const { title, releaseId, trackNumber, genreId, language, version, durationMs, isExplicit=false, explicitReason, isrc, originalReleaseDate, fileUrl, fileType='AUDIO', composer, lyricist, producer, performer, publisher, featuredArtists='', audioType='SONG', promoStartMs=0, promoEndMs=0, aiGenerated='NO', aiUsage='', lyrics='' } = req.body || {};
   if(!title || !releaseId) return res.status(400).json({error:'Título e lançamento são obrigatórios'});
   const safeAudioTypes=['SONG','INSTRUMENTAL','ACAPELLA','LIVE','REMIX','COVER'];
   const safeAi=['NO','PARTIAL','FULL'];
@@ -206,7 +221,7 @@ app.post('/api/tracks', auth, artistOnly, async (req:AuthedRequest,res) => {
   try{ await client.query('begin');
     const t=(await client.query(`insert into tracks(title,track_number,version,duration_ms,language,genre_id,is_explicit,explicit_reason,isrc,isrc_status,isrc_source,original_release_date,composer,lyricist,producer,performer,publisher,featured_artists,audio_type,ai_generated,ai_usage,lyrics,promo_start_ms,promo_end_ms,primary_release_id) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25) returning *`,[title,trackNumber?Number(trackNumber):null,version||null,durationMs||null,language||null,genreId||null,Boolean(isExplicit),explicitReason||null,isrc||null,isrc?'ASSIGNED':'PENDING_ASSIGNMENT',isrc?'ARTIST_PROVIDED':'NOT_PROVIDED',originalReleaseDate||null,composer||null,lyricist||null,producer||null,performer||null,publisher||null,safeFeaturedArtists||null,String(audioType),String(aiGenerated),safeAiUsage||null,safeLyrics||null,Math.max(0,Number(promoStartMs)||0),Math.max(0,Number(promoEndMs)||0),releaseId])).rows[0];
     await client.query(`insert into track_artists(track_id,artist_id,role) values($1,$2,'PRIMARY')`,[t.id,artist.id]);
-    if(fileUrl){ await client.query(`insert into track_files(track_id,storage_key,file_type,format,status) values($1,$2,$3,$4,'UPLOADED')`,[t.id,fileUrl,fileType,'unknown']); }
+    if(fileUrl){ const storageKey=String(fileUrl).split('/').pop()||String(fileUrl); await client.query(`insert into track_files(track_id,storage_key,file_type,format,status) values($1,$2,$3,$4,'UPLOADED')`,[t.id,storageKey,fileType,'unknown']); }
     await client.query('commit'); res.status(201).json({track:t});
   }catch(e){await client.query('rollback'); console.error(e); res.status(500).json({error:'Não foi possível criar a música'});}finally{client.release();}
 });
@@ -230,6 +245,15 @@ app.post('/api/uploads', auth, upload.single('file'), async (req:AuthedRequest,r
   res.status(201).json({file:{name:req.file.originalname,size:req.file.size,mimeType:req.file.mimetype,storageKey:finalName,url:`/media/${finalName}`,kind}});
 });
 
+
+app.delete('/api/uploads', auth, artistOnly, async (req:AuthedRequest,res) => {
+  const key=String(req.query.key||'').split('/').pop()||'';
+  if(!key || !key.startsWith(String(req.user!.id)+'-')) return res.status(403).json({error:'Ficheiro não pertence à tua conta.'});
+  const fp=path.join(uploadDir,key);
+  try { if(fs.existsSync(fp)) fs.unlinkSync(fp); } catch {}
+  await pool.query(`delete from track_files where storage_key=$1`,[key]);
+  res.json({ok:true});
+});
 
 app.delete('/api/tracks/:trackId/audio', auth, artistOnly, async (req:AuthedRequest,res) => {
   const q=await pool.query(`select tf.id,tf.storage_key,t.primary_release_id from track_files tf join tracks t on t.id=tf.track_id join releases r on r.id=t.primary_release_id join artists a on a.id=r.primary_artist_id where tf.track_id=$1 and tf.file_type='AUDIO' and a.user_id=$2 order by tf.created_at desc limit 1`,[req.params.trackId,req.user!.id]);
