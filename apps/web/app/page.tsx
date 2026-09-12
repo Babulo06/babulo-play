@@ -33,8 +33,8 @@ export default function Home(){
    return;
   }
   if(!stored)localStorage.setItem('babulo_artist_last_activity',String(now));
-  let timer:ReturnType<typeof setTimeout>|null=null;
-  let heartbeat:ReturnType<typeof setInterval>|null=null;
+  let timer:number|null=null;
+  let heartbeat:number|null=null;
   const check=()=>{
    const last=Number(localStorage.getItem('babulo_artist_last_activity')||Date.now());
    const remaining=ARTIST_IDLE_LIMIT_MS-(Date.now()-last);
