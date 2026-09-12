@@ -24,30 +24,3 @@
   height:auto;
   object-fit:contain;
 }
-
-/* BaBuLo Play — animação leve */
-
-@keyframes babuloLogoFloat {
-  0%, 100% {
-    transform: scale(1);
-  }
-
-  50% {
-    transform: scale(1.018);
-  }
-}
-
-.logoWrap img,
-.authModal > img,
-.mobileBrand img {
-  animation: babuloLogoFloat 5s ease-in-out infinite;
-  transform-origin: center;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .logoWrap img,
-  .authModal > img,
-  .mobileBrand img {
-    animation: none;
-  }
-}
