@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql']) {
+    for (const file of ['004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -106,7 +106,7 @@ async function audit(actorUserId: string | undefined, action: string, entityType
 
 const RIGHTS_ROLES=['RIGHTS_HOLDER','ARTIST','COMPOSER','LYRICIST','PRODUCER','PERFORMER','PUBLISHER','LABEL'];
 const RIGHT_TYPES=['STREAMING','DOWNLOAD','DISTRIBUTION','VIDEO','ADS','SYNC'];
-const PAYMENT_METHODS=['MULTICAIXA_EXPRESS','MULTICAIXA_REFERENCE','VISA','MASTERCARD'];
+const PAYMENT_METHODS=['WALLET','MULTICAIXA_EXPRESS','MULTICAIXA_REFERENCE','VISA','MASTERCARD'];
 const PAYMENT_STATUSES=['PENDING','PAID','FAILED','CANCELLED','REFUNDED'];
 function makePaymentReference(){ return `BBP-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`; }
 
@@ -178,6 +178,15 @@ app.put('/api/releases/:id', auth, artistOnly, async (req:AuthedRequest,res) => 
   res.json({release:q.rows[0]});
 });
 
+app.get('/api/releases/:id/editor', auth, artistOnly, async (req:AuthedRequest,res) => {
+  const release=(await pool.query(`select r.* from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`,[req.params.id,req.user!.id])).rows[0];
+  if(!release) return res.status(404).json({error:'Lançamento não encontrado'});
+  const tracks=(await pool.query(`select t.*,tf.storage_key,tf.format as file_format from tracks t left join track_files tf on tf.track_id=t.id and tf.file_type='AUDIO' where t.primary_release_id=$1 order by t.track_number nulls last,t.created_at`,[release.id])).rows;
+  const rights=(await pool.query(`select * from rights_declarations where release_id=$1 order by created_at`,[release.id])).rows;
+  const mappedTracks=tracks.map((t:any)=>({...t,audioUrl:t.storage_key?`/media/${String(t.storage_key).split('/').pop()}`:'' ,audioName:t.storage_key?String(t.storage_key).split('/').pop():'',serverTrackId:t.id,serverRightId:(rights.find((r:any)=>String(r.track_id)===String(t.id))||{}).id||undefined}));
+  res.json({release,tracks:mappedTracks,rights});
+});
+
 app.get('/api/artists/me/releases', auth, artistOnly, async (req:AuthedRequest,res) => {
   const artist=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];
   if(!artist) return res.status(404).json({error:'Perfil de artista não encontrado'});
@@ -207,6 +216,7 @@ app.post('/api/tracks', auth, artistOnly, async (req:AuthedRequest,res) => {
   const safeAi=['NO','PARTIAL','FULL'];
   if(!safeAudioTypes.includes(String(audioType))) return res.status(400).json({error:'Tipo de áudio inválido'});
   if(!safeAi.includes(String(aiGenerated))) return res.status(400).json({error:'Estado de IA inválido'});
+  if(Math.max(0,Number(promoEndMs)||0)-Math.max(0,Number(promoStartMs)||0)!==59000) return res.status(400).json({error:'O trecho promocional deve ter exatamente 59 segundos.'});
   const safeFeaturedArtists=Array.isArray(featuredArtists)
     ? featuredArtists.map((x:any)=>String(x).trim()).filter(Boolean).slice(0,20).join(', ')
     : String(featuredArtists||'').trim().slice(0,2000);
@@ -224,6 +234,18 @@ app.post('/api/tracks', auth, artistOnly, async (req:AuthedRequest,res) => {
     if(fileUrl){ const storageKey=String(fileUrl).split('/').pop()||String(fileUrl); await client.query(`insert into track_files(track_id,storage_key,file_type,format,status) values($1,$2,$3,$4,'UPLOADED')`,[t.id,storageKey,fileType,'unknown']); }
     await client.query('commit'); res.status(201).json({track:t});
   }catch(e){await client.query('rollback'); console.error(e); res.status(500).json({error:'Não foi possível criar a música'});}finally{client.release();}
+});
+
+app.put('/api/tracks/:trackId', auth, artistOnly, async (req:AuthedRequest,res) => {
+  const {title,trackNumber,genreId,language,version,durationMs,isExplicit=false,explicitReason,isrc,originalReleaseDate,composer,lyricist,producer,performer,publisher,featuredArtists='',audioType='SONG',promoStartMs=0,promoEndMs=0,aiGenerated='NO',aiUsage='',lyrics='',fileUrl} = req.body || {};
+  const t=(await pool.query(`select t.id,t.primary_release_id from tracks t join releases r on r.id=t.primary_release_id join artists a on a.id=r.primary_artist_id where t.id=$1 and a.user_id=$2`,[req.params.trackId,req.user!.id])).rows[0];
+  if(!t) return res.status(404).json({error:'Faixa não encontrada'});
+  if(Math.max(0,Number(promoEndMs)||0)-Math.max(0,Number(promoStartMs)||0)!==59000) return res.status(400).json({error:'O trecho promocional deve ter exatamente 59 segundos.'});
+  const safeFeaturedArtists=Array.isArray(featuredArtists)?featuredArtists.map((x:any)=>String(x).trim()).filter(Boolean).slice(0,20).join(', '):String(featuredArtists||'').trim().slice(0,2000);
+  const safeAiUsage=Array.isArray(aiUsage)?aiUsage.map((x:any)=>String(x).trim()).filter(Boolean).slice(0,20).join(', '):String(aiUsage||'').trim().slice(0,2000);
+  const q=await pool.query(`update tracks set title=coalesce($1,title),track_number=$2,genre_id=$3,language=$4,version=$5,duration_ms=$6,is_explicit=$7,explicit_reason=$8,isrc=$9,isrc_status=case when $9 is not null and $9<>'' then 'ASSIGNED' else isrc_status end,isrc_source=case when $9 is not null and $9<>'' then 'ARTIST_PROVIDED' else isrc_source end,original_release_date=$10,composer=$11,lyricist=$12,producer=$13,performer=$14,publisher=$15,featured_artists=$16,audio_type=$17,ai_generated=$18,ai_usage=$19,lyrics=$20,promo_start_ms=$21,promo_end_ms=$22 where id=$23 returning *`,[title||null,trackNumber?Number(trackNumber):null,genreId||null,language||null,version||null,durationMs||null,Boolean(isExplicit),explicitReason||null,isrc||null,originalReleaseDate||null,composer||null,lyricist||null,producer||null,performer||null,publisher||null,safeFeaturedArtists||null,String(audioType),String(aiGenerated),safeAiUsage||null,String(lyrics||'').slice(0,100000),Math.max(0,Number(promoStartMs)||0),Math.max(0,Number(promoEndMs)||0),t.id]);
+  if(fileUrl){const key=String(fileUrl).split('/').pop()||String(fileUrl); await pool.query(`delete from track_files where track_id=$1 and file_type='AUDIO'`,[t.id]); await pool.query(`insert into track_files(track_id,storage_key,file_type,format,status) values($1,$2,'AUDIO',$3,'UPLOADED')`,[t.id,key,'unknown']);}
+  res.json({track:q.rows[0]});
 });
 
 app.put('/api/artists/me', auth, artistOnly, async (req:AuthedRequest,res) => {
@@ -284,7 +306,7 @@ app.post('/api/releases/:id/preflight', auth, artistOnly, async (req:AuthedReque
   if(!release.title) errors.push('Título do lançamento em falta.');
   if(!release.cover_url) errors.push('Capa não enviada.');
   if(!tracks.length) errors.push('O lançamento precisa de pelo menos uma faixa.');
-  for(const t of tracks){ if(!t.title) errors.push('Uma faixa está sem título.'); if(!t.storage_key) errors.push(`A faixa “${t.title}” não tem áudio enviado.`); }
+  for(const t of tracks){ if(!t.title) errors.push('Uma faixa está sem título.'); if(!t.storage_key) errors.push(`A faixa “${t.title}” não tem áudio enviado.`); if(Number(t.promo_end_ms)-Number(t.promo_start_ms)!==59000) errors.push(`O trecho promocional da faixa “${t.title||'Sem título'}” deve ter exatamente 59 segundos.`); }
   if(release.cover_url){ const key=String(release.cover_url).split('/').pop(); const fp=path.join(uploadDir,key||''); if(!fs.existsSync(fp)) errors.push('Ficheiro da capa não encontrado no armazenamento.'); else { const d=imageDimensions(fp); if(!d) errors.push('Não foi possível validar as dimensões da capa.'); else if(d.width!==600||d.height!==600) errors.push(`A capa tem ${d.width}×${d.height}px. A BaBuLo Play exige exatamente 600×600px.`); } }
   const status=errors.length?'FAILED':'PASSED';
   await pool.query(`update releases set preflight_status=$1,preflight_reason=$2,status=$3,submitted_at=case when $1='PASSED' then now() else submitted_at end where id=$4`,[status,errors.length?errors.join(' '):null,'DRAFT',release.id]);
@@ -308,12 +330,16 @@ app.get('/api/releases/:id/payment', auth, artistOnly, async (req:AuthedRequest,
   const mode=payment?.metadata?.distributionMode || 'MAIN';
   const fullExtra=Math.round(Number(product.amount)*0.5*100)/100;
   const total=mode==='ALL'?Number(product.amount)+fullExtra:Number(product.amount);
-  res.json({release,product,payment,paid:Boolean(payment?.status==='PAID'),distribution:{mode,selectedCodes,mainPlatformCodes:MAIN_PLATFORM_CODES,allPlatformCodes:ALL_PLATFORM_CODES,baseAmount:Number(product.amount),extraAllPlatforms:fullExtra,totalAmount:total,surchargePercent:50}});
+  const wallet=Number((await pool.query(`select coalesce(sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount else 0 end),0) balance from financial_ledger where artist_id=$1`,[release.artist_id])).rows[0].balance||0);
+  const walletApplied=Number(payment?.metadata?.walletAmount||0);
+  const externalDue=Math.max(0,total-walletApplied);
+  res.json({release,product,payment,paid:Boolean(payment?.status==='PAID'),wallet:{balance:wallet,applied:walletApplied,externalDue},distribution:{mode,selectedCodes,mainPlatformCodes:MAIN_PLATFORM_CODES,allPlatformCodes:ALL_PLATFORM_CODES,baseAmount:Number(product.amount),extraAllPlatforms:fullExtra,totalAmount:total,surchargePercent:50}});
 });
 
 app.post('/api/releases/:id/payment', auth, artistOnly, async (req:AuthedRequest,res) => {
-  const {paymentMethod='MULTICAIXA_EXPRESS',distributionMode='MAIN'}=req.body||{};
+  const {paymentMethod='WALLET',fallbackPaymentMethod='MULTICAIXA_EXPRESS',distributionMode='MAIN'}=req.body||{};
   if(!PAYMENT_METHODS.includes(String(paymentMethod))) return res.status(400).json({error:'Método de pagamento inválido'});
+  if(!['MULTICAIXA_EXPRESS','MULTICAIXA_REFERENCE','VISA','MASTERCARD'].includes(String(fallbackPaymentMethod))) return res.status(400).json({error:'Método para a diferença inválido'});
   if(!['MAIN','ALL'].includes(String(distributionMode))) return res.status(400).json({error:'Plano de distribuição inválido'});
   const release=(await pool.query(`select r.id,r.title,r.type,a.id artist_id from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`,[req.params.id,req.user!.id])).rows[0];
   if(!release) return res.status(404).json({error:'Lançamento não encontrado'});
@@ -330,12 +356,34 @@ app.post('/api/releases/:id/payment', auth, artistOnly, async (req:AuthedRequest
   else if(existingPaid && distributionMode==='MAIN') return res.json({payment:existingPaid,paid:true,message:'Pagamento base já confirmado.'});
   const pending=(await pool.query(`select id,reference,amount,currency,payment_method,gateway,status,metadata,paid_at,created_at from payment_transactions where release_id=$1 and status='PENDING' order by created_at desc limit 1`,[release.id])).rows[0];
   if(pending) return res.json({payment:pending,paid:false,message:'Já existe um pagamento pendente para este lançamento.'});
-  const reference=makePaymentReference();
-  const gateway=paymentMethod==='MULTICAIXA_EXPRESS'?'MULTICAIXA_EXPRESS':paymentMethod==='MULTICAIXA_REFERENCE'?'MULTICAIXA':'CARD';
-  const metadata={releaseId:release.id,releaseTitle:release.title,productCode,productName:product.name,paymentInstructions:paymentMethod==='MULTICAIXA_REFERENCE'?'Use a referência apresentada para concluir o pagamento.':'Conclua o pagamento pelo método selecionado e aguarde a confirmação.',distributionMode,platformCodes:selectedCodes,surchargePercent:distributionMode==='ALL'?50:0,paymentType};
-  const q=await pool.query(`insert into payment_transactions(user_id,product_id,release_id,service_type,payment_method,gateway,reference,idempotency_key,amount,currency,net_amount,status,metadata) values($1,$2,$3,'DISTRIBUTION',$4,$5,$6,$7,$8,$9,$8,'PENDING',$10) returning id,reference,amount,currency,payment_method,gateway,status,metadata,paid_at,created_at`,[req.user!.id,product.id,release.id,paymentMethod,gateway,reference,crypto.randomUUID(),amount,product.currency,JSON.stringify(metadata)]);
-  await audit(req.user!.id,'RELEASE_PAYMENT_CREATED','PAYMENT',q.rows[0].id,{releaseId:release.id,productCode,paymentMethod,distributionMode,paymentType,amount});
-  res.status(201).json({payment:q.rows[0],paid:false,message:'Pedido de pagamento criado. Aguarda a confirmação do pagamento.'});
+
+  const client=await pool.connect();
+  try{
+    await client.query('begin');
+    await client.query(`select id from artists where id=$1 for update`,[release.artist_id]);
+    const bal=Number((await client.query(`select coalesce(sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount else 0 end),0) balance from financial_ledger where artist_id=$1`,[release.artist_id])).rows[0].balance||0);
+    const walletRequested=String(paymentMethod)==='WALLET';
+    const walletAmount=walletRequested?Math.min(Math.max(0,bal),amount):0;
+    const externalAmount=Math.max(0,amount-walletAmount);
+    if(walletRequested && walletAmount<=0){ await client.query('rollback'); return res.status(400).json({error:'O teu saldo de streams não tem fundos disponíveis para este pagamento. Escolhe um método para pagar o valor.',walletBalance:bal,required:amount}); }
+    const effectiveMethod=externalAmount>0?String(fallbackPaymentMethod):'WALLET';
+    const reference=makePaymentReference();
+    const gateway=effectiveMethod==='WALLET'?'WALLET':effectiveMethod==='MULTICAIXA_EXPRESS'?'MULTICAIXA_EXPRESS':effectiveMethod==='MULTICAIXA_REFERENCE'?'MULTICAIXA':'CARD';
+    const metadata={releaseId:release.id,releaseTitle:release.title,productCode,productName:product.name,paymentInstructions:effectiveMethod==='MULTICAIXA_REFERENCE'?'Use a referência apresentada para concluir o pagamento.':effectiveMethod==='WALLET'?'Pagamento efetuado com saldo acumulado dos streams.':'Conclua o pagamento pelo método selecionado e aguarde a confirmação.',distributionMode,platformCodes:selectedCodes,surchargePercent:distributionMode==='ALL'?50:0,paymentType,walletAmount,externalAmount,totalAmount:amount};
+    const status=externalAmount===0?'PAID':'PENDING';
+    const q=await client.query(`insert into payment_transactions(user_id,product_id,release_id,service_type,payment_method,gateway,reference,idempotency_key,amount,currency,net_amount,status,metadata,paid_at) values($1,$2,$3,'DISTRIBUTION',$4,$5,$6,$7,$8,$9,$8,$10,$11,case when $10='PAID' then now() else null end) returning id,reference,amount,currency,payment_method,gateway,status,metadata,paid_at,created_at`,[req.user!.id,product.id,release.id,effectiveMethod,gateway,reference,crypto.randomUUID(),externalAmount,product.currency,status,JSON.stringify(metadata)]);
+    if(walletAmount>0){
+      const after=bal-walletAmount;
+      await client.query(`insert into financial_ledger(artist_id,entry_type,reference_type,reference_id,amount,currency,balance_after,description) values($1,'DEBIT','RELEASE_PAYMENT',$2,$3,'AOA',$4,$5)`,[release.artist_id,q.rows[0].id,walletAmount,after,externalAmount>0?'Reserva de saldo dos streams para pagamento do lançamento':'Pagamento do lançamento com saldo dos streams']);
+    }
+    await client.query('commit');
+    await audit(req.user!.id,'RELEASE_PAYMENT_CREATED', 'PAYMENT',q.rows[0].id,{releaseId:release.id,productCode,paymentMethod:effectiveMethod,distributionMode,paymentType,amount,walletAmount,externalAmount});
+    res.status(201).json({payment:q.rows[0],paid:status==='PAID',wallet:{balance:bal-walletAmount,applied:walletAmount,externalDue:externalAmount},message:status==='PAID'?'✓ Lançamento pago com o saldo dos streams.':'Saldo dos streams aplicado. Paga agora apenas a diferença.'});
+  }catch(e){
+    try{await client.query('rollback')}catch{}
+    console.error('release wallet payment error',e);
+    res.status(500).json({error:'Não foi possível processar o pagamento do lançamento.'});
+  }finally{client.release()}
 });
 
 app.post('/api/admin/payments/:id/confirm', auth, adminOnly, async (req:AuthedRequest,res) => {
@@ -368,6 +416,18 @@ app.post('/api/releases/:id/rights', auth, artistOnly, async (req:AuthedRequest,
   const q=await pool.query(`insert into rights_declarations(release_id,track_id,party_name,party_role,right_type,percentage,territory,valid_from,valid_to,document_url,created_by) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning *`,[release.id,trackId||null,partyName,partyRole,rightType,pct,territory,validFrom||null,validTo||null,documentUrl||null,req.user!.id]);
   await audit(req.user!.id,'RIGHT_CREATED','RIGHTS',q.rows[0].id,{releaseId:release.id});
   res.status(201).json({right:q.rows[0]});
+});
+
+app.put('/api/releases/:id/rights/:rightId', auth, artistOnly, async (req:AuthedRequest,res) => {
+  const {partyName,partyRole='RIGHTS_HOLDER',rightType='STREAMING',percentage,territory='WORLDWIDE'}=req.body||{};
+  const release=(await pool.query(`select r.id from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`,[req.params.id,req.user!.id])).rows[0];
+  if(!release) return res.status(404).json({error:'Lançamento não encontrado'});
+  if(!partyName || percentage===undefined) return res.status(400).json({error:'Nome do titular e percentagem são obrigatórios'});
+  const pct=Number(percentage); if(!Number.isFinite(pct)||pct<0||pct>100) return res.status(400).json({error:'A percentagem deve estar entre 0 e 100'});
+  const q=await pool.query(`update rights_declarations set party_name=$1,party_role=$2,right_type=$3,percentage=$4,territory=$5 where id=$6 and release_id=$7 returning *`,[String(partyName).trim(),partyRole,rightType,pct,territory,req.params.rightId,release.id]);
+  if(!q.rows[0]) return res.status(404).json({error:'Declaração de direitos não encontrada'});
+  await audit(req.user!.id,'RIGHT_UPDATED','RIGHTS',q.rows[0].id,{releaseId:release.id});
+  res.json({right:q.rows[0]});
 });
 
 app.delete('/api/releases/:id/rights/:rightId', auth, artistOnly, async (req:AuthedRequest,res) => {
