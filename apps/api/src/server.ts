@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql']) {
+    for (const file of ['004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -67,9 +67,9 @@ function verifyPassword(password: string, stored: string) {
   return crypto.timingSafeEqual(Buffer.from(derived, 'hex'), Buffer.from(key, 'hex'));
 }
 function b64(value: string) { return Buffer.from(value).toString('base64url'); }
-function tokenFor(user: { id: string; role: string }) {
+function tokenFor(user: { id: string; role: string }, sid: string) {
   const header = b64(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-  const payload = b64(JSON.stringify({ sub: user.id, role: user.role, exp: Math.floor(Date.now()/1000) + 60*60*24*7 }));
+  const payload = b64(JSON.stringify({ sub: user.id, role: user.role, sid, exp: Math.floor(Date.now()/1000) + 60*60*24*7 }));
   const signature = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${payload}`).digest('base64url');
   return `${header}.${payload}.${signature}`;
 }
@@ -80,16 +80,37 @@ function decodeToken(token: string) {
   if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
   const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
   if (!data.exp || data.exp < Math.floor(Date.now()/1000)) return null;
-  return data as { sub: string; role: string; exp: number };
+  return data as { sub: string; role: string; sid?: string; exp: number };
 }
 type AuthedRequest = Request & { user?: { id: string; role: string } };
-function auth(req: AuthedRequest, res: Response, next: NextFunction) {
+async function auth(req: AuthedRequest, res: Response, next: NextFunction) {
   const value = req.headers.authorization;
   if (!value?.startsWith('Bearer ')) return res.status(401).json({ error: 'Autenticação necessária' });
   const decoded = decodeToken(value.slice(7));
   if (!decoded) return res.status(401).json({ error: 'Sessão inválida ou expirada' });
-  req.user = { id: decoded.sub, role: decoded.role }; next();
+  try {
+    const row=(await pool.query('select role,status from users where id=$1 limit 1',[decoded.sub])).rows[0];
+    if(!row || row.status!=='ACTIVE') return res.status(401).json({error:'Conta inativa ou não encontrada'});
+    const role=String(row.role||decoded.role);
+    if(role==='ARTIST'){
+      if(!decoded.sid) return res.status(401).json({error:'Sessão antiga da área do artista. Faça login novamente.'});
+      const session=(await pool.query('select last_activity_at,revoked_at from auth_sessions where id=$1 and user_id=$2 limit 1',[decoded.sid,decoded.sub])).rows[0];
+      if(!session || session.revoked_at) return res.status(401).json({error:'Sessão da área do artista encerrada. Faça login novamente.'});
+      const idleLimit=30*60*1000;
+      const last=session.last_activity_at?new Date(session.last_activity_at).getTime():0;
+      if(last && Date.now()-last>=idleLimit){
+        await pool.query('update auth_sessions set revoked_at=now() where id=$1',[decoded.sid]);
+        return res.status(401).json({error:'Sessão da área do artista expirada por inatividade. Faça login novamente.'});
+      }
+      if(!last || Date.now()-last>=60*1000) await pool.query('update auth_sessions set last_activity_at=now() where id=$1',[decoded.sid]);
+    }
+    req.user = { id: decoded.sub, role }; next();
+  } catch (error) {
+    console.error('auth session check failed:',error);
+    return res.status(500).json({error:'Não foi possível validar a sessão'});
+  }
 }
+
 function artistOnly(req: AuthedRequest, res: Response, next: NextFunction) {
   if (!['ARTIST','ADMIN','OWNER'].includes(req.user?.role || '')) return res.status(403).json({ error: 'Acesso reservado a artistas' });
   next();
@@ -126,8 +147,10 @@ app.post('/api/auth/register', async (req,res) => {
       if (!stageName) { await client.query('ROLLBACK'); return res.status(400).json({error:'stageName é obrigatório para contas de artista'}); }
       artist = (await client.query(`insert into artists(user_id,stage_name) values($1,$2) returning id,stage_name`, [u.rows[0].id, stageName])).rows[0];
     }
+    const sid=crypto.randomUUID();
+    if(safeRole==='ARTIST') await client.query(`insert into auth_sessions(id,user_id,role,last_activity_at) values($1,$2,$3,now())`,[sid,u.rows[0].id,safeRole]);
     await client.query('COMMIT');
-    res.status(201).json({ user:u.rows[0], artist, token:tokenFor(u.rows[0]) });
+    res.status(201).json({ user:u.rows[0], artist, token:tokenFor(u.rows[0],sid) });
   } catch (e:any) { await client.query('ROLLBACK'); res.status(e.code === '23505' ? 409 : 500).json({error:e.code === '23505' ? 'Email ou telefone já registado' : 'Não foi possível criar a conta'}); } finally { client.release(); }
 });
 
@@ -138,7 +161,21 @@ app.post('/api/auth/login', async (req,res) => {
   const user = q.rows[0];
   if (!user || user.status !== 'ACTIVE' || !verifyPassword(password,user.password_hash)) return res.status(401).json({error:'Credenciais inválidas'});
   delete user.password_hash;
-  res.json({user,token:tokenFor(user)});
+  const sid=crypto.randomUUID();
+  if(user.role==='ARTIST') await pool.query(`insert into auth_sessions(id,user_id,role,last_activity_at) values($1,$2,$3,now())`,[sid,user.id,user.role]);
+  res.json({user,token:tokenFor(user,sid)});
+});
+
+app.post('/api/auth/activity', auth, async (req:AuthedRequest,res) => {
+  const decoded=decodeToken(String(req.headers.authorization||'').slice(7));
+  if(req.user?.role==='ARTIST' && decoded?.sid) await pool.query('update auth_sessions set last_activity_at=now() where id=$1 and user_id=$2 and revoked_at is null',[decoded.sid,req.user.id]);
+  res.json({ok:true});
+});
+
+app.post('/api/auth/logout', auth, async (req:AuthedRequest,res) => {
+  const decoded=decodeToken(String(req.headers.authorization||'').slice(7));
+  if(req.user?.role==='ARTIST' && decoded?.sid) await pool.query('update auth_sessions set revoked_at=now() where id=$1 and user_id=$2',[decoded.sid,req.user.id]);
+  res.json({ok:true});
 });
 
 app.get('/api/auth/me', auth, async (req:AuthedRequest,res) => {

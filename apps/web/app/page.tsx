@@ -18,7 +18,53 @@ export default function Home(){
  const [authOpen,setAuthOpen]=useState(false),[authMode,setAuthMode]=useState<'login'|'register'>('login'),[email,setEmail]=useState(''),[password,setPassword]=useState(''),[stageName,setStageName]=useState(''),[accountRole,setAccountRole]=useState<'LISTENER'|'ARTIST'>('LISTENER'),[authMsg,setAuthMsg]=useState('');
  const [token,setToken]=useState<string|null>(null),[me,setMe]=useState<any>(null),[dashboard,setDashboard]=useState(false);
  const [sessionReady,setSessionReady]=useState(false);
- 
+ const ARTIST_IDLE_LIMIT_MS=30*60*1000;
+ const lastActivityWriteRef=useRef(0);
+
+ // Sessão da área de trabalho do artista: encerra após 30 minutos sem atividade.
+ useEffect(()=>{
+  const role=me?.user?.role||me?.role;
+  if(!token||role!=='ARTIST')return;
+  const now=Date.now();
+  const stored=Number(localStorage.getItem('babulo_artist_last_activity')||0);
+  if(stored && now-stored>=ARTIST_IDLE_LIMIT_MS){
+   logout();
+   alert('A sessão da área do artista terminou por inatividade durante mais de 30 minutos.');
+   return;
+  }
+  if(!stored)localStorage.setItem('babulo_artist_last_activity',String(now));
+  let timer:ReturnType<typeof setTimeout>|null=null;
+  let heartbeat:ReturnType<typeof setInterval>|null=null;
+  const check=()=>{
+   const last=Number(localStorage.getItem('babulo_artist_last_activity')||Date.now());
+   const remaining=ARTIST_IDLE_LIMIT_MS-(Date.now()-last);
+   if(remaining<=0){
+    logout();
+    alert('A sessão da área do artista terminou por inatividade durante mais de 30 minutos.');
+    return;
+   }
+   if(timer)clearTimeout(timer);
+   timer=window.setTimeout(check,Math.min(remaining,30000));
+  };
+  const touch=()=>{
+   const t=Date.now();
+   if(t-lastActivityWriteRef.current<60000)return;
+   lastActivityWriteRef.current=t;
+   localStorage.setItem('babulo_artist_last_activity',String(t));
+   fetch(API+'/api/auth/activity',{method:'POST',headers:{Authorization:`Bearer ${token}`}}).catch(()=>{});
+   check();
+  };
+  const events=['pointerdown','keydown','scroll','touchstart','mousemove'];
+  events.forEach(ev=>window.addEventListener(ev,touch,{passive:true}));
+  heartbeat=window.setInterval(()=>{
+   const last=Number(localStorage.getItem('babulo_artist_last_activity')||0);
+   if(last && Date.now()-last<120000) fetch(API+'/api/auth/activity',{method:'POST',headers:{Authorization:`Bearer ${token}`}}).catch(()=>{});
+   check();
+  },60000);
+  check();
+  return()=>{events.forEach(ev=>window.removeEventListener(ev,touch));if(timer)clearTimeout(timer);if(heartbeat)clearInterval(heartbeat)};
+ },[token,me]);
+
  const [releases,setReleases]=useState<Release[]>([]);
  const draftReleases=useMemo(()=>releases.filter(r=>['DRAFT','FAILED','PENDING_APPROVAL'].includes(String(r.status||'DRAFT'))),[releases]);
 const [releaseOpen,setReleaseOpen]=useState(false);
@@ -34,7 +80,7 @@ const [distOpen,setDistOpen]=useState(false);
   if(!saved){setSessionReady(true);return;}
   setToken(saved);
   fetch(API+'/api/auth/me',{headers:{Authorization:`Bearer ${saved}`}})
-   .then(async r=>{if(!r.ok)throw Error('Sessão expirada'); return r.json();})
+   .then(async r=>{if(!r.ok){const e:any=Error(r.status===401?'Sessão expirada':'Não foi possível validar a sessão');e.status=r.status;throw e;} return r.json();})
    .then(async data=>{
     if(cancelled)return;
     setMe(data);
@@ -42,9 +88,17 @@ const [distOpen,setDistOpen]=useState(false);
     setDashboard(savedDashboard);
     setSessionReady(true);
    })
-   .catch(()=>{
-    const cached=localStorage.getItem('babulo_profile');
+   .catch((err:any)=>{
     if(cancelled)return;
+    if(err?.status===401){
+      localStorage.removeItem('babulo_token');
+      localStorage.removeItem('babulo_dashboard');
+      localStorage.removeItem('babulo_profile');
+      localStorage.removeItem('babulo_artist_last_activity');
+      setToken(null);setMe(null);setDashboard(false);setSessionReady(true);
+      return;
+    }
+    const cached=localStorage.getItem('babulo_profile');
     if(cached){try{const profile=JSON.parse(cached);setMe(profile);setToken(saved);setDashboard(savedDashboard);setSessionReady(true);return;}catch{}}
     setToken(saved);
     setDashboard(savedDashboard);
@@ -160,8 +214,8 @@ function formatTime(value:number){
   setCurrentTime(value);
 }
  
- async function submitAuth(e:React.FormEvent){e.preventDefault();setAuthMsg(''); const url=authMode==='login'?'/api/auth/login':'/api/auth/register'; const body=authMode==='login'?{email,password}:{email,password,role:accountRole,stageName:accountRole==='ARTIST'?stageName:undefined}; try{const r=await fetch(API+url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw Error(d.error||'Não foi possível continuar');localStorage.setItem('babulo_token',d.token);setToken(d.token);const mr=await fetch(API+'/api/auth/me',{headers:{Authorization:`Bearer ${d.token}`}});const profile=mr.ok?await mr.json():d;setMe(profile);localStorage.setItem('babulo_profile',JSON.stringify(profile));const artist=profile?.user?.role==='ARTIST'||profile?.role==='ARTIST';setDashboard(Boolean(artist));localStorage.setItem('babulo_dashboard',artist?'1':'0');setAuthOpen(false);setAuthMsg('');}catch(err:any){setAuthMsg(err.message)}}
- function logout(){localStorage.removeItem('babulo_token');localStorage.removeItem('babulo_dashboard');localStorage.removeItem('babulo_profile');setToken(null);setMe(null);setDashboard(false);setReleases([])}
+ async function submitAuth(e:React.FormEvent){e.preventDefault();setAuthMsg(''); const url=authMode==='login'?'/api/auth/login':'/api/auth/register'; const body=authMode==='login'?{email,password}:{email,password,role:accountRole,stageName:accountRole==='ARTIST'?stageName:undefined}; try{const r=await fetch(API+url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw Error(d.error||'Não foi possível continuar');localStorage.setItem('babulo_token',d.token);setToken(d.token);const mr=await fetch(API+'/api/auth/me',{headers:{Authorization:`Bearer ${d.token}`}});const profile=mr.ok?await mr.json():d;setMe(profile);localStorage.setItem('babulo_profile',JSON.stringify(profile));const artist=profile?.user?.role==='ARTIST'||profile?.role==='ARTIST';if(artist)localStorage.setItem('babulo_artist_last_activity',String(Date.now()));else localStorage.removeItem('babulo_artist_last_activity');setDashboard(Boolean(artist));localStorage.setItem('babulo_dashboard',artist?'1':'0');setAuthOpen(false);setAuthMsg('');}catch(err:any){setAuthMsg(err.message)}}
+ function logout(){const currentToken=localStorage.getItem('babulo_token');if(currentToken)fetch(API+'/api/auth/logout',{method:'POST',headers:{Authorization:`Bearer ${currentToken}`}}).catch(()=>{});localStorage.removeItem('babulo_token');localStorage.removeItem('babulo_dashboard');localStorage.removeItem('babulo_profile');localStorage.removeItem('babulo_artist_last_activity');setToken(null);setMe(null);setDashboard(false);setReleases([])}
  async function loadReleases(){if(!token)return;const r=await fetch(API+'/api/artists/me/releases',{headers:{Authorization:`Bearer ${token}`}});const d=await r.json();if(r.ok)setReleases(d.releases||[])}
  const isArtist=me?.user?.role==='ARTIST'||me?.role==='ARTIST';
  if(!sessionReady)return <main className="app"><section className="content"><div className="authModal" style={{margin:'12vh auto',maxWidth:520,textAlign:'center'}}><img src={img.logo} alt="BaBuLo Play" style={{width:140}}/><h2>A restaurar a tua sessão…</h2><p>Não é necessário fazer login novamente.</p></div></section></main>;
@@ -365,13 +419,13 @@ function AudioTrackEditor({track,index,onUpdate,onMessage,onBusy}:{track:WizardT
  const toggle=()=>{if(!ref.current)return;if(ref.current.paused){ref.current.play();setPlaying(true)}else{ref.current.pause();setPlaying(false)}};
  const start=track.promoStartMs/1000,end=track.promoEndMs/1000;const maxStart=Math.max(0,Math.floor(localDur-59));const valid=localDur>=59&&Math.round(end-start)===59;
  const setStart=(s:number)=>{const safe=Math.max(0,Math.min(maxStart,Math.round(s)));onUpdate(index,'promoStartMs',safe*1000);onUpdate(index,'promoEndMs',Math.min(localDur,safe+59)*1000)};
- const setEnd=(e:number)=>{const safe=Math.max(start+59,Math.min(localDur,Math.round(e)));onUpdate(index,'promoEndMs',safe*1000);};
+ const setEnd=(e:number)=>{const safe=Math.max(59,Math.min(localDur,Math.round(e)));const nextStart=Math.max(0,Math.min(maxStart,safe-59));const nextEnd=Math.min(localDur,nextStart+59);onUpdate(index,'promoStartMs',nextStart*1000);onUpdate(index,'promoEndMs',nextEnd*1000);};
  const preview=()=>{if(!ref.current||!valid)return;ref.current.currentTime=start;ref.current.play();setPlaying(true);};
  return <div className="audioEditor"><audio ref={ref} src={track.audioUrl} preload="metadata"/><div className="audioControls"><button type="button" className="primary" onClick={toggle}>{playing?'⏸ Pausar':'▶ Reproduzir'}</button><button type="button" className="outline" onClick={preview} disabled={!valid}>▶ Pré-visualizar trecho</button><span>{Math.round(localDur/60)}:{String(Math.floor(localDur%60)).padStart(2,'0')}</span></div>
- <div className="clipEditor"><b>✂️ Trecho promocional para TikTok e redes sociais</b><small>Define exatamente onde começa e onde termina o trecho de <strong>59 segundos</strong>.</small>
+ <div className="clipEditor"><b>✂️ Trecho promocional para TikTok e redes sociais</b><small>Arrasta livremente o marcador 🟢 de início ou o 🔴 de fim. Ao mover qualquer um, o outro acompanha para manter exatamente <strong>59 segundos</strong>.</small>
  <div className="clipTimeline"><div className="clipSelected" style={{left:`${localDur?start/localDur*100:0}%`,width:`${localDur?Math.max(0,end-start)/localDur*100:0}%`}}/><div className="clipMarker start" style={{left:`${localDur?start/localDur*100:0}%`}}/><div className="clipMarker end" style={{left:`${localDur?end/localDur*100:0}%`}}/></div>
- <div className="clipSliders"><input aria-label="Marcador de início" className="clipRange" type="range" min="0" max={maxStart} step="1" value={Math.min(start,maxStart)} onChange={e=>setStart(Number(e.target.value))}/><input aria-label="Marcador de fim" className="clipRange clipRangeEnd" type="range" min={Math.min(localDur,start+59)} max={Math.max(59,localDur)} step="1" value={Math.min(Math.max(end,start+59),Math.max(59,localDur))} onChange={e=>setEnd(Number(e.target.value))}/></div>
- <div className="clipTimes"><label>🟢 Início (seg.)<input type="number" min="0" max={maxStart} step="1" value={start} onChange={e=>setStart(Number(e.target.value))}/></label><label>🔴 Fim (seg.)<input type="number" min={Math.min(localDur,start+59)} max={localDur||59} step="1" value={end} onChange={e=>setEnd(Number(e.target.value))}/></label></div>
+ <div className="clipSliders"><label className="clipSliderLabel">🟢 Mover início <input aria-label="Marcador de início" className="clipRange" type="range" min="0" max={maxStart} step="1" value={Math.min(start,maxStart)} onChange={e=>setStart(Number(e.target.value))}/></label><label className="clipSliderLabel">🔴 Mover fim <input aria-label="Marcador de fim" className="clipRange clipRangeEnd" type="range" min="59" max={Math.max(59,localDur)} step="1" value={Math.min(Math.max(end,59),Math.max(59,localDur))} onChange={e=>setEnd(Number(e.target.value))}/></label></div>
+ <div className="clipTimes"><label>🟢 Início (seg.)<input type="number" min="0" max={maxStart} step="1" value={start} onChange={e=>setStart(Number(e.target.value))}/></label><label>🔴 Fim (seg.)<input type="number" min="59" max={localDur||59} step="1" value={end} onChange={e=>setEnd(Number(e.target.value))}/></label></div>
  <p className={valid?'clipValid':'clipInvalid'}>{valid?'✓ Trecho válido:':'⚠ Ajusta os marcadores:'} {Math.floor(start/60)}:{String(Math.floor(start%60)).padStart(2,'0')} → {Math.floor(end/60)}:{String(Math.floor(end%60)).padStart(2,'0')} · <strong>{Math.max(0,end-start).toFixed(0)}s</strong></p>
  </div></div>}
 
