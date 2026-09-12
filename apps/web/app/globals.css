@@ -24,3 +24,49 @@
   height:auto;
   object-fit:contain;
 }
+
+/* =====================================================
+   BaBuLo Play — Animação profissional do logotipo
+   ===================================================== */
+
+@keyframes babuloLogoPulse {
+  0%, 100% {
+    transform: scale(1);
+    filter: brightness(1);
+  }
+
+  50% {
+    transform: scale(1.025);
+    filter: brightness(1.18);
+  }
+}
+
+@keyframes babuloLogoGlow {
+  0%, 100% {
+    filter: drop-shadow(0 0 0 rgba(0, 255, 140, 0));
+  }
+
+  50% {
+    filter: drop-shadow(0 0 12px rgba(0, 255, 140, 0.55));
+  }
+}
+
+.logoWrap img,
+.authModal > img,
+.mobileBrand img {
+  animation:
+    babuloLogoPulse 3.5s ease-in-out infinite,
+    babuloLogoGlow 3.5s ease-in-out infinite;
+
+  transform-origin: center;
+  will-change: transform, filter;
+}
+
+/* Respeita utilizadores que preferem menos movimento */
+@media (prefers-reduced-motion: reduce) {
+  .logoWrap img,
+  .authModal > img,
+  .mobileBrand img {
+    animation: none;
+  }
+}
