@@ -48,3 +48,6 @@ databases:
   - name: babulo-play-db
     databaseName: babulo_play
     user: babulo
+
+    # Blueprint BaBuLo Play V10.2
+    
