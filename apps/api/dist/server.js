@@ -3,6 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+// @ts-nocheck
 require("dotenv/config");
 const express_1 = __importDefault(require("express"));
 const cors_1 = __importDefault(require("cors"));
@@ -36,7 +37,7 @@ async function ensureDatabaseSchema() {
             .replace(/^\s*\\i\s+.*$/gm, '')
             .trim();
         await pool.query(schema);
-        for (const file of ['004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql']) {
+        for (const file of ['004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql']) {
             const migrationPath = node_path_1.default.join(migrationsDir, file);
             if (!node_fs_1.default.existsSync(migrationPath))
                 throw new Error(`Migração não encontrada: ${migrationPath}`);
@@ -198,8 +199,15 @@ app.post('/api/releases', auth, artistOnly, async (req, res) => {
         return res.status(404).json({ error: 'Perfil de artista não encontrado' });
     if (!['SINGLE', 'EP', 'ALBUM', 'ALBUM_PRO'].includes(type))
         return res.status(400).json({ error: 'Tipo de lançamento inválido' });
-    const q = await pool.query(`insert into releases(title,type,primary_artist_id,genre_id,language,country,release_date,pre_release_date,cover_url,description,upc,ean,label_name,phonographic_copyright,copyright_text) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) returning *`, [title, type, artist.id, genreId || null, language || null, country || null, releaseDate || null, preReleaseDate || null, coverUrl || null, description || null, upc || null, ean || null, labelName || null, phonographicCopyright || null, copyrightText || null]);
+    const q = await pool.query(`insert into releases(title,type,primary_artist_id,genre_id,language,country,release_date,pre_release_date,cover_url,description,upc,ean,label_name,phonographic_copyright,copyright_text) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) returning *`, [title, type, artist.id, genreId || null, language || null, country || null, releaseDate || null, preReleaseDate || null, coverUrl || null, description || null, upc || null, ean || null, labelName || null, phonographicCopyright || null, copyrightText || null]);
     res.status(201).json({ release: q.rows[0] });
+});
+app.put('/api/releases/:id', auth, artistOnly, async (req, res) => {
+    const { title, type = 'SINGLE', genreId, language, country, releaseDate, preReleaseDate, coverUrl, description, upc, ean, labelName, phonographicCopyright, copyrightText } = req.body || {};
+    const q = await pool.query(`update releases r set title=coalesce($1,r.title),type=coalesce($2,r.type),genre_id=$3,language=$4,country=$5,release_date=$6,pre_release_date=$7,cover_url=$8,description=$9,upc=$10,ean=$11,label_name=$12,phonographic_copyright=$13,copyright_text=$14 where r.id=$15 and exists(select 1 from artists a where a.id=r.primary_artist_id and a.user_id=$16) returning r.*`, [title || null, type, genreId || null, language || null, country || null, releaseDate || null, preReleaseDate || null, coverUrl || null, description || null, upc || null, ean || null, labelName || null, phonographicCopyright || null, copyrightText || null, req.params.id, req.user.id]);
+    if (!q.rows[0])
+        return res.status(404).json({ error: 'Lançamento não encontrado' });
+    res.json({ release: q.rows[0] });
 });
 app.get('/api/artists/me/releases', auth, artistOnly, async (req, res) => {
     const artist = (await pool.query('select id from artists where user_id=$1 limit 1', [req.user.id])).rows[0];
@@ -209,7 +217,7 @@ app.get('/api/artists/me/releases', auth, artistOnly, async (req, res) => {
     res.json({ releases: q.rows });
 });
 app.post('/api/tracks', auth, artistOnly, async (req, res) => {
-    const { title, releaseId, genreId, language, version, durationMs, isExplicit = false, explicitReason, isrc, originalReleaseDate, fileUrl, fileType = 'AUDIO', composer, lyricist, producer, performer, publisher, featuredArtists = '', audioType = 'SONG', aiGenerated = 'NO', aiUsage = '', lyrics = '' } = req.body || {};
+    const { title, releaseId, trackNumber, genreId, language, version, durationMs, isExplicit = false, explicitReason, isrc, originalReleaseDate, fileUrl, fileType = 'AUDIO', composer, lyricist, producer, performer, publisher, featuredArtists = '', audioType = 'SONG', aiGenerated = 'NO', aiUsage = '', lyrics = '' } = req.body || {};
     if (!title || !releaseId)
         return res.status(400).json({ error: 'Título e lançamento são obrigatórios' });
     const safeAudioTypes = ['SONG', 'INSTRUMENTAL', 'ACAPELLA', 'LIVE', 'REMIX', 'COVER'];
@@ -232,7 +240,7 @@ app.post('/api/tracks', auth, artistOnly, async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('begin');
-        const t = (await client.query(`insert into tracks(title,version,duration_ms,language,genre_id,is_explicit,explicit_reason,isrc,isrc_status,isrc_source,original_release_date,composer,lyricist,producer,performer,publisher,featured_artists,audio_type,ai_generated,ai_usage,lyrics,primary_release_id) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) returning *`, [title, version || null, durationMs || null, language || null, genreId || null, Boolean(isExplicit), explicitReason || null, isrc || null, isrc ? 'ASSIGNED' : 'PENDING_ASSIGNMENT', isrc ? 'ARTIST_PROVIDED' : 'NOT_PROVIDED', originalReleaseDate || null, composer || null, lyricist || null, producer || null, performer || null, publisher || null, safeFeaturedArtists || null, String(audioType), String(aiGenerated), safeAiUsage || null, safeLyrics || null, releaseId])).rows[0];
+        const t = (await client.query(`insert into tracks(title,track_number,version,duration_ms,language,genre_id,is_explicit,explicit_reason,isrc,isrc_status,isrc_source,original_release_date,composer,lyricist,producer,performer,publisher,featured_artists,audio_type,ai_generated,ai_usage,lyrics,promo_start_ms,promo_end_ms,primary_release_id) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25) returning *`, [title, trackNumber ? Number(trackNumber) : null, version || null, durationMs || null, language || null, genreId || null, Boolean(isExplicit), explicitReason || null, isrc || null, isrc ? 'ASSIGNED' : 'PENDING_ASSIGNMENT', isrc ? 'ARTIST_PROVIDED' : 'NOT_PROVIDED', originalReleaseDate || null, composer || null, lyricist || null, producer || null, performer || null, publisher || null, safeFeaturedArtists || null, String(audioType), String(aiGenerated), safeAiUsage || null, safeLyrics || null, Math.max(0, Number(promoStartMs) || 0), Math.max(0, Number(promoEndMs) || 0), releaseId])).rows[0];
         await client.query(`insert into track_artists(track_id,artist_id,role) values($1,$2,'PRIMARY')`, [t.id, artist.id]);
         if (fileUrl) {
             await client.query(`insert into track_files(track_id,storage_key,file_type,format,status) values($1,$2,$3,$4,'UPLOADED')`, [t.id, fileUrl, fileType, 'unknown']);
@@ -273,15 +281,30 @@ app.post('/api/uploads', auth, upload.single('file'), async (req, res) => {
     }
     if (kind === 'cover') {
         const d = imageDimensions(req.file.path);
-        if (!d || d.width !== 3000 || d.height !== 3000) {
+        if (!d || d.width !== 600 || d.height !== 600) {
             node_fs_1.default.unlinkSync(req.file.path);
-            return res.status(400).json({ error: d ? `Capa inválida: ${d.width}×${d.height}px. A BaBuLo Play exige exatamente 3000×3000px.` : 'Não foi possível ler as dimensões da capa.' });
+            return res.status(400).json({ error: d ? `Capa inválida: ${d.width}×${d.height}px. A BaBuLo Play exige exatamente 600×600px.` : 'Não foi possível ler as dimensões da capa.' });
         }
     }
     const finalName = `${req.user.id}-${Date.now()}-${node_crypto_1.default.randomUUID()}${ext}`;
     const finalPath = node_path_1.default.join(uploadDir, finalName);
     node_fs_1.default.renameSync(req.file.path, finalPath);
     res.status(201).json({ file: { name: req.file.originalname, size: req.file.size, mimeType: req.file.mimetype, storageKey: finalName, url: `/media/${finalName}`, kind } });
+});
+app.delete('/api/tracks/:trackId/audio', auth, artistOnly, async (req, res) => {
+    const q = await pool.query(`select tf.id,tf.storage_key,t.primary_release_id from track_files tf join tracks t on t.id=tf.track_id join releases r on r.id=t.primary_release_id join artists a on a.id=r.primary_artist_id where tf.track_id=$1 and tf.file_type='AUDIO' and a.user_id=$2 order by tf.created_at desc limit 1`, [req.params.trackId, req.user.id]);
+    const f = q.rows[0];
+    if (!f)
+        return res.status(404).json({ error: 'Áudio não encontrado.' });
+    const fp = node_path_1.default.join(uploadDir, String(f.storage_key).replace(/^.*[\/]/, ''));
+    try {
+        if (node_fs_1.default.existsSync(fp))
+            node_fs_1.default.unlinkSync(fp);
+    }
+    catch { }
+    await pool.query(`delete from track_files where id=$1`, [f.id]);
+    await audit(req.user.id, 'TRACK_AUDIO_DELETED', 'TRACK', req.params.trackId);
+    res.json({ ok: true });
 });
 function imageDimensions(filePath) {
     const b = node_fs_1.default.readFileSync(filePath);
@@ -338,13 +361,80 @@ app.post('/api/releases/:id/preflight', auth, artistOnly, async (req, res) => {
             const d = imageDimensions(fp);
             if (!d)
                 errors.push('Não foi possível validar as dimensões da capa.');
-            else if (d.width !== 3000 || d.height !== 3000)
-                errors.push(`A capa tem ${d.width}×${d.height}px. A BaBuLo Play exige 3000×3000px.`);
+            else if (d.width !== 600 || d.height !== 600)
+                errors.push(`A capa tem ${d.width}×${d.height}px. A BaBuLo Play exige exatamente 600×600px.`);
         }
     }
     const status = errors.length ? 'FAILED' : 'PASSED';
-    await pool.query(`update releases set preflight_status=$1,preflight_reason=$2,status=$3,submitted_at=case when $1='PASSED' then now() else submitted_at end where id=$4`, [status, errors.length ? errors.join(' ') : null, errors.length ? 'DRAFT' : 'PENDING_APPROVAL', release.id]);
+    await pool.query(`update releases set preflight_status=$1,preflight_reason=$2,status=$3,submitted_at=case when $1='PASSED' then now() else submitted_at end where id=$4`, [status, errors.length ? errors.join(' ') : null, 'DRAFT', release.id]);
     res.json({ preflight: { status, errors }, releaseId: release.id });
+});
+// ===== Pagamento obrigatório por lançamento · V10.3 =====
+const RELEASE_PAYMENT_PRODUCT = { SINGLE: 'DIST_SINGLE', EP: 'DIST_EP', ALBUM: 'DIST_ALBUM', ALBUM_PRO: 'DIST_ALBUM_PRO' };
+const MAIN_PLATFORM_CODES = ['SPOTIFY', 'APPLE_MUSIC', 'YOUTUBE_MUSIC', 'AMAZON_MUSIC', 'DEEZER', 'PANDORA', 'BOOMPLAY', 'JOOX', 'SOUNDCLOUD', 'SHAZAM', 'TIKTOK', 'INSTAGRAM_MUSIC', 'FACEBOOK_MUSIC', 'ITUNES_STORE', 'YOUTUBE_SHORTS'];
+const ALL_PLATFORM_CODES = ['SPOTIFY', 'APPLE_MUSIC', 'YOUTUBE_MUSIC', 'AMAZON_MUSIC', 'DEEZER', 'TIDAL', 'AUDIOMACK', 'BOOMPLAY', 'SOUNDCLOUD', 'PANDORA', 'IHEARTRADIO', 'NAPSTER', 'QOBUZ', 'ANGHAMI', 'JOOX', 'TENCENT_MUSIC', 'NETEASE_CLOUD_MUSIC', 'KKBOX', 'CLARO_MUSICA', 'AWA', 'TIKTOK', 'INSTAGRAM_MUSIC', 'FACEBOOK_MUSIC', 'YOUTUBE_SHORTS', 'SNAPCHAT', 'TRILLER', 'SHAZAM', 'ITUNES_STORE', 'AMAZON_DIGITAL_MUSIC', 'BEATPORT', 'TRAXSOURCE', '7DIGITAL', 'JUNO_DOWNLOAD'];
+function platformPlanCodes(mode) { return mode === 'ALL' ? ALL_PLATFORM_CODES : MAIN_PLATFORM_CODES; }
+app.get('/api/releases/:id/payment', auth, artistOnly, async (req, res) => {
+    const release = (await pool.query(`select r.id,r.title,r.type,r.status,a.id artist_id from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`, [req.params.id, req.user.id])).rows[0];
+    if (!release)
+        return res.status(404).json({ error: 'Lançamento não encontrado' });
+    const productCode = RELEASE_PAYMENT_PRODUCT[String(release.type)];
+    const product = (await pool.query(`select id,code,name,amount,currency,active from payment_products where code=$1 and service_type='DISTRIBUTION'`, [productCode])).rows[0];
+    if (!product)
+        return res.status(500).json({ error: 'Preço do lançamento não configurado' });
+    const payment = (await pool.query(`select id,reference,amount,currency,payment_method,gateway,status,metadata,paid_at,created_at from payment_transactions where release_id=$1 order by created_at desc limit 1`, [release.id])).rows[0] || null;
+    const selectedCodes = payment?.metadata?.platformCodes || MAIN_PLATFORM_CODES;
+    const mode = payment?.metadata?.distributionMode || 'MAIN';
+    const fullExtra = Math.round(Number(product.amount) * 0.5 * 100) / 100;
+    const total = mode === 'ALL' ? Number(product.amount) + fullExtra : Number(product.amount);
+    res.json({ release, product, payment, paid: Boolean(payment?.status === 'PAID'), distribution: { mode, selectedCodes, mainPlatformCodes: MAIN_PLATFORM_CODES, allPlatformCodes: ALL_PLATFORM_CODES, baseAmount: Number(product.amount), extraAllPlatforms: fullExtra, totalAmount: total, surchargePercent: 50 } });
+});
+app.post('/api/releases/:id/payment', auth, artistOnly, async (req, res) => {
+    const { paymentMethod = 'MULTICAIXA_EXPRESS', distributionMode = 'MAIN' } = req.body || {};
+    if (!PAYMENT_METHODS.includes(String(paymentMethod)))
+        return res.status(400).json({ error: 'Método de pagamento inválido' });
+    if (!['MAIN', 'ALL'].includes(String(distributionMode)))
+        return res.status(400).json({ error: 'Plano de distribuição inválido' });
+    const release = (await pool.query(`select r.id,r.title,r.type,a.id artist_id from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`, [req.params.id, req.user.id])).rows[0];
+    if (!release)
+        return res.status(404).json({ error: 'Lançamento não encontrado' });
+    const productCode = RELEASE_PAYMENT_PRODUCT[String(release.type)];
+    const product = (await pool.query(`select id,code,name,amount,currency from payment_products where code=$1 and service_type='DISTRIBUTION' and active=true`, [productCode])).rows[0];
+    if (!product)
+        return res.status(500).json({ error: 'Preço do lançamento não configurado' });
+    const selectedCodes = platformPlanCodes(String(distributionMode));
+    const existingPaid = (await pool.query(`select id,reference,amount,currency,payment_method,gateway,status,metadata,paid_at,created_at from payment_transactions where release_id=$1 and service_type='DISTRIBUTION' and status='PAID' order by paid_at desc limit 1`, [release.id])).rows[0];
+    const existingMode = existingPaid?.metadata?.distributionMode || null;
+    if (existingPaid && existingMode === 'ALL')
+        return res.json({ payment: existingPaid, paid: true, message: 'Pagamento e distribuição completa já confirmados.' });
+    let amount = Number(product.amount);
+    let paymentType = 'BASE';
+    if (existingPaid && existingMode === 'MAIN' && distributionMode === 'ALL') {
+        amount = Math.round(Number(product.amount) * 0.5 * 100) / 100;
+        paymentType = 'PLATFORM_UPGRADE';
+    }
+    else if (existingPaid && distributionMode === 'MAIN')
+        return res.json({ payment: existingPaid, paid: true, message: 'Pagamento base já confirmado.' });
+    const pending = (await pool.query(`select id,reference,amount,currency,payment_method,gateway,status,metadata,paid_at,created_at from payment_transactions where release_id=$1 and status='PENDING' order by created_at desc limit 1`, [release.id])).rows[0];
+    if (pending)
+        return res.json({ payment: pending, paid: false, message: 'Já existe um pagamento pendente para este lançamento.' });
+    const reference = makePaymentReference();
+    const gateway = paymentMethod === 'MULTICAIXA_EXPRESS' ? 'MULTICAIXA_EXPRESS' : paymentMethod === 'MULTICAIXA_REFERENCE' ? 'MULTICAIXA' : 'CARD';
+    const metadata = { releaseId: release.id, releaseTitle: release.title, productCode, productName: product.name, paymentInstructions: paymentMethod === 'MULTICAIXA_REFERENCE' ? 'Use a referência apresentada para concluir o pagamento.' : 'Conclua o pagamento pelo método selecionado e aguarde a confirmação.', distributionMode, platformCodes: selectedCodes, surchargePercent: distributionMode === 'ALL' ? 50 : 0, paymentType };
+    const q = await pool.query(`insert into payment_transactions(user_id,product_id,release_id,service_type,payment_method,gateway,reference,idempotency_key,amount,currency,net_amount,status,metadata) values($1,$2,$3,'DISTRIBUTION',$4,$5,$6,$7,$8,$9,$8,'PENDING',$10) returning id,reference,amount,currency,payment_method,gateway,status,metadata,paid_at,created_at`, [req.user.id, product.id, release.id, paymentMethod, gateway, reference, node_crypto_1.default.randomUUID(), amount, product.currency, JSON.stringify(metadata)]);
+    await audit(req.user.id, 'RELEASE_PAYMENT_CREATED', 'PAYMENT', q.rows[0].id, { releaseId: release.id, productCode, paymentMethod, distributionMode, paymentType, amount });
+    res.status(201).json({ payment: q.rows[0], paid: false, message: 'Pedido de pagamento criado. Aguarda a confirmação do pagamento.' });
+});
+app.post('/api/admin/payments/:id/confirm', auth, adminOnly, async (req, res) => {
+    const q = await pool.query(`update payment_transactions set status='PAID',paid_at=now(),updated_at=now() where id=$1 and status='PENDING' returning id,release_id,status,paid_at,reference,amount,currency`, [req.params.id]);
+    if (!q.rows[0])
+        return res.status(404).json({ error: 'Pagamento pendente não encontrado' });
+    await audit(req.user.id, 'RELEASE_PAYMENT_CONFIRMED', 'PAYMENT', q.rows[0].id, { releaseId: q.rows[0].release_id });
+    res.json({ ok: true, payment: q.rows[0] });
+});
+app.get('/api/admin/payments/pending', auth, adminOnly, async (_req, res) => {
+    const q = await pool.query(`select p.id,p.reference,p.amount,p.currency,p.payment_method,p.status,p.created_at,p.release_id,r.title release_title,a.stage_name from payment_transactions p left join releases r on r.id=p.release_id left join artists a on a.id=r.primary_artist_id where p.service_type='DISTRIBUTION' and p.status='PENDING' order by p.created_at asc`);
+    res.json({ payments: q.rows });
 });
 // ===== Direitos e aprovação =====
 app.get('/api/releases/:id/rights', auth, async (req, res) => {
@@ -387,6 +477,9 @@ app.post('/api/releases/:id/submit-approval', auth, artistOnly, async (req, res)
         return res.status(404).json({ error: 'Lançamento não encontrado' });
     if (release.preflight_status !== 'PASSED')
         return res.status(400).json({ error: 'O lançamento precisa passar no preflight técnico antes da aprovação.' });
+    const paid = (await pool.query(`select id from payment_transactions where release_id=$1 and service_type='DISTRIBUTION' and status='PAID' order by paid_at desc limit 1`, [release.id])).rows[0];
+    if (!paid)
+        return res.status(402).json({ error: 'O pagamento deste lançamento ainda não foi confirmado. O lançamento permanece em rascunho até o pagamento ser confirmado.' });
     const rights = (await pool.query(`select right_type,territory,coalesce(track_id,'00000000-0000-0000-0000-000000000000') track_key,sum(percentage) total from rights_declarations where release_id=$1 and status='PENDING' group by right_type,territory,track_id`, [release.id])).rows;
     if (!rights.length)
         return res.status(400).json({ error: 'Declare pelo menos um titular de direitos antes de submeter.' });
