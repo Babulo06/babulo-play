@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -108,10 +108,27 @@ function verifyPassword(password: string, stored: string) {
   const derived = crypto.scryptSync(password, salt, 64).toString('hex');
   return crypto.timingSafeEqual(Buffer.from(derived, 'hex'), Buffer.from(key, 'hex'));
 }
+
+function randomToken(bytes=32){ return crypto.randomBytes(bytes).toString('hex'); }
+function hashToken(value:string){ return crypto.createHash('sha256').update(value).digest('hex'); }
+function base32Encode(buf:Buffer){ const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'; let bits=0,val=0,out=''; for(const byte of buf){ val=(val<<8)|byte; bits+=8; while(bits>=5){ out+=alphabet[(val>>>(bits-5))&31]; bits-=5; } } if(bits>0) out+=alphabet[(val<<(5-bits))&31]; return out; }
+function base32Decode(input:string){ const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'; let bits=0,val=0,out:number[]=[]; for(const c of input.replace(/=+$/,'').toUpperCase()){ const n=alphabet.indexOf(c); if(n<0) continue; val=(val<<5)|n; bits+=5; if(bits>=8){ out.push((val>>>(bits-8))&255); bits-=8; } } return Buffer.from(out); }
+function totp(secret:string, counter:number){ const key=base32Decode(secret); const msg=Buffer.alloc(8); msg.writeBigUInt64BE(BigInt(counter)); const h=crypto.createHmac('sha1',key).update(msg).digest(); const off=h[h.length-1]&15; const code=((h[off]&127)<<24)|((h[off+1]&255)<<16)|((h[off+2]&255)<<8)|(h[off+3]&255); return String(code%1000000).padStart(6,'0'); }
+function verifyTotp(secret:string,code:string){ const now=Math.floor(Date.now()/1000/30); return [-1,0,1].some(delta=>crypto.timingSafeEqual(Buffer.from(totp(secret,now+delta)),Buffer.from(String(code).padStart(6,'0')))); }
+function encryptSecret(value:string){ const key=crypto.createHash('sha256').update(JWT_SECRET).digest(); const iv=crypto.randomBytes(12); const cipher=crypto.createCipheriv('aes-256-gcm',key,iv); const enc=Buffer.concat([cipher.update(value,'utf8'),cipher.final()]); return [iv.toString('hex'),cipher.getAuthTag().toString('hex'),enc.toString('hex')].join('$'); }
+function decryptSecret(value:string){ const [ivHex,tagHex,dataHex]=String(value||'').split('$'); if(!ivHex||!tagHex||!dataHex) throw new Error('Segredo 2FA inválido'); const key=crypto.createHash('sha256').update(JWT_SECRET).digest(); const decipher=crypto.createDecipheriv('aes-256-gcm',key,Buffer.from(ivHex,'hex')); decipher.setAuthTag(Buffer.from(tagHex,'hex')); return Buffer.concat([decipher.update(Buffer.from(dataHex,'hex')),decipher.final()]).toString('utf8'); }
+function sessionIdleLimit(role:string){ return role==='ADMIN'||role==='OWNER' ? 20*60*1000 : role==='ARTIST' ? 30*60*1000 : 60*60*1000; }
+async function sendEmail(to:string,subject:string,text:string){
+  const key=String(process.env.RESEND_API_KEY||''); const from=String(process.env.AUTH_FROM_EMAIL||'');
+  if(!key || !from){ console.log(`[BaBuLo AUTH EMAIL DEV] Para: ${to} | ${subject} | ${text}`); return false; }
+  const r=await fetch('https://api.resend.com/emails',{method:'POST',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify({from,to,subject,text})});
+  if(!r.ok){ const body=await r.text(); console.error('Falha ao enviar email:',body); return false; } return true;
+}
+function publicWebUrl(pathname:string,token:string){ return `${String(process.env.WEB_ORIGIN||'http://localhost:3000').replace(/\/$/,'')}${pathname}?token=${encodeURIComponent(token)}`; }
 function b64(value: string) { return Buffer.from(value).toString('base64url'); }
 function tokenFor(user: { id: string; role: string }, sid: string) {
   const header = b64(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-  const payload = b64(JSON.stringify({ sub: user.id, role: user.role, sid, exp: Math.floor(Date.now()/1000) + 60*60*24*7 }));
+  const payload = b64(JSON.stringify({ sub: user.id, role: user.role, sid, exp: Math.floor(Date.now()/1000) + 60*60*24 }));
   const signature = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${payload}`).digest('base64url');
   return `${header}.${payload}.${signature}`;
 }
@@ -129,28 +146,18 @@ async function auth(req: AuthedRequest, res: Response, next: NextFunction) {
   const value = req.headers.authorization;
   if (!value?.startsWith('Bearer ')) return res.status(401).json({ error: 'Autenticação necessária' });
   const decoded = decodeToken(value.slice(7));
-  if (!decoded) return res.status(401).json({ error: 'Sessão inválida ou expirada' });
+  if (!decoded?.sid) return res.status(401).json({ error: 'Sessão inválida ou expirada' });
   try {
     const row=(await pool.query('select role,status from users where id=$1 limit 1',[decoded.sub])).rows[0];
     if(!row || row.status!=='ACTIVE') return res.status(401).json({error:'Conta inativa ou não encontrada'});
     const role=String(row.role||decoded.role);
-    if(role==='ARTIST'){
-      if(!decoded.sid) return res.status(401).json({error:'Sessão antiga da área do artista. Faça login novamente.'});
-      const session=(await pool.query('select last_activity_at,revoked_at from auth_sessions where id=$1 and user_id=$2 limit 1',[decoded.sid,decoded.sub])).rows[0];
-      if(!session || session.revoked_at) return res.status(401).json({error:'Sessão da área do artista encerrada. Faça login novamente.'});
-      const idleLimit=30*60*1000;
-      const last=session.last_activity_at?new Date(session.last_activity_at).getTime():0;
-      if(last && Date.now()-last>=idleLimit){
-        await pool.query('update auth_sessions set revoked_at=now() where id=$1',[decoded.sid]);
-        return res.status(401).json({error:'Sessão da área do artista expirada por inatividade. Faça login novamente.'});
-      }
-      if(!last || Date.now()-last>=60*1000) await pool.query('update auth_sessions set last_activity_at=now() where id=$1',[decoded.sid]);
-    }
+    const session=(await pool.query('select last_activity_at,revoked_at from auth_sessions where id=$1 and user_id=$2 limit 1',[decoded.sid,decoded.sub])).rows[0];
+    if(!session || session.revoked_at) return res.status(401).json({error:'Sessão encerrada. Faça login novamente.'});
+    const idleLimit=sessionIdleLimit(role); const last=session.last_activity_at?new Date(session.last_activity_at).getTime():0;
+    if(last && Date.now()-last>=idleLimit){ await pool.query('update auth_sessions set revoked_at=now() where id=$1',[decoded.sid]); return res.status(401).json({error:'Sessão expirada por inatividade. Faça login novamente.'}); }
+    if(!last || Date.now()-last>=60*1000) await pool.query('update auth_sessions set last_activity_at=now() where id=$1 and revoked_at is null',[decoded.sid]);
     req.user = { id: decoded.sub, role }; next();
-  } catch (error) {
-    console.error('auth session check failed:',error);
-    return res.status(500).json({error:'Não foi possível validar a sessão'});
-  }
+  } catch (error) { console.error('auth session check failed:',error); return res.status(500).json({error:'Não foi possível validar a sessão'}); }
 }
 
 function artistOnly(req: AuthedRequest, res: Response, next: NextFunction) {
@@ -161,6 +168,33 @@ function artistOnly(req: AuthedRequest, res: Response, next: NextFunction) {
 function adminOnly(req: AuthedRequest, res: Response, next: NextFunction) {
   if (!['ADMIN','OWNER'].includes(req.user?.role || '')) return res.status(403).json({ error: 'Acesso reservado à administração' });
   next();
+}
+
+const ADMIN_PERMISSIONS=['USERS','ARTISTS','TEAM','RELEASES','FINANCE','WITHDRAWALS','MODERATION','ANALYTICS','SETTINGS'];
+function requireAnyAdminPermission(permissions:string[]){
+  return async (req:AuthedRequest,res:Response,next:NextFunction)=>{
+    if(req.user?.role==='OWNER') return next();
+    if(req.user?.role!=='ADMIN') return res.status(403).json({error:'Acesso reservado à administração'});
+    try{
+      const row=(await pool.query('select admin_permissions from users where id=$1 and role=\'ADMIN\'', [req.user.id])).rows[0];
+      const current=Array.isArray(row?.admin_permissions)?row.admin_permissions:ADMIN_PERMISSIONS;
+      if(!permissions.some(p=>current.includes(p))) return res.status(403).json({error:'Este ADMIN não tem a função necessária para esta operação.'});
+      next();
+    }catch(e){console.error(e);res.status(500).json({error:'Não foi possível validar as permissões do ADMIN'});}
+  };
+}
+
+function requireAdminPermission(permission:string){
+  return async (req:AuthedRequest,res:Response,next:NextFunction)=>{
+    if(req.user?.role==='OWNER') return next();
+    if(req.user?.role!=='ADMIN') return res.status(403).json({error:'Acesso reservado à administração'});
+    try{
+      const row=(await pool.query("select admin_permissions from users where id=$1 and role='ADMIN'", [req.user.id])).rows[0];
+      const permissions=Array.isArray(row?.admin_permissions)?row.admin_permissions:ADMIN_PERMISSIONS;
+      if(!permissions.includes(permission)) return res.status(403).json({error:`Este ADMIN não tem a função/permissão: ${permission}.`});
+      next();
+    }catch(e){console.error(e);res.status(500).json({error:'Não foi possível validar as permissões do ADMIN'});}
+  };
 }
 
 async function audit(actorUserId: string | undefined, action: string, entityType: string, entityId: string | undefined, details: unknown = {}) {
@@ -177,51 +211,87 @@ app.get('/api/health', async (_req,res) => { try { await pool.query('select 1');
 
 app.post('/api/auth/register', async (req,res) => {
   const { email, phone, password, role = 'LISTENER', stageName } = req.body || {};
+  const normalizedEmail=String(email||'').trim().toLowerCase();
+  if (!normalizedEmail || !normalizedEmail.includes('@')) return res.status(400).json({error:'Informe um email válido'});
   if (!password || String(password).length < 8) return res.status(400).json({error:'A palavra-passe deve ter pelo menos 8 caracteres'});
-  if (!email && !phone) return res.status(400).json({error:'Informe email ou telefone'});
   const safeRole = ['LISTENER','ARTIST'].includes(role) ? role : 'LISTENER';
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const u = await client.query(`insert into users(email,phone,password_hash,role) values($1,$2,$3,$4) returning id,email,phone,role,created_at`, [email || null, phone || null, hashPassword(password), safeRole]);
+    const u = await client.query(`insert into users(email,phone,password_hash,role,email_verified) values($1,$2,$3,$4,false) returning id,email,phone,role,created_at`, [normalizedEmail, phone || null, hashPassword(password), safeRole]);
     let artist = null;
-    if (safeRole === 'ARTIST') {
-      if (!stageName) { await client.query('ROLLBACK'); return res.status(400).json({error:'stageName é obrigatório para contas de artista'}); }
-      artist = (await client.query(`insert into artists(user_id,stage_name) values($1,$2) returning id,stage_name`, [u.rows[0].id, stageName])).rows[0];
-    }
-    const sid=crypto.randomUUID();
-    if(safeRole==='ARTIST') await client.query(`insert into auth_sessions(id,user_id,role,last_activity_at) values($1,$2,$3,now())`,[sid,u.rows[0].id,safeRole]);
+    if (safeRole === 'ARTIST') { if (!stageName) { await client.query('ROLLBACK'); return res.status(400).json({error:'stageName é obrigatório para contas de artista'}); } artist = (await client.query(`insert into artists(user_id,stage_name) values($1,$2) returning id,stage_name`, [u.rows[0].id, stageName])).rows[0]; }
+    const raw=randomToken(); await client.query(`insert into auth_email_tokens(id,user_id,token_hash,type,expires_at) values($1,$2,$3,'VERIFY_EMAIL',now()+interval '24 hours')`,[crypto.randomUUID(),u.rows[0].id,hashToken(raw)]);
     await client.query('COMMIT');
-    res.status(201).json({ user:u.rows[0], artist, token:tokenFor(u.rows[0],sid) });
+    const link=publicWebUrl('/',raw).replace('?token=','?verify='); await sendEmail(normalizedEmail,'Verifica o teu email — BaBuLo Play',`Bem-vindo à BaBuLo Play. Confirma o teu email neste link (válido por 24 horas): ${link}`);
+    res.status(201).json({ok:true,requiresEmailVerification:true,message:'Conta criada. Verifica o teu email antes de entrar.',user:u.rows[0],artist});
   } catch (e:any) { await client.query('ROLLBACK'); res.status(e.code === '23505' ? 409 : 500).json({error:e.code === '23505' ? 'Email ou telefone já registado' : 'Não foi possível criar a conta'}); } finally { client.release(); }
 });
 
 app.post('/api/auth/login', async (req,res) => {
   const { email, phone, password } = req.body || {};
   if ((!email && !phone) || !password) return res.status(400).json({error:'Informe os dados de acesso'});
-  const q = await pool.query(`select id,email,phone,password_hash,role,status from users where email=$1 or phone=$2 limit 1`, [email || null, phone || null]);
+  const q = await pool.query(`select id,email,phone,password_hash,role,status,email_verified,mfa_enabled from users where (email=$1 or phone=$2) limit 1`, [String(email||'').trim().toLowerCase() || null, phone || null]);
   const user = q.rows[0];
   if (!user || user.status !== 'ACTIVE' || !verifyPassword(password,user.password_hash)) return res.status(401).json({error:'Credenciais inválidas'});
+  if(!user.email_verified) return res.status(403).json({error:'Verifica primeiro o teu email. Podes pedir um novo link de verificação.',code:'EMAIL_NOT_VERIFIED'});
   delete user.password_hash;
-  const sid=crypto.randomUUID();
-  if(user.role==='ARTIST') await pool.query(`insert into auth_sessions(id,user_id,role,last_activity_at) values($1,$2,$3,now())`,[sid,user.id,user.role]);
+  if(user.mfa_enabled){ const challenge=randomToken(); await pool.query(`insert into auth_challenges(id,user_id,challenge_hash,type,expires_at) values($1,$2,$3,'LOGIN_2FA',now()+interval '10 minutes')`,[crypto.randomUUID(),user.id,hashToken(challenge)]); return res.json({requires2FA:true,challenge}); }
+  const sid=crypto.randomUUID(); await pool.query(`insert into auth_sessions(id,user_id,role,last_activity_at,user_agent_hash) values($1,$2,$3,now(),$4)`,[sid,user.id,user.role,hashToken(String(req.headers['user-agent']||''))]);
   res.json({user,token:tokenFor(user,sid)});
 });
 
-app.post('/api/auth/activity', auth, async (req:AuthedRequest,res) => {
-  const decoded=decodeToken(String(req.headers.authorization||'').slice(7));
-  if(req.user?.role==='ARTIST' && decoded?.sid) await pool.query('update auth_sessions set last_activity_at=now() where id=$1 and user_id=$2 and revoked_at is null',[decoded.sid,req.user.id]);
-  res.json({ok:true});
+app.post('/api/auth/verify-2fa', async (req,res)=>{
+  const {challenge,code}=req.body||{}; if(!challenge||!code) return res.status(400).json({error:'Código 2FA obrigatório'});
+  const row=(await pool.query(`select c.id,c.user_id,u.email,u.phone,u.role,u.status,u.mfa_secret_enc from auth_challenges c join users u on u.id=c.user_id where c.challenge_hash=$1 and c.type='LOGIN_2FA' and c.used_at is null and c.expires_at>now() limit 1`,[hashToken(String(challenge))])).rows[0];
+  if(!row || row.status!=='ACTIVE') return res.status(401).json({error:'Desafio 2FA inválido ou expirado'});
+  if(!verifyTotp(decryptSecret(row.mfa_secret_enc),String(code))) return res.status(401).json({error:'Código 2FA incorreto'});
+  await pool.query('update auth_challenges set used_at=now() where id=$1',[row.id]); const sid=crypto.randomUUID(); await pool.query(`insert into auth_sessions(id,user_id,role,last_activity_at,user_agent_hash) values($1,$2,$3,now(),$4)`,[sid,row.user_id,row.role,hashToken(String(req.headers['user-agent']||''))]);
+  res.json({user:{id:row.user_id,email:row.email,phone:row.phone,role:row.role,status:row.status},token:tokenFor({id:row.user_id,role:row.role},sid)});
 });
 
-app.post('/api/auth/logout', auth, async (req:AuthedRequest,res) => {
-  const decoded=decodeToken(String(req.headers.authorization||'').slice(7));
-  if(req.user?.role==='ARTIST' && decoded?.sid) await pool.query('update auth_sessions set revoked_at=now() where id=$1 and user_id=$2',[decoded.sid,req.user.id]);
-  res.json({ok:true});
+app.post('/api/auth/resend-verification', async (req,res)=>{
+  const email=String(req.body?.email||'').trim().toLowerCase(); if(!email) return res.status(400).json({error:'Informe o email'});
+  const u=(await pool.query(`select id,email,email_verified from users where lower(email)=lower($1) limit 1`,[email])).rows[0];
+  if(u && !u.email_verified){ await pool.query(`update auth_email_tokens set used_at=now() where user_id=$1 and type='VERIFY_EMAIL' and used_at is null`,[u.id]); const raw=randomToken(); await pool.query(`insert into auth_email_tokens(id,user_id,token_hash,type,expires_at) values($1,$2,$3,'VERIFY_EMAIL',now()+interval '24 hours')`,[crypto.randomUUID(),u.id,hashToken(raw)]); await sendEmail(email,'Novo link de verificação — BaBuLo Play',`Confirma o teu email: ${publicWebUrl('/verify-email',raw)}`); }
+  res.json({ok:true,message:'Se o email existir e ainda não estiver verificado, enviámos um novo link.'});
 });
+
+app.post('/api/auth/verify-email', async (req,res)=>{
+  const token=String(req.body?.token||''); if(!token) return res.status(400).json({error:'Token de verificação obrigatório'});
+  const row=(await pool.query(`select id,user_id from auth_email_tokens where token_hash=$1 and type='VERIFY_EMAIL' and used_at is null and expires_at>now() limit 1`,[hashToken(token)])).rows[0];
+  if(!row) return res.status(400).json({error:'Link de verificação inválido ou expirado'});
+  await pool.query('update users set email_verified=true,updated_at=now() where id=$1',[row.user_id]); await pool.query('update auth_email_tokens set used_at=now() where id=$1',[row.id]); res.json({ok:true,message:'Email verificado com sucesso. Já podes entrar.'});
+});
+
+app.post('/api/auth/forgot-password', async (req,res)=>{
+  const email=String(req.body?.email||'').trim().toLowerCase(); if(!email) return res.status(400).json({error:'Informe o email'});
+  const u=(await pool.query(`select id,email from users where lower(email)=lower($1) and status<>'BLOCKED' limit 1`,[email])).rows[0];
+  if(u){ await pool.query(`update auth_email_tokens set used_at=now() where user_id=$1 and type='RESET_PASSWORD' and used_at is null`,[u.id]); const raw=randomToken(); await pool.query(`insert into auth_email_tokens(id,user_id,token_hash,type,expires_at) values($1,$2,$3,'RESET_PASSWORD',now()+interval '30 minutes')`,[crypto.randomUUID(),u.id,hashToken(raw)]); await sendEmail(email,'Recuperação de palavra-passe — BaBuLo Play',`Redefine a tua palavra-passe (válido por 30 minutos): ${publicWebUrl('/',raw).replace('?token=','?reset=')}`); }
+  res.json({ok:true,message:'Se o email existir, receberás instruções para recuperar a palavra-passe.'});
+});
+
+app.post('/api/auth/reset-password', async (req,res)=>{
+  const {token,password}=req.body||{}; if(!token||!password||String(password).length<8) return res.status(400).json({error:'Token e palavra-passe de pelo menos 8 caracteres são obrigatórios'});
+  const row=(await pool.query(`select id,user_id from auth_email_tokens where token_hash=$1 and type='RESET_PASSWORD' and used_at is null and expires_at>now() limit 1`,[hashToken(String(token))])).rows[0]; if(!row) return res.status(400).json({error:'Link de recuperação inválido ou expirado'});
+  await pool.query('update users set password_hash=$1,updated_at=now() where id=$2',[hashPassword(String(password)),row.user_id]); await pool.query('update auth_email_tokens set used_at=now() where id=$1',[row.id]); await pool.query('update auth_sessions set revoked_at=now() where user_id=$1 and revoked_at is null',[row.user_id]); res.json({ok:true,message:'Palavra-passe alterada. Todas as sessões anteriores foram encerradas.'});
+});
+
+app.get('/api/auth/sessions', auth, async (req:AuthedRequest,res)=>{ const rows=(await pool.query(`select id,role,created_at,last_activity_at,revoked_at from auth_sessions where user_id=$1 order by created_at desc`,[req.user!.id])).rows; res.json({sessions:rows}); });
+app.post('/api/auth/sessions/revoke-all', auth, async (req:AuthedRequest,res)=>{ await pool.query(`update auth_sessions set revoked_at=now() where user_id=$1 and revoked_at is null`,[req.user!.id]); res.json({ok:true}); });
+
+app.post('/api/auth/activity', auth, async (req:AuthedRequest,res) => { const decoded=decodeToken(String(req.headers.authorization||'').slice(7)); if(decoded?.sid) await pool.query('update auth_sessions set last_activity_at=now() where id=$1 and user_id=$2 and revoked_at is null',[decoded.sid,req.user!.id]); res.json({ok:true}); });
+app.post('/api/auth/logout', auth, async (req:AuthedRequest,res) => { const decoded=decodeToken(String(req.headers.authorization||'').slice(7)); if(decoded?.sid) await pool.query('update auth_sessions set revoked_at=now() where id=$1 and user_id=$2',[decoded.sid,req.user!.id]); res.json({ok:true}); });
+
+app.post('/api/auth/2fa/setup', auth, async (req:AuthedRequest,res)=>{
+  if(!['ADMIN','OWNER'].includes(req.user!.role)) return res.status(403).json({error:'2FA é obrigatório apenas para ADMIN/OWNER.'});
+  const secret=base32Encode(crypto.randomBytes(20)); const enc=encryptSecret(secret); await pool.query('update users set mfa_secret_enc=$1,mfa_pending=true where id=$2',[enc,req.user!.id]); const u=(await pool.query('select email from users where id=$1',[req.user!.id])).rows[0]; const issuer='BaBuLo Play'; const uri=`otpauth://totp/${encodeURIComponent(issuer+':'+u.email)}?secret=${secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`; res.json({secret,otpauthUri:uri,message:'Adiciona esta chave no Google Authenticator, Microsoft Authenticator ou app compatível e confirma com o código.'});
+});
+app.post('/api/auth/2fa/enable', auth, async (req:AuthedRequest,res)=>{ if(!['ADMIN','OWNER'].includes(req.user!.role)) return res.status(403).json({error:'Acesso reservado à administração'}); const row=(await pool.query('select mfa_secret_enc from users where id=$1',[req.user!.id])).rows[0]; if(!row?.mfa_secret_enc) return res.status(400).json({error:'Primeiro inicia a configuração do 2FA'}); if(!verifyTotp(decryptSecret(row.mfa_secret_enc),String(req.body?.code||''))) return res.status(400).json({error:'Código 2FA incorreto'}); await pool.query('update users set mfa_enabled=true,mfa_pending=false where id=$1',[req.user!.id]); res.json({ok:true,message:'2FA ativado com sucesso.'}); });
+app.post('/api/auth/2fa/disable', auth, async (req:AuthedRequest,res)=>{ if(!['ADMIN','OWNER'].includes(req.user!.role)) return res.status(403).json({error:'Acesso reservado à administração'}); const row=(await pool.query('select mfa_secret_enc,mfa_enabled from users where id=$1',[req.user!.id])).rows[0]; if(!row?.mfa_enabled) return res.json({ok:true}); if(!verifyTotp(decryptSecret(row.mfa_secret_enc),String(req.body?.code||''))) return res.status(400).json({error:'Código 2FA incorreto'}); await pool.query('update users set mfa_enabled=false,mfa_pending=false,mfa_secret_enc=null where id=$1',[req.user!.id]); res.json({ok:true,message:'2FA desativado.'}); });
 
 app.get('/api/auth/me', auth, async (req:AuthedRequest,res) => {
-  const q = await pool.query(`select id,email,phone,role,status,email_verified,phone_verified,created_at from users where id=$1`, [req.user!.id]);
+  const q = await pool.query(`select id,email,phone,role,status,email_verified,phone_verified,mfa_enabled,created_at from users where id=$1`, [req.user!.id]);
   if (!q.rows[0]) return res.status(404).json({error:'Utilizador não encontrado'});
   const artist = (await pool.query(`select id,stage_name,legal_name,bio,country,city,photo_url,verification_status from artists where user_id=$1`, [req.user!.id])).rows[0] || null;
   res.json({user:q.rows[0],artist});
@@ -531,7 +601,7 @@ app.post('/api/releases/:id/submit-approval', auth, artistOnly, async (req:Authe
   res.json({ok:true,status:'PENDING_APPROVAL'});
 });
 
-app.get('/api/admin/releases/pending', auth, adminOnly, async (req:AuthedRequest,res) => {
+app.get('/api/admin/releases/pending', auth, requireAdminPermission('RELEASES'), async (req:AuthedRequest,res) => {
   const q=await pool.query(`select r.id,r.title,r.type,r.status,r.preflight_status,r.submitted_at,r.cover_url,a.stage_name from releases r join artists a on a.id=r.primary_artist_id where r.status='PENDING_APPROVAL' order by r.submitted_at asc nulls last`);
   res.json({releases:q.rows});
 });
@@ -569,12 +639,12 @@ app.post('/api/copyright-complaints', async (req,res) => {
   res.status(201).json({complaint:q.rows[0]});
 });
 
-app.get('/api/admin/copyright-complaints', auth, adminOnly, async (_req,res) => {
+app.get('/api/admin/copyright-complaints', auth, requireAdminPermission('MODERATION'), async (_req,res) => {
   const q=await pool.query(`select c.*,r.title release_title,t.title track_title from copyright_complaints c left join releases r on r.id=c.release_id left join tracks t on t.id=c.track_id order by c.created_at desc`);
   res.json({complaints:q.rows});
 });
 
-app.post('/api/admin/copyright-complaints/:id/decision', auth, adminOnly, async (req:AuthedRequest,res) => {
+app.post('/api/admin/copyright-complaints/:id/decision', auth, requireAdminPermission('MODERATION'), async (req:AuthedRequest,res) => {
   const {decision,reason}=req.body||{};
   if(!['SUSPEND','REJECT','RESOLVE','REACTIVATE','REMOVE'].includes(decision)) return res.status(400).json({error:'Decisão de reclamação inválida'});
   if(!String(reason||'').trim()) return res.status(400).json({error:'Informe o motivo da decisão'});
@@ -598,7 +668,7 @@ app.post('/api/admin/copyright-complaints/:id/decision', auth, adminOnly, async 
 const ACCOUNT_STATUSES=['ACTIVE','SUSPENDED','BLOCKED'];
 const VERIFICATION_STATUSES=['UNVERIFIED','PENDING','VERIFIED','REJECTED'];
 
-app.get('/api/admin/users', auth, adminOnly, async (req:AuthedRequest,res) => {
+app.get('/api/admin/users', auth, requireAnyAdminPermission(['USERS','ARTISTS','TEAM']), async (req:AuthedRequest,res) => {
   const qtext=String(req.query.q||'').trim();
   const role=String(req.query.role||'').trim().toUpperCase();
   const status=String(req.query.status||'').trim().toUpperCase();
@@ -608,7 +678,7 @@ app.get('/api/admin/users', auth, adminOnly, async (req:AuthedRequest,res) => {
   if(['LISTENER','ARTIST','ADMIN','OWNER'].includes(role)){params.push(role);where.push(`u.role=$${params.length}`);}
   if(ACCOUNT_STATUSES.includes(status)){params.push(status);where.push(`u.status=$${params.length}`);}
   params.push(limit);
-  const sql=`select u.id,u.email,u.phone,u.role,u.status,u.email_verified,u.phone_verified,u.created_at,u.updated_at,
+  const sql=`select u.id,u.email,u.phone,u.role,u.status,u.email_verified,u.phone_verified,u.admin_title,u.admin_permissions,u.created_at,u.updated_at,
     a.id artist_id,a.stage_name,a.country,a.city,a.photo_url,a.verification_status,a.status artist_status,
     (select count(*)::int from releases r where r.primary_artist_id=a.id) release_count,
     (select count(*)::int from stream_events se join tracks t on t.id=se.track_id where t.primary_release_id in (select r2.id from releases r2 where r2.primary_artist_id=a.id) and se.is_valid=true) valid_streams
@@ -618,17 +688,20 @@ app.get('/api/admin/users', auth, adminOnly, async (req:AuthedRequest,res) => {
   res.json({users:rows});
 });
 
-app.get('/api/admin/users/:id', auth, adminOnly, async (req:AuthedRequest,res) => {
-  const user=(await pool.query(`select id,email,phone,role,status,email_verified,phone_verified,created_at,updated_at from users where id=$1`,[req.params.id])).rows[0];
+app.get('/api/admin/users/:id', auth, requireAnyAdminPermission(['USERS','ARTISTS','TEAM']), async (req:AuthedRequest,res) => {
+  const user=(await pool.query(`select id,email,phone,role,status,email_verified,phone_verified,admin_title,admin_permissions,created_at,updated_at from users where id=$1`,[req.params.id])).rows[0];
   if(!user) return res.status(404).json({error:'Utilizador não encontrado'});
   const artist=(await pool.query(`select id,stage_name,legal_name,bio,country,city,photo_url,verification_status,status,created_at from artists where user_id=$1`,[req.params.id])).rows[0]||null;
   const releases=artist?(await pool.query(`select id,title,type,status,preflight_status,submitted_at,reviewed_at,review_reason,created_at from releases where primary_artist_id=$1 order by created_at desc limit 100`,[artist.id])).rows:[];
   const withdrawals=artist?(await pool.query(`select id,amount,currency,method,status,rejection_reason,created_at,reviewed_at from withdrawals where artist_id=$1 order by created_at desc limit 50`,[artist.id])).rows:[];
+  const streamStats=artist?(await pool.query(`select count(*) filter(where se.is_valid=true)::int valid_streams,count(distinct se.listener_key) filter(where se.is_valid=true)::int unique_listeners from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where r.primary_artist_id=$1`,[artist.id])).rows[0]:null;
+  const listenerStats=!artist?(await pool.query(`select count(*) filter(where se.is_valid=true)::int valid_streams,count(distinct se.listener_key) filter(where se.is_valid=true)::int unique_listeners from stream_events se where se.user_id=$1`,[req.params.id])).rows[0]:null;
+  const sessions=(await pool.query(`select id,created_at,last_activity_at,revoked_at from auth_sessions where user_id=$1 order by created_at desc limit 20`,[req.params.id])).rows;
   const logs=(await pool.query(`select al.id,al.action,al.entity_type,al.entity_id,al.details,al.created_at,u.email actor_email from audit_logs al left join users u on u.id=al.actor_user_id where al.entity_id=$1 or al.actor_user_id=$1 order by al.created_at desc limit 50`,[req.params.id])).rows;
-  res.json({user,artist,releases,withdrawals,logs});
+  res.json({user,artist,releases,withdrawals,streamStats:streamStats||listenerStats||{valid_streams:0,unique_listeners:0},sessions,logs});
 });
 
-app.post('/api/admin/users/:id/status', auth, adminOnly, async (req:AuthedRequest,res) => {
+app.post('/api/admin/users/:id/status', auth, requireAnyAdminPermission(['USERS','ARTISTS','TEAM']), async (req:AuthedRequest,res) => {
   const status=String(req.body?.status||'').toUpperCase();
   if(!ACCOUNT_STATUSES.includes(status)) return res.status(400).json({error:'Estado de conta inválido'});
   if(req.params.id===req.user!.id) return res.status(400).json({error:'Não podes alterar o estado da tua própria conta.'});
@@ -641,7 +714,7 @@ app.post('/api/admin/users/:id/status', auth, adminOnly, async (req:AuthedReques
   res.json({ok:true,user:q.rows[0]});
 });
 
-app.post('/api/admin/artists/:id/verification', auth, adminOnly, async (req:AuthedRequest,res) => {
+app.post('/api/admin/artists/:id/verification', auth, requireAdminPermission('ARTISTS'), async (req:AuthedRequest,res) => {
   const verificationStatus=String(req.body?.verificationStatus||'').toUpperCase();
   if(!VERIFICATION_STATUSES.includes(verificationStatus)) return res.status(400).json({error:'Estado de verificação inválido'});
   const artist=(await pool.query(`select id,user_id,stage_name,verification_status from artists where id=$1`,[req.params.id])).rows[0];
@@ -651,17 +724,22 @@ app.post('/api/admin/artists/:id/verification', auth, adminOnly, async (req:Auth
   res.json({ok:true,artist:q.rows[0]});
 });
 
-app.post('/api/owner/admins', auth, async (req:AuthedRequest,res) => {
+app.post('/api/owner/admins', auth, async (req:AuthedRequest,res:Response) => {
   if(req.user?.role!=='OWNER') return res.status(403).json({error:'Apenas o OWNER pode criar contas ADMIN.'});
   const email=String(req.body?.email||'').trim().toLowerCase();
   const password=String(req.body?.password||'');
+  const adminTitle=String(req.body?.adminTitle||'Administrador').trim().slice(0,100)||'Administrador';
+  const permissions=Array.isArray(req.body?.permissions)?req.body.permissions.filter((p:any)=>ADMIN_PERMISSIONS.includes(String(p))):[];
   if(!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({error:'Informe um email válido.'});
   if(password.length<12) return res.status(400).json({error:'A palavra-passe do ADMIN deve ter pelo menos 12 caracteres.'});
+  if(!permissions.length) return res.status(400).json({error:'Selecione pelo menos uma função para o ADMIN.'});
   const duplicate=(await pool.query(`select id from users where lower(email)=lower($1) limit 1`,[email])).rows[0];
   if(duplicate) return res.status(409).json({error:'Este email já está registado.'});
-  const q=await pool.query(`insert into users(email,password_hash,role,status,email_verified) values($1,$2,'ADMIN','ACTIVE',true) returning id,email,role,status,created_at`,[email,hashPassword(password)]);
-  await audit(req.user!.id,'ADMIN_CREATED','USER',q.rows[0].id,{email});
-  res.status(201).json({ok:true,user:q.rows[0]});
+  const q=await pool.query(`insert into users(email,password_hash,role,status,email_verified,admin_title,admin_permissions) values($1,$2,'ADMIN','ACTIVE',false,$3,$4::jsonb) returning id,email,role,status,admin_title,admin_permissions,created_at`,[email,hashPassword(password),adminTitle,JSON.stringify(permissions)]);
+  const raw=randomToken(); await pool.query(`insert into auth_email_tokens(id,user_id,token_hash,type,expires_at) values($1,$2,$3,'VERIFY_EMAIL',now()+interval '24 hours')`,[crypto.randomUUID(),q.rows[0].id,hashToken(raw)]);
+  await sendEmail(email,'Ativação da conta ADMIN — BaBuLo Play',`A tua conta de administrador foi criada. Confirma o teu email neste link (válido por 24 horas): ${publicWebUrl('/',raw).replace('?token=','?verify=')}`);
+  await audit(req.user!.id,'ADMIN_CREATED','USER',q.rows[0].id,{email,adminTitle,permissions});
+  res.status(201).json({ok:true,user:q.rows[0],requiresEmailVerification:true});
 });
 
 app.get('/api/admin/audit-logs', auth, adminOnly, async (_req,res) => {
@@ -730,7 +808,7 @@ app.get('/api/artists/me/analytics', auth, artistOnly, async (req:AuthedRequest,
   res.json({artist,analytics:await streamAnalytics(artist.id,range.from,range.to)});
 });
 
-app.get('/api/admin/analytics/streams', auth, adminOnly, async (req,res)=>{
+app.get('/api/admin/analytics/streams', auth, requireAdminPermission('ANALYTICS'), async (req,res)=>{
   const range=dateRange(req); if(!range) return res.status(400).json({error:'Período inválido'});
   res.json({analytics:await streamAnalytics(null,range.from,range.to)});
 });
@@ -773,7 +851,7 @@ app.post('/api/artists/me/withdrawals', auth, artistOnly, async (req:AuthedReque
   }catch(e){await client.query('rollback');console.error(e);res.status(500).json({error:'Não foi possível solicitar o levantamento'});}finally{client.release();}
 });
 
-app.get('/api/admin/finance/summary', auth, adminOnly, async (_req,res)=>{
+app.get('/api/admin/finance/summary', auth, requireAdminPermission('FINANCE'), async (_req,res)=>{
   const q=await pool.query(`select
     (select count(*) from stream_events where is_valid=true)::int as valid_streams,
     coalesce((select sum(amount) from payment_transactions where status='PAID' and payment_method<>'WALLET'),0) as external_paid,
