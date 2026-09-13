@@ -678,7 +678,7 @@ app.get('/api/admin/users', auth, requireAnyAdminPermission(['USERS','ARTISTS','
   if(['LISTENER','ARTIST','ADMIN','OWNER'].includes(role)){params.push(role);where.push(`u.role=$${params.length}`);}
   if(ACCOUNT_STATUSES.includes(status)){params.push(status);where.push(`u.status=$${params.length}`);}
   params.push(limit);
-  const sql=`select u.id,u.email,u.phone,u.role,u.status,u.email_verified,u.phone_verified,u.admin_title,u.admin_permissions,u.created_at,u.updated_at,
+  const sql=`select u.id,u.phone,u.role,u.status,u.email_verified,u.phone_verified,u.admin_title,u.admin_permissions,u.full_name,u.birth_date,u.created_at,u.updated_at,
     a.id artist_id,a.stage_name,a.country,a.city,a.photo_url,a.verification_status,a.status artist_status,
     (select count(*)::int from releases r where r.primary_artist_id=a.id) release_count,
     (select count(*)::int from stream_events se join tracks t on t.id=se.track_id where t.primary_release_id in (select r2.id from releases r2 where r2.primary_artist_id=a.id) and se.is_valid=true) valid_streams
@@ -689,7 +689,7 @@ app.get('/api/admin/users', auth, requireAnyAdminPermission(['USERS','ARTISTS','
 });
 
 app.get('/api/admin/users/:id', auth, requireAnyAdminPermission(['USERS','ARTISTS','TEAM']), async (req:AuthedRequest,res) => {
-  const user=(await pool.query(`select id,email,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,admin_title,admin_permissions,created_at,updated_at from users where id=$1`,[req.params.id])).rows[0];
+  const user=(await pool.query(`select id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,admin_title,admin_permissions,created_at,updated_at from users where id=$1`,[req.params.id])).rows[0];
   if(!user) return res.status(404).json({error:'Utilizador não encontrado'});
   const artist=(await pool.query(`select id,stage_name,legal_name,bio,country,city,photo_url,verification_status,status,created_at from artists where user_id=$1`,[req.params.id])).rows[0]||null;
   const releases=artist?(await pool.query(`select id,title,type,status,preflight_status,submitted_at,reviewed_at,review_reason,created_at from releases where primary_artist_id=$1 order by created_at desc limit 100`,[artist.id])).rows:[];
@@ -697,7 +697,7 @@ app.get('/api/admin/users/:id', auth, requireAnyAdminPermission(['USERS','ARTIST
   const streamStats=artist?(await pool.query(`select count(*) filter(where se.is_valid=true)::int valid_streams,count(distinct se.listener_key) filter(where se.is_valid=true)::int unique_listeners from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where r.primary_artist_id=$1`,[artist.id])).rows[0]:null;
   const listenerStats=!artist?(await pool.query(`select count(*) filter(where se.is_valid=true)::int valid_streams,count(distinct se.listener_key) filter(where se.is_valid=true)::int unique_listeners from stream_events se where se.user_id=$1`,[req.params.id])).rows[0]:null;
   const sessions=(await pool.query(`select id,created_at,last_activity_at,revoked_at from auth_sessions where user_id=$1 order by created_at desc limit 20`,[req.params.id])).rows;
-  const logs=(await pool.query(`select al.id,al.action,al.entity_type,al.entity_id,al.details,al.created_at,u.email actor_email from audit_logs al left join users u on u.id=al.actor_user_id where al.entity_id=$1 or al.actor_user_id=$1 order by al.created_at desc limit 50`,[req.params.id])).rows;
+  const logs=(await pool.query(`select al.id,al.action,al.entity_type,al.entity_id,al.details,al.created_at,u.role actor_role,u.full_name actor_name from audit_logs al left join users u on u.id=al.actor_user_id where al.entity_id=$1 or al.actor_user_id=$1 order by al.created_at desc limit 50`,[req.params.id])).rows;
   res.json({user,artist,releases,withdrawals,streamStats:streamStats||listenerStats||{valid_streams:0,unique_listeners:0},sessions,logs});
 });
 
@@ -735,6 +735,24 @@ app.delete('/api/owner/admins/:id', auth, async (req:AuthedRequest,res:Response)
   res.json({ok:true,message:'Conta ADMIN apagada com sucesso.'});
 });
 
+app.patch('/api/owner/admins/:id', auth, async (req:AuthedRequest,res:Response) => {
+  if(req.user?.role!=='OWNER') return res.status(403).json({error:'Apenas o OWNER pode alterar funções de ADMIN.'});
+  const target=(await pool.query(`select id,role,admin_title,admin_permissions from users where id=$1`,[req.params.id])).rows[0];
+  if(!target) return res.status(404).json({error:'ADMIN não encontrado'});
+  if(target.role!=='ADMIN') return res.status(400).json({error:'Só é possível alterar funções de contas ADMIN.'});
+  const adminTitle=String(req.body?.adminTitle||'Administrador').trim().slice(0,100)||'Administrador';
+  const fullName=String(req.body?.fullName||'').trim().slice(0,160)||null;
+  const phone=String(req.body?.phone||'').trim().slice(0,40)||null;
+  const birthDate=String(req.body?.birthDate||'').trim()||null;
+  if(birthDate && !/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) return res.status(400).json({error:'Data de nascimento inválida.'});
+  const permissions=Array.isArray(req.body?.permissions)?req.body.permissions.filter((p:any)=>ADMIN_PERMISSIONS.includes(String(p))):[];
+  if(!permissions.length) return res.status(400).json({error:'Selecione pelo menos uma função/permissão.'});
+  const q=await pool.query(`update users set admin_title=$1,admin_permissions=$2::jsonb,full_name=$3,phone=$4,birth_date=$5,updated_at=now() where id=$6 and role='ADMIN' returning id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,admin_title,admin_permissions,created_at,updated_at`,[adminTitle,JSON.stringify(permissions),fullName,phone,birthDate,target.id]);
+  await pool.query(`update auth_sessions set revoked_at=now() where user_id=$1 and revoked_at is null`,[target.id]);
+  await audit(req.user!.id,'ADMIN_ROLE_UPDATED','USER',target.id,{fromTitle:target.admin_title,toTitle:adminTitle,fromPermissions:target.admin_permissions,toPermissions:permissions});
+  res.json({ok:true,user:q.rows[0],message:'Função e permissões atualizadas. O ADMIN deverá iniciar uma nova sessão.'});
+});
+
 app.patch('/api/admin/me/profile', auth, async (req:AuthedRequest,res:Response) => {
   if(req.user?.role!=='ADMIN') return res.status(403).json({error:'Apenas ADMIN pode atualizar o próprio perfil por esta rota.'});
   const fullName=String(req.body?.fullName||'').trim().slice(0,160)||null;
@@ -742,7 +760,7 @@ app.patch('/api/admin/me/profile', auth, async (req:AuthedRequest,res:Response) 
   const birthDate=String(req.body?.birthDate||'').trim()||null;
   if(birthDate && !/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) return res.status(400).json({error:'Data de nascimento inválida.'});
   try{
-    const q=await pool.query(`update users set full_name=$1,phone=$2,birth_date=$3,updated_at=now() where id=$4 and role='ADMIN' returning id,email,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,admin_title,admin_permissions,created_at,updated_at`,[fullName,phone,birthDate,req.user.id]);
+    const q=await pool.query(`update users set full_name=$1,phone=$2,birth_date=$3,updated_at=now() where id=$4 and role='ADMIN' returning id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,admin_title,admin_permissions,created_at,updated_at`,[fullName,phone,birthDate,req.user.id]);
     if(!q.rows[0]) return res.status(404).json({error:'ADMIN não encontrado'});
     await audit(req.user.id,'ADMIN_PROFILE_UPDATED','USER',req.user.id,{phoneChanged:Boolean(phone),profileFields:['full_name','phone','birth_date']});
     res.json({ok:true,user:q.rows[0]});
@@ -772,7 +790,7 @@ app.post('/api/owner/admins', auth, async (req:AuthedRequest,res:Response) => {
 });
 
 app.get('/api/admin/audit-logs', auth, adminOnly, async (_req,res) => {
-  const q=await pool.query(`select al.*,u.email actor_email from audit_logs al left join users u on u.id=al.actor_user_id order by al.created_at desc limit 200`);
+  const q=await pool.query(`select al.*,u.role actor_role,u.full_name actor_name from audit_logs al left join users u on u.id=al.actor_user_id order by al.created_at desc limit 200`);
   res.json({logs:q.rows});
 });
 
