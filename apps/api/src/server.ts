@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -175,7 +175,7 @@ function ownerOnly(req: AuthedRequest, res: Response, next: NextFunction) {
   next();
 }
 
-const ADMIN_PERMISSIONS=['USERS','ARTISTS','TEAM','RELEASES','FINANCE','WITHDRAWALS','MODERATION','ANALYTICS','SETTINGS'];
+const ADMIN_PERMISSIONS=['USERS','ARTISTS','TEAM','RELEASES','FINANCE','WITHDRAWALS','MODERATION','ANALYTICS','ADS','SECURITY','SETTINGS'];
 function requireAnyAdminPermission(permissions:string[]){
   return async (req:AuthedRequest,res:Response,next:NextFunction)=>{
     if(req.user?.role==='OWNER') return next();
@@ -575,7 +575,7 @@ app.post('/api/owner/payments/:id/decision', auth, ownerOnly, async (req:AuthedR
   }catch(e){await client.query('rollback');console.error('owner payment decision error',e);res.status(500).json({error:'Não foi possível guardar a decisão financeira'});}finally{client.release();}
 });
 
-app.get('/api/admin/payments/pending', auth, adminOnly, async (_req,res) => {
+app.get('/api/admin/payments/pending', auth, requireAdminPermission('FINANCE'), async (_req,res) => {
   const q=await pool.query(`select p.id,p.reference,p.amount,p.currency,p.payment_method,p.status,p.created_at,p.release_id,r.title release_title,a.stage_name from payment_transactions p left join releases r on r.id=p.release_id left join artists a on a.id=r.primary_artist_id where p.service_type='DISTRIBUTION' and p.status='PENDING' order by p.created_at asc`);
   res.json({payments:q.rows});
 });
@@ -639,7 +639,7 @@ app.get('/api/admin/releases/pending', auth, requireAdminPermission('RELEASES'),
   res.json({releases:q.rows});
 });
 
-app.get('/api/admin/releases/:id', auth, adminOnly, async (req:AuthedRequest,res) => {
+app.get('/api/admin/releases/:id', auth, requireAdminPermission('RELEASES'), async (req:AuthedRequest,res) => {
   const release=(await pool.query(`select r.*,a.stage_name from releases r join artists a on a.id=r.primary_artist_id where r.id=$1`,[req.params.id])).rows[0];
   if(!release) return res.status(404).json({error:'Lançamento não encontrado'});
   const tracks=(await pool.query(`select t.*,tf.storage_key from tracks t left join track_files tf on tf.track_id=t.id and tf.file_type='AUDIO' where t.primary_release_id=$1`,[release.id])).rows;
@@ -647,7 +647,7 @@ app.get('/api/admin/releases/:id', auth, adminOnly, async (req:AuthedRequest,res
   res.json({release,tracks,rights});
 });
 
-app.post('/api/admin/releases/:id/decision', auth, adminOnly, async (req:AuthedRequest,res) => {
+app.post('/api/admin/releases/:id/decision', auth, requireAdminPermission('RELEASES'), async (req:AuthedRequest,res) => {
   const {decision,reason}=req.body||{};
   if(!['APPROVED','REJECTED'].includes(decision)) return res.status(400).json({error:'Decisão inválida'});
   if(decision==='REJECTED' && !String(reason||'').trim()) return res.status(400).json({error:'Informe o motivo da rejeição'});
@@ -784,7 +784,7 @@ app.patch('/api/owner/admins/:id', auth, async (req:AuthedRequest,res:Response) 
   const maritalStatus=String(req.body?.maritalStatus||'').trim().slice(0,60)||null;
   const profilePhotoUrl=String(req.body?.profilePhotoUrl||'').trim().slice(0,1000)||null;
   if(birthDate && !/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) return res.status(400).json({error:'Data de nascimento inválida.'});
-  if(heightCm!==null && (!Number.isFinite(heightCm)||heightCm<80||heightCm>250)) return res.status(400).json({error:'Altura inválida.'});
+  if(heightCm!==null && (!Number.isFinite(heightCm)||heightCm<110||heightCm>220)) return res.status(400).json({error:'Altura inválida. Deve estar entre 1,10 m e 2,20 m.'});
   const permissions=Array.isArray(req.body?.permissions)?req.body.permissions.filter((p:any)=>ADMIN_PERMISSIONS.includes(String(p))):[];
   if(!permissions.length) return res.status(400).json({error:'Selecione pelo menos uma função/permissão.'});
   const q=await pool.query(`update users set admin_title=$1,admin_permissions=$2::jsonb,full_name=$3,phone=$4,birth_date=$5,gender=$6,height_cm=$7,education=$8,address=$9,marital_status=$10,profile_photo_url=$11,updated_at=now() where id=$12 and role='ADMIN' returning id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,gender,height_cm,education,address,marital_status,profile_photo_url,admin_title,admin_permissions,created_at,updated_at`,[adminTitle,JSON.stringify(permissions),fullName,phone,birthDate,gender,heightCm,education,address,maritalStatus,profilePhotoUrl,target.id]);
@@ -805,7 +805,7 @@ app.patch('/api/admin/me/profile', auth, async (req:AuthedRequest,res:Response) 
   const maritalStatus=String(req.body?.maritalStatus||'').trim().slice(0,60)||null;
   const profilePhotoUrl=String(req.body?.profilePhotoUrl||'').trim().slice(0,1000)||null;
   if(birthDate && !/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) return res.status(400).json({error:'Data de nascimento inválida.'});
-  if(heightCm!==null && (!Number.isFinite(heightCm)||heightCm<80||heightCm>250)) return res.status(400).json({error:'Altura inválida.'});
+  if(heightCm!==null && (!Number.isFinite(heightCm)||heightCm<110||heightCm>220)) return res.status(400).json({error:'Altura inválida. Deve estar entre 1,10 m e 2,20 m.'});
   try{
     const q=await pool.query(`update users set full_name=$1,phone=$2,birth_date=$3,gender=$4,height_cm=$5,education=$6,address=$7,marital_status=$8,profile_photo_url=$9,updated_at=now() where id=$10 and role='ADMIN' returning id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,gender,height_cm,education,address,marital_status,profile_photo_url,admin_title,admin_permissions,created_at,updated_at`,[fullName,phone,birthDate,gender,heightCm,education,address,maritalStatus,profilePhotoUrl,req.user.id]);
     if(!q.rows[0]) return res.status(404).json({error:'ADMIN não encontrado'});
@@ -836,7 +836,7 @@ app.post('/api/owner/admins', auth, async (req:AuthedRequest,res:Response) => {
   res.status(201).json({ok:true,user:q.rows[0],requiresEmailVerification:true});
 });
 
-app.get('/api/admin/audit-logs', auth, adminOnly, async (_req,res) => {
+app.get('/api/admin/audit-logs', auth, requireAdminPermission('SECURITY'), async (_req,res) => {
   const q=await pool.query(`select al.*,u.role actor_role,u.full_name actor_name from audit_logs al left join users u on u.id=al.actor_user_id order by al.created_at desc limit 200`);
   res.json({logs:q.rows});
 });
@@ -994,6 +994,42 @@ app.get('/api/admin/finance/summary', auth, requireAdminPermission('FINANCE'), a
   },updatedAt:new Date().toISOString()});
 });
 
+// ===== V10.4.7 ADMIN — CENTRO FINANCEIRO OPERACIONAL =====
+app.get('/api/admin/finance/overview', auth, requireAdminPermission('FINANCE'), async (_req,res)=>{
+  try{
+    const [artists,admins,pendingPayments,pendingWithdrawals]=await Promise.all([
+      pool.query(`select a.id,a.stage_name,u.full_name,u.phone,
+        coalesce((select sum(case when fl.entry_type='CREDIT' then fl.amount when fl.entry_type='DEBIT' then -fl.amount end) from financial_ledger fl where fl.artist_id=a.id),0) balance,
+        coalesce((select count(*) from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where r.primary_artist_id=a.id and se.is_valid=true),0) valid_streams
+        from artists a left join users u on u.id=a.user_id order by balance desc,a.stage_name asc`),
+      pool.query(`select id,full_name,admin_title,salary_amount,salary_currency,status from users where role='ADMIN' order by full_name asc`),
+      pool.query(`select p.id,p.reference,p.amount,p.currency,p.payment_method,p.status,p.created_at,p.release_id,r.title release_title,a.stage_name from payment_transactions p left join releases r on r.id=p.release_id left join artists a on a.id=r.primary_artist_id where p.service_type='DISTRIBUTION' and p.status='PENDING' order by p.created_at asc`),
+      pool.query(`select w.id,w.amount,w.currency,w.method,w.status,w.created_at,a.stage_name,u.full_name from withdrawals w join artists a on a.id=w.artist_id left join users u on u.id=a.user_id where w.status='PENDING' order by w.created_at asc`)
+    ]);
+    res.json({artists:artists.rows,admins:admins.rows,pendingPayments:pendingPayments.rows,pendingWithdrawals:pendingWithdrawals.rows});
+  }catch(e){console.error(e);res.status(500).json({error:'Não foi possível carregar o centro financeiro administrativo'});}
+});
+
+// ===== V10.4.7 ADMIN — PUBLICIDADE OPERACIONAL (SEM PODER DE PAGAMENTO/ATIVAÇÃO) =====
+app.get('/api/admin/ads/overview', auth, requireAdminPermission('ADS'), async (_req,res)=>{
+  try{
+    const [campaigns,placements,pricing]=await Promise.all([
+      pool.query(`select id,name,advertiser_name,format,pricing_model,budget,spend,currency,status,payment_status,start_at,end_at,target_country,target_city,impressions,clicks,video_views from ad_campaigns order by created_at desc`),
+      pool.query(`select id,code,name,description,active,sort_order from ad_placements order by sort_order asc`),
+      pool.query(`select id,name,format,pricing_model,price,currency,unit,active from ad_pricing order by created_at desc`)
+    ]);
+    res.json({campaigns:campaigns.rows,placements:placements.rows,pricing:pricing.rows});
+  }catch(e){console.error(e);res.status(500).json({error:'Não foi possível carregar a publicidade'});}
+});
+app.get('/api/admin/ads/reports', auth, requireAdminPermission('ADS'), async (_req,res)=>{
+  try{
+    const q=await pool.query(`select c.id,c.name,c.advertiser_name,c.format,c.status,c.impressions,c.clicks,c.video_views,c.spend,c.budget,
+      case when c.impressions>0 then round((c.clicks::numeric/c.impressions::numeric)*100,2) else 0 end ctr
+      from ad_campaigns c order by c.created_at desc`);
+    res.json({reports:q.rows});
+  }catch(e){console.error(e);res.status(500).json({error:'Não foi possível carregar os relatórios de publicidade'});}
+});
+
 // ===== V10.4.7 OWNER — CONTROLO FINANCEIRO CENTRAL =====
 app.get('/api/owner/finance/overview', auth, ownerOnly, async (_req,res)=>{
   try{
@@ -1059,12 +1095,12 @@ app.post('/api/owner/finance/:id/mark-paid', auth, ownerOnly, async (req:AuthedR
   const q=await pool.query(`update owner_finance_transactions set status='PAID',updated_at=now() where id=$1 and status in ('APPROVED','SENT_TO_BANK') returning *`,[req.params.id]); if(!q.rows[0])return res.status(404).json({error:'Operação aprovada/enviada não encontrada'}); await audit(req.user!.id,'OWNER_FINANCE_MARKED_PAID','OWNER_FINANCE',req.params.id,{}); res.json({ok:true,transaction:q.rows[0]});
 });
 
-app.get('/api/admin/royalty-periods', auth, adminOnly, async (_req,res) => {
+app.get('/api/admin/royalty-periods', auth, requireAdminPermission('FINANCE'), async (_req,res) => {
   const q=await pool.query(`select rp.*,u.email calculated_by_email from royalty_periods rp left join users u on u.id=rp.calculated_by order by period_start desc`);
   res.json({periods:q.rows});
 });
 
-app.post('/api/admin/royalty-periods/calculate', auth, adminOnly, async (req:AuthedRequest,res) => {
+app.post('/api/admin/royalty-periods/calculate', auth, requireAdminPermission('FINANCE'), async (req:AuthedRequest,res) => {
   const {periodStart,periodEnd,grossRevenue=0,paymentFees=0,taxes=0,adjustments=0,artistSharePercent=70}=req.body||{};
   if(!periodStart||!periodEnd) return res.status(400).json({error:'periodStart e periodEnd são obrigatórios'});
   const start=new Date(`${periodStart}T00:00:00Z`), end=new Date(`${periodEnd}T23:59:59Z`);
@@ -1106,7 +1142,7 @@ app.get('/api/owner/finance/approvals', auth, ownerOnly, async (_req,res) => {
   } catch(e){ console.error(e); res.status(500).json({error:'Não foi possível carregar as aprovações financeiras'}); }
 });
 
-app.get('/api/admin/withdrawals', auth, adminOnly, async (_req,res) => {
+app.get('/api/admin/withdrawals', auth, requireAdminPermission('WITHDRAWALS'), async (_req,res) => {
   const q=await pool.query(`select w.*,a.stage_name,u.email from withdrawals w join artists a on a.id=w.artist_id left join users u on u.id=a.user_id order by w.created_at desc`);
   res.json({withdrawals:q.rows});
 });
@@ -1142,8 +1178,8 @@ app.post('/api/distribution/orders/:id/submit',auth,artistOnly,async(req:AuthedR
 app.post('/api/distribution/orders/:id/retry/:platformId',auth,artistOnly,async(req:AuthedRequest,res)=>{const d=(await pool.query(`select d.*,o.id order_id,p.name,a.user_id from distribution_deliveries d join distribution_platforms p on p.id=d.platform_id join distribution_orders o on o.id=d.order_id join artists a on a.id=o.artist_id where d.id=$1 and p.id=$2 and a.user_id=$3`,[req.params.id,req.params.platformId,req.user!.id])).rows[0];if(!d)return res.status(404).json({error:'Entrega não encontrada'});if(d.status!=='FAILED')return res.status(400).json({error:'A entrega não está em falha'});await pool.query(`update distribution_deliveries set status='READY',error_code=null,error_message=null,updated_at=now() where id=$1`,[d.id]);await distHistory(d.order_id,d.id,'FAILED','READY',`Reenvio solicitado para ${d.name}`,req.user!.id);res.json({ok:true,status:'READY'})});
 app.post('/api/distribution/catalog-migrations',auth,artistOnly,async(req:AuthedRequest,res)=>{const {releaseId,previousDistributor,oldIsrc,oldUpc,originalReleaseDate,platformLinks={},oldStatus}=req.body||{};if(!releaseId||!previousDistributor)return res.status(400).json({error:'releaseId e distribuidor anterior são obrigatórios'});const a=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];const r=(await pool.query('select id from releases where id=$1 and primary_artist_id=$2',[releaseId,a?.id])).rows[0];if(!r)return res.status(404).json({error:'Lançamento não encontrado'});const q=await pool.query(`insert into catalog_migrations(release_id,artist_id,previous_distributor,old_isrc,old_upc,original_release_date,platform_links,old_status) values($1,$2,$3,$4,$5,$6,$7,$8) returning *`,[releaseId,a.id,previousDistributor,oldIsrc||null,oldUpc||null,originalReleaseDate||null,JSON.stringify(platformLinks),oldStatus||null]);await audit(req.user!.id,'CATALOG_MIGRATION_CREATED','CATALOG_MIGRATION',q.rows[0].id,{preserveIdentity:true});res.status(201).json({migration:q.rows[0]})});
 app.get('/api/distribution/catalog-migrations',auth,artistOnly,async(req:AuthedRequest,res)=>{const a=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];res.json({migrations:(await pool.query(`select cm.*,r.title release_title from catalog_migrations cm join releases r on r.id=cm.release_id where cm.artist_id=$1 order by cm.created_at desc`,[a?.id])).rows})});
-app.get('/api/admin/distribution/orders',auth,adminOnly,async(_q,res)=>res.json({orders:(await pool.query(`select o.*,r.title release_title,a.stage_name from distribution_orders o join releases r on r.id=o.release_id join artists a on a.id=o.artist_id order by o.created_at desc`)).rows}));
-app.post('/api/admin/distribution/deliveries/:id/status',auth,adminOnly,async(req:AuthedRequest,res)=>{const {status,externalReleaseId,externalUrl,errorCode,errorMessage}=req.body||{};if(!DIST_STATUSES.includes(status))return res.status(400).json({error:'Estado inválido'});const d=(await pool.query(`select d.*,o.id order_id,p.name platform_name from distribution_deliveries d join distribution_orders o on o.id=d.order_id join distribution_platforms p on p.id=d.platform_id where d.id=$1`,[req.params.id])).rows[0];if(!d)return res.status(404).json({error:'Entrega não encontrada'});await pool.query(`update distribution_deliveries set status=$1,external_release_id=coalesce($2,external_release_id),external_url=coalesce($3,external_url),error_code=$4,error_message=$5,delivered_at=case when $1='DELIVERED' then now() else delivered_at end,published_at=case when $1='PUBLISHED' then now() else published_at end,updated_at=now() where id=$6`,[status,externalReleaseId||null,externalUrl||null,errorCode||null,errorMessage||null,d.id]);const c=(await pool.query(`select count(*)::int total,count(*) filter(where status='PUBLISHED')::int published,count(*) filter(where status='FAILED')::int failed from distribution_deliveries where order_id=$1`,[d.order_id])).rows[0];const os=Number(c.published)===Number(c.total)?'PUBLISHED':Number(c.failed)+Number(c.published)===Number(c.total)&&Number(c.failed)>0?'FAILED':'PROCESSING';await pool.query(`update distribution_orders set status=$1,error=$2,completed_at=case when $1 in ('PUBLISHED','FAILED') then now() else completed_at end,updated_at=now() where id=$3`,[os,errorMessage||null,d.order_id]);await distHistory(d.order_id,d.id,d.status,status,`Estado ${d.platform_name}: ${status}`,req.user!.id);await audit(req.user!.id,'DISTRIBUTION_DELIVERY_STATUS','DISTRIBUTION_DELIVERY',d.id,{status});res.json({ok:true,status,orderStatus:os})});
+app.get('/api/admin/distribution/orders',auth,requireAdminPermission('RELEASES'),async(_q,res)=>res.json({orders:(await pool.query(`select o.*,r.title release_title,a.stage_name from distribution_orders o join releases r on r.id=o.release_id join artists a on a.id=o.artist_id order by o.created_at desc`)).rows}));
+app.post('/api/admin/distribution/deliveries/:id/status',auth,requireAdminPermission('RELEASES'),async(req:AuthedRequest,res)=>{const {status,externalReleaseId,externalUrl,errorCode,errorMessage}=req.body||{};if(!DIST_STATUSES.includes(status))return res.status(400).json({error:'Estado inválido'});const d=(await pool.query(`select d.*,o.id order_id,p.name platform_name from distribution_deliveries d join distribution_orders o on o.id=d.order_id join distribution_platforms p on p.id=d.platform_id where d.id=$1`,[req.params.id])).rows[0];if(!d)return res.status(404).json({error:'Entrega não encontrada'});await pool.query(`update distribution_deliveries set status=$1,external_release_id=coalesce($2,external_release_id),external_url=coalesce($3,external_url),error_code=$4,error_message=$5,delivered_at=case when $1='DELIVERED' then now() else delivered_at end,published_at=case when $1='PUBLISHED' then now() else published_at end,updated_at=now() where id=$6`,[status,externalReleaseId||null,externalUrl||null,errorCode||null,errorMessage||null,d.id]);const c=(await pool.query(`select count(*)::int total,count(*) filter(where status='PUBLISHED')::int published,count(*) filter(where status='FAILED')::int failed from distribution_deliveries where order_id=$1`,[d.order_id])).rows[0];const os=Number(c.published)===Number(c.total)?'PUBLISHED':Number(c.failed)+Number(c.published)===Number(c.total)&&Number(c.failed)>0?'FAILED':'PROCESSING';await pool.query(`update distribution_orders set status=$1,error=$2,completed_at=case when $1 in ('PUBLISHED','FAILED') then now() else completed_at end,updated_at=now() where id=$3`,[os,errorMessage||null,d.order_id]);await distHistory(d.order_id,d.id,d.status,status,`Estado ${d.platform_name}: ${status}`,req.user!.id);await audit(req.user!.id,'DISTRIBUTION_DELIVERY_STATUS','DISTRIBUTION_DELIVERY',d.id,{status});res.json({ok:true,status,orderStatus:os})});
 
 
 
