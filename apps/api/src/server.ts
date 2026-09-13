@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -963,10 +963,86 @@ app.get('/api/admin/finance/summary', auth, requireAdminPermission('FINANCE'), a
     coalesce((select sum(amount) from payment_transactions where status='REFUNDED'),0) as refunds,
     coalesce((select sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount else 0 end) from financial_ledger),0) as artist_royalty_balance,
     coalesce((select sum(w.amount) from withdrawals w where w.status='PAID'),0) as artist_payments_paid,
-    coalesce((select sum(w.amount) from withdrawals w where w.status='PENDING'),0) as artist_payments_pending`);
+    coalesce((select sum(w.amount) from withdrawals w where w.status='PENDING'),0) as artist_payments_pending,
+    coalesce((select sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount end) from owner_finance_ledger where account_code='ADVERTISING'),0) as advertising_balance,
+    coalesce((select sum(amount) from owner_finance_transactions where transaction_type='AD_REVENUE' and status='PAID'),0) as advertising_revenue,
+    coalesce((select sum(amount) from owner_finance_transactions where transaction_type='ADMIN_SALARY' and status in ('APPROVED','SENT_TO_BANK','PAID')),0) as payroll_total,
+    coalesce((select sum(amount) from owner_finance_transactions where transaction_type='ARTIST_PAYOUT' and status in ('APPROVED','SENT_TO_BANK','PAID')),0) as owner_artist_payouts,
+    coalesce((select sum(amount) from owner_finance_transactions where status='PENDING_APPROVAL'),0) as owner_pending_approvals`);
   const row=q.rows[0];
-  const externalNet=Number(row.external_net||0),royalty=Number(row.artist_royalty_balance||0);
-  res.json({currency:'AOA',balances:{streamBalance:{validStreams:Number(row.valid_streams||0)},artistPayments:{paid:Number(row.artist_payments_paid||0),pending:Number(row.artist_payments_pending||0)},artistRoyalties:royalty,pendingPayments:Number(row.pending_payments||0),refunds:Number(row.refunds||0),babuloRevenue:externalNet,netAfterArtistPayments:externalNet-Number(row.artist_payments_paid||0)},updatedAt:new Date().toISOString()});
+  const externalNet=Number(row.external_net||0),royalty=Number(row.artist_royalty_balance||0),advertising=Number(row.advertising_balance||0);
+  res.json({currency:'AOA',balances:{
+    streamBalance:{validStreams:Number(row.valid_streams||0)},
+    artistPayments:{paid:Number(row.artist_payments_paid||0),pending:Number(row.artist_payments_pending||0)},
+    artistRoyalties:royalty,pendingPayments:Number(row.pending_payments||0),refunds:Number(row.refunds||0),babuloRevenue:externalNet,
+    advertisingRevenue:Number(row.advertising_revenue||0),advertisingBalance:advertising,payrollTotal:Number(row.payroll_total||0),ownerArtistPayouts:Number(row.owner_artist_payouts||0),ownerPendingApprovals:Number(row.owner_pending_approvals||0),
+    netAfterArtistPayments:externalNet-Number(row.artist_payments_paid||0)-Number(row.payroll_total||0)
+  },updatedAt:new Date().toISOString()});
+});
+
+// ===== V10.4.7 OWNER — CONTROLO FINANCEIRO CENTRAL =====
+app.get('/api/owner/finance/overview', auth, ownerOnly, async (_req,res)=>{
+  try{
+    const [artists,admins,pending,ledger]=await Promise.all([
+      pool.query(`select a.id,a.stage_name,a.country,a.city,u.id user_id,u.full_name,u.phone,
+        coalesce((select sum(case when fl.entry_type='CREDIT' then fl.amount when fl.entry_type='DEBIT' then -fl.amount end) from financial_ledger fl where fl.artist_id=a.id),0) balance,
+        coalesce((select sum(w.amount) from withdrawals w where w.artist_id=a.id and w.status in ('PAID','APPROVED')),0) paid_withdrawals,
+        coalesce((select count(*) from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where r.primary_artist_id=a.id and se.is_valid=true),0) valid_streams
+        from artists a left join users u on u.id=a.user_id order by balance desc,a.stage_name asc`),
+      pool.query(`select id,full_name,phone,role,status,admin_title,salary_amount,salary_currency from users where role='ADMIN' and status='ACTIVE' order by full_name nulls last,created_at desc`),
+      pool.query(`select count(*)::int count,coalesce(sum(amount),0) amount from owner_finance_transactions where status='PENDING_APPROVAL'`),
+      pool.query(`select account_code,coalesce(sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount end),0) balance from owner_finance_ledger group by account_code order by account_code`)
+    ]);
+    res.json({artists:artists.rows,admins:admins.rows,pending:pending.rows[0]||{count:0,amount:0},accounts:ledger.rows});
+  }catch(e){console.error(e);res.status(500).json({error:'Não foi possível carregar o centro financeiro do OWNER'});}
+});
+
+app.get('/api/owner/finance/transactions', auth, ownerOnly, async (_req,res)=>{
+  try{const q=await pool.query(`select t.*,coalesce(a.stage_name,u.full_name,u2.full_name,'—') recipient_name from owner_finance_transactions t left join artists a on a.id=t.recipient_artist_id left join users u on u.id=a.user_id left join users u2 on u2.id=t.recipient_user_id order by t.created_at desc limit 200`);res.json({transactions:q.rows});}
+  catch(e){console.error(e);res.status(500).json({error:'Não foi possível carregar o histórico financeiro'});}
+});
+
+app.post('/api/owner/finance/artist-payout', auth, ownerOnly, async (req:AuthedRequest,res)=>{
+  const {artistId,amount,paymentMethod='BANK',destination,description='Pagamento de saldo ao artista'}=req.body||{}; const value=Number(amount);
+  if(!artistId||!Number.isFinite(value)||value<=0) return res.status(400).json({error:'Informe artista e valor válidos'});
+  if(!destination) return res.status(400).json({error:'Informe o destino bancário ou método de pagamento'});
+  if(!['BANK','MULTICAIXA_EXPRESS'].includes(String(paymentMethod))) return res.status(400).json({error:'Método de pagamento inválido'});
+  const client=await pool.connect();
+  try{await client.query('begin');
+    const artist=(await client.query(`select a.id,a.stage_name,a.user_id,coalesce((select sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount end) from financial_ledger where artist_id=a.id),0) balance from artists a where a.id=$1 for update`,[artistId])).rows[0];
+    if(!artist){await client.query('rollback');return res.status(404).json({error:'Artista não encontrado'});} const bal=Number(artist.balance||0);
+    if(value>bal){await client.query('rollback');return res.status(400).json({error:`Saldo insuficiente do artista. Disponível: ${bal.toFixed(2)} Kz.`});}
+    const reference='BP-ART-'+crypto.randomBytes(6).toString('hex').toUpperCase();
+    const tx=(await client.query(`insert into owner_finance_transactions(transaction_type,status,amount,payment_method,recipient_user_id,recipient_artist_id,destination,reference,description,created_by) values('ARTIST_PAYOUT','PENDING_APPROVAL',$1,$2,$3,$4,$5,$6,$7,$8) returning *`,[value,paymentMethod,artist.user_id,artist.id,String(destination),reference,String(description),req.user!.id])).rows[0];
+    const after=bal-value; await client.query(`insert into financial_ledger(artist_id,entry_type,reference_type,reference_id,amount,currency,balance_after,description) values($1,'DEBIT','OWNER_PAYOUT',$2,$3,'AOA',$4,'Reserva para pagamento feito pelo OWNER')`,[artist.id,tx.id,value,after]);
+    await client.query('commit'); await audit(req.user!.id,'OWNER_ARTIST_PAYOUT_CREATED','OWNER_FINANCE',tx.id,{artistId,amount:value,reference}); res.status(201).json({transaction:tx,artistBalance:after});
+  }catch(e){await client.query('rollback');console.error(e);res.status(500).json({error:'Não foi possível criar o pagamento do artista'});}finally{client.release();}
+});
+
+app.post('/api/owner/finance/admin-salary', auth, ownerOnly, async (req:AuthedRequest,res)=>{
+  const {adminUserId,amount,paymentMethod='BANK',destination,description='Salário / remuneração do funcionário'}=req.body||{}; const value=Number(amount);
+  if(!adminUserId||!Number.isFinite(value)||value<=0) return res.status(400).json({error:'Informe funcionário e valor válidos'}); if(!destination) return res.status(400).json({error:'Informe o destino bancário ou método de pagamento'});
+  const admin=(await pool.query(`select id,full_name,role,status from users where id=$1 and role='ADMIN'`,[adminUserId])).rows[0]; if(!admin) return res.status(404).json({error:'Administrador/funcionário não encontrado'});
+  try{const reference='BP-SAL-'+crypto.randomBytes(6).toString('hex').toUpperCase(); const q=await pool.query(`insert into owner_finance_transactions(transaction_type,status,amount,payment_method,recipient_user_id,destination,reference,description,created_by) values('ADMIN_SALARY','PENDING_APPROVAL',$1,$2,$3,$4,$5,$6,$7) returning *`,[value,paymentMethod,admin.id,String(destination),reference,String(description),req.user!.id]); await audit(req.user!.id,'OWNER_ADMIN_SALARY_CREATED','OWNER_FINANCE',q.rows[0].id,{adminUserId,amount:value,reference}); res.status(201).json({transaction:q.rows[0]});}
+  catch(e){console.error(e);res.status(500).json({error:'Não foi possível criar o pagamento do funcionário'});}
+});
+
+app.post('/api/owner/finance/advertising-revenue', auth, ownerOnly, async (req:AuthedRequest,res)=>{
+  const {amount,description='Receita de publicidade',reference}=req.body||{}; const value=Number(amount); if(!Number.isFinite(value)||value<=0)return res.status(400).json({error:'Informe um valor válido'});
+  const client=await pool.connect(); try{await client.query('begin'); const ref=String(reference||('BP-ADS-'+crypto.randomBytes(6).toString('hex').toUpperCase())); const tx=(await client.query(`insert into owner_finance_transactions(transaction_type,status,amount,payment_method,reference,description,created_by,approved_by,approved_at,executed_at) values('AD_REVENUE','PAID',$1,'BANK',$2,$3,$4,$4,now(),now()) returning *`,[value,ref,String(description),req.user!.id])).rows[0]; await client.query(`insert into owner_finance_ledger(account_code,entry_type,amount,reference_type,reference_id,description,created_by) values('ADVERTISING','CREDIT',$1,'AD_REVENUE',$2,$3,$4)`,[value,tx.id,String(description),req.user!.id]); await client.query('commit'); await audit(req.user!.id,'OWNER_AD_REVENUE_RECORDED','OWNER_FINANCE',tx.id,{amount:value,reference:ref}); res.status(201).json({transaction:tx}); }catch(e){await client.query('rollback');console.error(e);res.status(500).json({error:'Não foi possível registar a receita de publicidade'});}finally{client.release();}
+});
+
+app.post('/api/owner/finance/:id/decision', auth, ownerOnly, async (req:AuthedRequest,res)=>{
+  const {decision,reason}=req.body||{}; if(!['APPROVED','REJECTED'].includes(decision))return res.status(400).json({error:'Decisão inválida'}); if(decision==='REJECTED'&&!String(reason||'').trim())return res.status(400).json({error:'Informe o motivo da rejeição'});
+  const client=await pool.connect(); try{await client.query('begin'); const tx=(await client.query(`update owner_finance_transactions set status=$1,approved_by=$2,approved_at=case when $1='APPROVED' then now() else null end,rejection_reason=$3,updated_at=now() where id=$4 and status='PENDING_APPROVAL' returning *`,[decision==='APPROVED'?'APPROVED':'REJECTED',req.user!.id,reason||null,req.params.id])).rows[0]; if(!tx){await client.query('rollback');return res.status(404).json({error:'Operação pendente não encontrada'});} if(decision==='REJECTED'&&tx.transaction_type==='ARTIST_PAYOUT'&&tx.recipient_artist_id){const bal=Number((await client.query(`select coalesce(sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount end),0) balance from financial_ledger where artist_id=$1`,[tx.recipient_artist_id])).rows[0].balance||0);await client.query(`insert into financial_ledger(artist_id,entry_type,reference_type,reference_id,amount,currency,balance_after,description) values($1,'CREDIT','OWNER_PAYOUT',$2,$3,'AOA',$4,'Devolução da reserva de pagamento rejeitada pelo OWNER')`,[tx.recipient_artist_id,tx.id,tx.amount,bal+Number(tx.amount)]);} await client.query('commit'); await audit(req.user!.id,decision==='APPROVED'?'OWNER_FINANCE_APPROVED':'OWNER_FINANCE_REJECTED','OWNER_FINANCE',tx.id,{reason:reason||null,type:tx.transaction_type}); res.json({ok:true,transaction:tx}); }catch(e){await client.query('rollback');console.error(e);res.status(500).json({error:'Não foi possível guardar a decisão financeira'});}finally{client.release();}
+});
+
+app.post('/api/owner/finance/:id/execute', auth, ownerOnly, async (req:AuthedRequest,res)=>{
+  const client=await pool.connect(); try{await client.query('begin'); const tx=(await client.query(`update owner_finance_transactions set status='SENT_TO_BANK',executed_at=now(),updated_at=now() where id=$1 and status='APPROVED' returning *`,[req.params.id])).rows[0]; if(!tx){await client.query('rollback');return res.status(404).json({error:'Operação aprovada não encontrada'});} if(tx.transaction_type==='AD_REVENUE'){await client.query('commit');return res.json({ok:true,transaction:tx});} if(tx.transaction_type==='ADMIN_SALARY'||tx.transaction_type==='ARTIST_PAYOUT'){await client.query(`insert into owner_finance_ledger(account_code,entry_type,amount,reference_type,reference_id,description,created_by) values('BANK','DEBIT',$1,'OWNER_FINANCE',$2,$3,$4)`,[tx.amount,tx.id,`Ordem bancária ${tx.reference}`,req.user!.id]);} await client.query('commit'); await audit(req.user!.id,'OWNER_FINANCE_SENT_TO_BANK','OWNER_FINANCE',tx.id,{reference:tx.reference}); res.json({ok:true,transaction:tx,message:'Ordem registada como enviada ao banco. A execução bancária real depende da integração com o banco/gateway.'}); }catch(e){await client.query('rollback');console.error(e);res.status(500).json({error:'Não foi possível registar o envio ao banco'});}finally{client.release();}
+});
+
+app.post('/api/owner/finance/:id/mark-paid', auth, ownerOnly, async (req:AuthedRequest,res)=>{
+  const q=await pool.query(`update owner_finance_transactions set status='PAID',updated_at=now() where id=$1 and status in ('APPROVED','SENT_TO_BANK') returning *`,[req.params.id]); if(!q.rows[0])return res.status(404).json({error:'Operação aprovada/enviada não encontrada'}); await audit(req.user!.id,'OWNER_FINANCE_MARKED_PAID','OWNER_FINANCE',req.params.id,{}); res.json({ok:true,transaction:q.rows[0]});
 });
 
 app.get('/api/admin/royalty-periods', auth, adminOnly, async (_req,res) => {
@@ -1054,6 +1130,54 @@ app.post('/api/distribution/catalog-migrations',auth,artistOnly,async(req:Authed
 app.get('/api/distribution/catalog-migrations',auth,artistOnly,async(req:AuthedRequest,res)=>{const a=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];res.json({migrations:(await pool.query(`select cm.*,r.title release_title from catalog_migrations cm join releases r on r.id=cm.release_id where cm.artist_id=$1 order by cm.created_at desc`,[a?.id])).rows})});
 app.get('/api/admin/distribution/orders',auth,adminOnly,async(_q,res)=>res.json({orders:(await pool.query(`select o.*,r.title release_title,a.stage_name from distribution_orders o join releases r on r.id=o.release_id join artists a on a.id=o.artist_id order by o.created_at desc`)).rows}));
 app.post('/api/admin/distribution/deliveries/:id/status',auth,adminOnly,async(req:AuthedRequest,res)=>{const {status,externalReleaseId,externalUrl,errorCode,errorMessage}=req.body||{};if(!DIST_STATUSES.includes(status))return res.status(400).json({error:'Estado inválido'});const d=(await pool.query(`select d.*,o.id order_id,p.name platform_name from distribution_deliveries d join distribution_orders o on o.id=d.order_id join distribution_platforms p on p.id=d.platform_id where d.id=$1`,[req.params.id])).rows[0];if(!d)return res.status(404).json({error:'Entrega não encontrada'});await pool.query(`update distribution_deliveries set status=$1,external_release_id=coalesce($2,external_release_id),external_url=coalesce($3,external_url),error_code=$4,error_message=$5,delivered_at=case when $1='DELIVERED' then now() else delivered_at end,published_at=case when $1='PUBLISHED' then now() else published_at end,updated_at=now() where id=$6`,[status,externalReleaseId||null,externalUrl||null,errorCode||null,errorMessage||null,d.id]);const c=(await pool.query(`select count(*)::int total,count(*) filter(where status='PUBLISHED')::int published,count(*) filter(where status='FAILED')::int failed from distribution_deliveries where order_id=$1`,[d.order_id])).rows[0];const os=Number(c.published)===Number(c.total)?'PUBLISHED':Number(c.failed)+Number(c.published)===Number(c.total)&&Number(c.failed)>0?'FAILED':'PROCESSING';await pool.query(`update distribution_orders set status=$1,error=$2,completed_at=case when $1 in ('PUBLISHED','FAILED') then now() else completed_at end,updated_at=now() where id=$3`,[os,errorMessage||null,d.order_id]);await distHistory(d.order_id,d.id,d.status,status,`Estado ${d.platform_name}: ${status}`,req.user!.id);await audit(req.user!.id,'DISTRIBUTION_DELIVERY_STATUS','DISTRIBUTION_DELIVERY',d.id,{status});res.json({ok:true,status,orderStatus:os})});
+
+
+
+
+// V10.4.7 — Owner Advertising / BaBuLo Ads
+app.get('/api/owner/ads/overview', auth, ownerOnly, async (_req,res)=>{
+  const [summary,campaigns,placements]=await Promise.all([
+    pool.query(`select count(*) filter(where status='ACTIVE')::int active_campaigns,count(*) filter(where status in ('PENDING_PAYMENT','PENDING_APPROVAL'))::int pending_campaigns,coalesce(sum(budget) filter(where payment_status='PAID'),0) paid_budget,coalesce(sum(spend),0) spend,coalesce(sum(impressions),0)::bigint impressions,coalesce(sum(clicks),0)::bigint clicks,coalesce(sum(video_views),0)::bigint video_views from ad_campaigns`),
+    pool.query(`select c.*,coalesce(cr.name,'Sem criativo') creative_name from ad_campaigns c left join lateral (select name from ad_creatives where campaign_id=c.id order by created_at desc limit 1) cr on true order by c.created_at desc limit 100`),
+    pool.query(`select * from ad_placements order by active desc,sort_order,name`)
+  ]);
+  res.json({summary:summary.rows[0],campaigns:campaigns.rows,placements:placements.rows});
+});
+app.get('/api/owner/ads/pricing', auth, ownerOnly, async (_req,res)=>res.json({pricing:(await pool.query('select * from ad_pricing order by active desc,sort_order,name')).rows}));
+app.post('/api/owner/ads/placements/:id/toggle', auth, ownerOnly, async(req:AuthedRequest,res)=>{const q=await pool.query(`update ad_placements set active=not active where id=$1 returning *`,[req.params.id]);if(!q.rows[0])return res.status(404).json({error:'Espaço publicitário não encontrado'});await audit(req.user!.id,'AD_PLACEMENT_TOGGLE','AD_PLACEMENT',req.params.id,{active:q.rows[0].active});res.json({placement:q.rows[0]})});
+app.post('/api/owner/ads/pricing', auth, ownerOnly, async (req:AuthedRequest,res)=>{
+  const {id,name,format,pricingModel,price,currency='AOA',unit='CAMPAIGN',active=true}=req.body||{};
+  if(!name||!format||!['FIXED','CPM','CPC','CPV'].includes(pricingModel)||Number(price)<=0)return res.status(400).json({error:'Preencha nome, formato, modelo e preço válido.'});
+  const q=id?await pool.query(`update ad_pricing set name=$1,format=$2,pricing_model=$3,price=$4,currency=$5,unit=$6,active=$7,updated_at=now() where id=$8 returning *`,[String(name).trim(),format,pricingModel,Number(price),currency,unit,Boolean(active),id]):await pool.query(`insert into ad_pricing(name,format,pricing_model,price,currency,unit,active) values($1,$2,$3,$4,$5,$6,$7) returning *`,[String(name).trim(),format,pricingModel,Number(price),currency,unit,Boolean(active)]);
+  await audit(req.user!.id,id?'AD_PRICING_UPDATED':'AD_PRICING_CREATED','AD_PRICING',q.rows[0].id,{name,format,pricingModel,price}); res.status(201).json({pricing:q.rows[0]});
+});
+app.post('/api/owner/ads/campaigns', auth, ownerOnly, async (req:AuthedRequest,res)=>{
+  const {id,name,advertiserName,contactEmail,format,pricingModel='FIXED',budget,currency='AOA',startAt,endAt,targetCountry='',targetCity='',targetAudience='FREE_USERS',destinationUrl='',creativeUrl='',creativeName='',headline='',bodyText='',cta='Saiba mais',paymentReference=''}=req.body||{};
+  if(!name||!advertiserName||!format||Number(budget)<=0||!startAt||!endAt)return res.status(400).json({error:'Nome, anunciante, formato, orçamento e período são obrigatórios.'});
+  if(new Date(endAt)<=new Date(startAt))return res.status(400).json({error:'A data final deve ser posterior à inicial.'});
+  const client=await pool.connect(); try{await client.query('begin');
+    let campaign;
+    if(id){campaign=(await client.query(`update ad_campaigns set name=$1,advertiser_name=$2,contact_email=$3,format=$4,pricing_model=$5,budget=$6,currency=$7,start_at=$8,end_at=$9,target_country=$10,target_city=$11,target_audience=$12,destination_url=$13,payment_reference=$14,updated_at=now() where id=$15 returning *`,[String(name).trim(),String(advertiserName).trim(),contactEmail||null,format,pricingModel,Number(budget),currency,startAt,endAt,targetCountry||null,targetCity||null,targetAudience,destinationUrl||null,paymentReference||null,id])).rows[0]; if(!campaign)throw Error('Campanha não encontrada');}
+    else campaign=(await client.query(`insert into ad_campaigns(name,advertiser_name,contact_email,format,pricing_model,budget,currency,start_at,end_at,target_country,target_city,target_audience,destination_url,payment_reference,created_by) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) returning *`,[String(name).trim(),String(advertiserName).trim(),contactEmail||null,format,pricingModel,Number(budget),currency,startAt,endAt,targetCountry||null,targetCity||null,targetAudience,destinationUrl||null,paymentReference||null,req.user!.id])).rows[0];
+    if(creativeUrl){await client.query(`insert into ad_creatives(campaign_id,name,format,asset_url,headline,body_text,cta,destination_url) values($1,$2,$3,$4,$5,$6,$7,$8)`,[campaign.id,creativeName||`${name} — criativo`,format,creativeUrl,headline||null,bodyText||null,cta||null,destinationUrl||null]);}
+    await client.query('commit'); await audit(req.user!.id,id?'AD_CAMPAIGN_UPDATED':'AD_CAMPAIGN_CREATED','AD_CAMPAIGN',campaign.id,{advertiserName,format,budget}); res.status(201).json({campaign});
+  }catch(e:any){await client.query('rollback');res.status(400).json({error:e.message||'Não foi possível guardar a campanha'});}finally{client.release()}
+});
+app.post('/api/owner/ads/campaigns/:id/payment', auth, ownerOnly, async(req:AuthedRequest,res)=>{const {status='PAID',reference=''}=req.body||{}; if(!['PENDING','PAID','REFUNDED'].includes(status))return res.status(400).json({error:'Estado de pagamento inválido'}); const q=await pool.query(`update ad_campaigns set payment_status=$1,payment_reference=coalesce(nullif($2,''),payment_reference),paid_at=case when $1='PAID' then coalesce(paid_at,now()) else paid_at end,updated_at=now() where id=$3 returning *`,[status,reference,req.params.id]); if(!q.rows[0])return res.status(404).json({error:'Campanha não encontrada'}); await audit(req.user!.id,'AD_CAMPAIGN_PAYMENT','AD_CAMPAIGN',req.params.id,{status,reference});res.json({campaign:q.rows[0]})});
+app.post('/api/owner/ads/campaigns/:id/status', auth, ownerOnly, async(req:AuthedRequest,res)=>{const {status,reason=''}=req.body||{}; if(!['DRAFT','PENDING_PAYMENT','PENDING_APPROVAL','ACTIVE','PAUSED','COMPLETED','REJECTED','CANCELLED'].includes(status))return res.status(400).json({error:'Estado inválido'}); const q=await pool.query(`update ad_campaigns set status=$1,rejection_reason=$2,updated_at=now() where id=$3 returning *`,[status,reason||null,req.params.id]);if(!q.rows[0])return res.status(404).json({error:'Campanha não encontrada'});await audit(req.user!.id,'AD_CAMPAIGN_STATUS','AD_CAMPAIGN',req.params.id,{status,reason});res.json({campaign:q.rows[0]})});
+app.post('/api/owner/ads/campaigns/:id/creative', auth, ownerOnly, async(req:AuthedRequest,res)=>{const {name,format,assetUrl,headline='',bodyText='',cta='Saiba mais',destinationUrl=''}=req.body||{};if(!name||!format||!assetUrl)return res.status(400).json({error:'Nome, formato e URL do criativo são obrigatórios'});const q=await pool.query(`insert into ad_creatives(campaign_id,name,format,asset_url,headline,body_text,cta,destination_url) values($1,$2,$3,$4,$5,$6,$7,$8) returning *`,[req.params.id,name,format,assetUrl,headline||null,bodyText||null,cta||null,destinationUrl||null]);res.status(201).json({creative:q.rows[0]})});
+app.get('/api/owner/ads/reports', auth, ownerOnly, async(req,res)=>{const from=req.query.from||new Date(Date.now()-29*86400000).toISOString().slice(0,10),to=req.query.to||new Date().toISOString().slice(0,10);const q=await pool.query(`select c.id,c.name,c.advertiser_name,c.format,c.status,c.budget,c.spend,c.impressions,c.clicks,c.video_views,case when c.impressions>0 then round(c.clicks::numeric*100/c.impressions,2) else 0 end ctr,coalesce(sum(e.value),0) event_value from ad_campaigns c left join ad_events e on e.campaign_id=c.id and e.created_at>=($1::date) and e.created_at<($2::date+interval '1 day') where c.created_at<($2::date+interval '1 day') group by c.id order by c.created_at desc`,[from,to]);res.json({from,to,reports:q.rows})});
+
+// API de entrega de anúncios — mesma API para Web, Android e iPhone.
+app.get('/api/ads/serve', async(req,res)=>{
+  const placement=String(req.query.placement||'HOME_BANNER'); const country=String(req.query.country||req.headers['cf-ipcountry']||req.headers['x-country']||'').toUpperCase(); const city=String(req.query.city||req.headers['cf-ipcity']||req.headers['x-city']||'');
+  const token=String(req.headers.authorization||'').startsWith('Bearer ')?String(req.headers.authorization).slice(7):''; let userId=null; let premium=false;
+  if(token){try{const d=decodeToken(token);if(d?.sid){const u=(await pool.query(`select id from users where id=$1 and status='ACTIVE'`,[d.sub])).rows[0];if(u){userId=u.id;premium=Boolean((await pool.query(`select 1 from subscriptions where user_id=$1 and status='ACTIVE' and ends_at>now() limit 1`,[u.id])).rows[0]);}}}catch{}}
+  if(premium)return res.json({ad:null,premium:true});
+  const q=await pool.query(`select c.id,c.name,c.advertiser_name,c.format,c.pricing_model,c.destination_url,c.target_country,c.target_city,c.target_audience,cr.id creative_id,cr.name creative_name,cr.asset_url,cr.headline,cr.body_text,cr.cta,cr.destination_url creative_destination from ad_campaigns c join lateral (select * from ad_creatives where campaign_id=c.id order by created_at desc limit 1) cr on true where c.status='ACTIVE' and c.payment_status='PAID' and now() between c.start_at and c.end_at and c.format=$1 and (c.target_country is null or c.target_country='' or upper(c.target_country)=$2) and (c.target_city is null or c.target_city='' or lower(c.target_city)=lower($3)) and (c.target_audience='ALL' or c.target_audience='FREE_USERS') order by random() limit 1`,[placement,country,city]);
+  if(!q.rows[0])return res.json({ad:null,premium:false}); const a=q.rows[0]; await pool.query(`update ad_campaigns set impressions=impressions+1,updated_at=now() where id=$1`,[a.id]); await pool.query(`insert into ad_events(campaign_id,creative_id,event_type,user_id,country,city,visitor_key) values($1,$2,'IMPRESSION',$3,$4,$5,$6)`,[a.id,a.creative_id,userId,country||null,city||null,hashToken(userId||`${req.headers['user-agent']||''}|${country}|${city}`)]); res.json({ad:{id:a.id,creativeId:a.creative_id,format:a.format,assetUrl:a.asset_url,headline:a.headline,bodyText:a.body_text,cta:a.cta,destinationUrl:a.creative_destination||a.destination_url,advertiserName:a.advertiser_name},premium:false});
+});
+app.post('/api/ads/event', async(req,res)=>{const {campaignId,creativeId,eventType,value=0,country='',city='',visitorKey=''}=req.body||{};if(!campaignId||!['CLICK','VIDEO_VIEW','INTERACTION'].includes(eventType))return res.status(400).json({error:'Evento publicitário inválido'});const key=String(visitorKey||`${req.headers['user-agent']||''}|${country}|${city}`).slice(0,500);const q=await pool.query(`select id,pricing_model from ad_campaigns where id=$1 and status='ACTIVE'`,[campaignId]);if(!q.rows[0])return res.status(404).json({error:'Campanha não encontrada'});const c=q.rows[0];await pool.query(`insert into ad_events(campaign_id,creative_id,event_type,value,country,city,visitor_key) values($1,$2,$3,$4,$5,$6,$7)`,[campaignId,creativeId||null,eventType,Number(value)||0,country||null,city||null,hashToken(key)]);const field=eventType==='CLICK'?'clicks':eventType==='VIDEO_VIEW'?'video_views':null;if(field)await pool.query(`update ad_campaigns set ${field}=${field}+1,updated_at=now() where id=$1`,[campaignId]);res.json({ok:true})});
 
 
 // Garantir que erros inesperados da API nunca chegam ao frontend como HTML.
