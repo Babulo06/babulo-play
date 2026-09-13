@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql', '024_rights_splits_payouts.sql', '025_rights_matching_scan.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -207,6 +207,7 @@ async function audit(actorUserId: string | undefined, action: string, entityType
 }
 
 const RIGHTS_ROLES=['RIGHTS_HOLDER','ARTIST','COMPOSER','LYRICIST','PRODUCER','PERFORMER','PUBLISHER','LABEL'];
+const RIGHTS_CATEGORIES=['MASTER','COMPOSITION','LYRICS','PRODUCTION','PERFORMANCE','OTHER'];
 const RIGHT_TYPES=['STREAMING','DOWNLOAD','DISTRIBUTION','VIDEO','ADS','SYNC'];
 const PAYMENT_METHODS=['WALLET','MULTICAIXA_EXPRESS','MULTICAIXA_REFERENCE','VISA','MASTERCARD'];
 const PAYMENT_STATUSES=['PENDING','PAID','FAILED','CANCELLED','REFUNDED'];
@@ -580,6 +581,190 @@ app.get('/api/admin/payments/pending', auth, requireAdminPermission('FINANCE'), 
   res.json({payments:q.rows});
 });
 
+
+
+// ===== Direitos V10.4.9: scan de áudio, matching e reserva de royalties =====
+function normalizeStorageKey(value:string){
+  const raw=String(value||'').split('?')[0].split('/').pop()||'';
+  if(!raw || raw.includes('..') || raw.includes('/') || raw.includes('\\')) return '';
+  return raw;
+}
+async function runRightsScan(opts:{storageKey:string,trackId?:string|null,userId:string}){
+  const key=normalizeStorageKey(opts.storageKey);
+  if(!key) throw new Error('Ficheiro de áudio inválido.');
+  const fp=path.join(uploadDir,key);
+  if(!fs.existsSync(fp)) throw new Error('Ficheiro de áudio não encontrado no armazenamento.');
+  const sha256=crypto.createHash('sha256').update(fs.readFileSync(fp)).digest('hex');
+  const providerUrl=String(process.env.RIGHTS_MATCH_PROVIDER_URL||'').trim();
+  let provider='INTERNAL', result:any={status:'NO_MATCH',confidence:0,matches:[],reference:null};
+
+  // Sem provedor externo, o motor interno só consegue reconhecer correspondências
+  // já conhecidas pelo próprio BaBuLo. Isto não é uma prova de ausência de copyright.
+  const known=(await pool.query(`select rm.holder_name,rm.holder_email,rm.country,rm.right_category,rm.isrc,rm.iswc,rm.ipi,rm.catalog_code,rm.match_type,rm.confidence,rm.confirmed,rm.royalty_percentage,rm.source,rm.source_reference from rights_scans rs join rights_matches rm on rm.scan_id=rs.id where rs.audio_sha256=$1 order by rm.created_at desc`,[sha256])).rows;
+  if(known.length){
+    result={status:known.some((x:any)=>x.confirmed)?'CONFIRMED_MATCH':'POSSIBLE_MATCH',confidence:Math.max(...known.map((x:any)=>Number(x.confidence||0))),matches:known,reference:'INTERNAL-SHA256'};
+  }
+
+  if(providerUrl){
+    provider='EXTERNAL';
+    try{
+      const r=await fetch(providerUrl,{method:'POST',headers:{'Content-Type':'application/json','Authorization':process.env.RIGHTS_MATCH_PROVIDER_TOKEN?`Bearer ${process.env.RIGHTS_MATCH_PROVIDER_TOKEN}`:''},body:JSON.stringify({audioSha256:sha256,trackId:opts.trackId||null})});
+      if(r.ok){ const d=await r.json(); result={status:d.status||'POSSIBLE_MATCH',confidence:Number(d.confidence||0),matches:Array.isArray(d.matches)?d.matches:[],reference:d.reference||null}; }
+      else console.warn('RIGHTS_MATCH_PROVIDER devolveu',r.status);
+    }catch(e){ console.warn('Falha no provedor externo de direitos:',e); }
+  }
+
+  const scan=(await pool.query(`insert into rights_scans(track_id,storage_key,audio_sha256,provider,status,result_status,confidence,provider_reference,created_by) values($1,$2,$3,$4,'COMPLETED',$5,$6,$7,$8) returning *`,[opts.trackId||null,key,sha256,provider,result.status,Number(result.confidence||0),result.reference||null,opts.userId])).rows[0];
+  for(const m of (result.matches||[])){
+    await pool.query(`insert into rights_matches(scan_id,holder_name,holder_email,country,right_category,isrc,iswc,ipi,catalog_code,match_type,confidence,confirmed,royalty_percentage,source,source_reference) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,[scan.id,m.holderName||m.holder_name||null,m.holderEmail||m.holder_email||null,m.country||null,m.rightCategory||m.right_category||null,m.isrc||null,m.iswc||null,m.ipi||null,m.catalogCode||m.catalog_code||null,m.matchType||m.match_type||'POSSIBLE',Number(m.confidence||0),Boolean(m.confirmed),m.royaltyPercentage==null?null:Number(m.royaltyPercentage),m.source||provider,m.sourceReference||result.reference||null]);
+  }
+  return {scanId:scan.id,sha256,provider,status:result.status,confidence:Number(result.confidence||0),matches:result.matches||[],reference:result.reference||null,disclaimer:'Uma correspondência automática identifica uma possível relação; não determina sozinha a titularidade jurídica nem a percentagem de royalties.'};
+}
+
+app.post('/api/rights/scan-upload', auth, artistOnly, async (req:AuthedRequest,res) => {
+  try{
+    const key=normalizeStorageKey(req.body?.storageKey);
+    if(!key) return res.status(400).json({error:'storageKey é obrigatório.'});
+    const trackId=req.body?.trackId?String(req.body.trackId):null;
+    if(trackId){
+      const own=(await pool.query(`select t.id from tracks t join releases r on r.id=t.primary_release_id join artists a on a.id=r.primary_artist_id where t.id=$1 and a.user_id=$2`,[trackId,req.user!.id])).rows[0];
+      if(!own) return res.status(404).json({error:'Faixa não encontrada.'});
+    }
+    const result=await runRightsScan({storageKey:key,trackId,userId:req.user!.id});
+    res.json(result);
+  }catch(e:any){console.error('rights scan error',e);res.status(400).json({error:e.message||'Não foi possível verificar os direitos.'});}
+});
+
+app.get('/api/tracks/:trackId/rights-scan', auth, artistOnly, async (req:AuthedRequest,res) => {
+  const own=(await pool.query(`select t.id from tracks t join releases r on r.id=t.primary_release_id join artists a on a.id=r.primary_artist_id where t.id=$1 and a.user_id=$2`,[req.params.trackId,req.user!.id])).rows[0];
+  if(!own) return res.status(404).json({error:'Faixa não encontrada.'});
+  const scan=(await pool.query(`select rs.*,coalesce(json_agg(json_build_object('holderName',rm.holder_name,'holderEmail',rm.holder_email,'country',rm.country,'rightCategory',rm.right_category,'isrc',rm.isrc,'iswc',rm.iswc,'ipi',rm.ipi,'catalogCode',rm.catalog_code,'matchType',rm.match_type,'confidence',rm.confidence,'confirmed',rm.confirmed,'royaltyPercentage',rm.royalty_percentage,'source',rm.source,'sourceReference',rm.source_reference) order by rm.created_at) filter(where rm.id is not null),'[]'::json) matches from rights_scans rs left join rights_matches rm on rm.scan_id=rs.id where rs.track_id=$1 group by rs.id order by rs.scanned_at desc limit 1`,[req.params.trackId])).rows[0];
+  res.json({scan:scan||null});
+});
+
+app.post('/api/rights/matches/:matchId/confirm', auth, artistOnly, async (req:AuthedRequest,res) => {
+  const match=(await pool.query(`select rm.*,rs.track_id,t.primary_release_id from rights_matches rm join rights_scans rs on rs.id=rm.scan_id join tracks t on t.id=rs.track_id join releases r on r.id=t.primary_release_id join artists a on a.id=r.primary_artist_id where rm.id=$1 and a.user_id=$2`,[req.params.matchId,req.user!.id])).rows[0];
+  if(!match) return res.status(404).json({error:'Correspondência não encontrada.'});
+  const pct=Number(req.body?.royaltyPercentage ?? match.royalty_percentage);
+  if(!Number.isFinite(pct)||pct<=0||pct>100) return res.status(400).json({error:'Indica uma percentagem válida entre 0,01% e 100%. A confirmação deve ter base documental.'});
+  const client=await pool.connect();
+  try{await client.query('begin');
+    await client.query(`update rights_matches set confirmed=true,royalty_percentage=$1 where id=$2`,[pct,match.id]);
+    let holderId=match.rights_holder_id||null;
+    if(!holderId){ holderId=(await client.query(`insert into rights_holders(user_id,display_name,email) values(null,$1,$2) returning id`,[match.holder_name||'Titular identificado',match.holder_email||null])).rows[0].id; }
+    const code=`BRR-${new Date().getUTCFullYear()}-${randomToken(5).toUpperCase()}`;
+    const reservation=(await client.query(`insert into royalty_reservations(track_id,rights_match_id,holder_id,holder_name,holder_email,right_category,percentage,payout_code,monthly_period) values($1,$2,$3,$4,$5,$6,$7,$8,to_char(current_date,'YYYY-MM')) returning *`,[match.track_id,match.id,holderId,match.holder_name||'Titular identificado',match.holder_email||null,match.right_category||'OTHER',pct,code])).rows[0];
+    await client.query('commit');
+    await audit(req.user!.id,'RIGHTS_MATCH_CONFIRMED','TRACK',match.track_id,{matchId:match.id,percentage:pct,payoutCode:code});
+    res.json({ok:true,reservation,warning:'A reserva só deve ser paga após validação documental/contratual e regras de pagamento aplicáveis.'});
+  }catch(e:any){await client.query('rollback');console.error(e);res.status(500).json({error:'Não foi possível criar a reserva de royalties.'});}finally{client.release();}
+});
+
+// ===== Direitos V10.4.8: splits, convites e perfis de recebimento =====
+app.get('/api/releases/:id/rights-v2', auth, artistOnly, async (req:AuthedRequest,res) => {
+  const release=(await pool.query(`select r.id from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`,[req.params.id,req.user!.id])).rows[0];
+  if(!release) return res.status(404).json({error:'Lançamento não encontrado'});
+  const q=await pool.query(`select tr.*,json_agg(json_build_object('id',rs.id,'name',rs.participant_name,'email',rs.participant_email,'role',rs.participant_role,'percentage',rs.percentage,'status',rs.status,'acceptedAt',rs.accepted_at) order by rs.created_at) filter (where rs.id is not null) splits from track_rights tr left join rights_splits rs on rs.track_right_id=tr.id join tracks t on t.id=tr.track_id where t.primary_release_id=$1 group by tr.id order by t.track_number,tr.right_category`,[release.id]);
+  res.json({rights:q.rows});
+});
+
+app.post('/api/releases/:id/tracks/:trackId/rights-v2', auth, artistOnly, async (req:AuthedRequest,res) => {
+  const {mode='SOLE',legitimacyConfirmed=false,categories=[]}=req.body||{};
+  const release=(await pool.query(`select r.id,a.id artist_id from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`,[req.params.id,req.user!.id])).rows[0];
+  const track=(await pool.query(`select id from tracks where id=$1 and primary_release_id=$2`,[req.params.trackId,release?.id])).rows[0];
+  if(!release||!track) return res.status(404).json({error:'Faixa ou lançamento não encontrado'});
+  if(!['SOLE','SHARED'].includes(String(mode))) return res.status(400).json({error:'Modo de direitos inválido'});
+  if(!legitimacyConfirmed) return res.status(400).json({error:'Confirma que tens legitimidade para declarar estes direitos.'});
+  if(!Array.isArray(categories)||!categories.length) return res.status(400).json({error:'Selecione pelo menos um tipo de direito.'});
+  const uniqueCats=[...new Set(categories.map((c:any)=>String(c.category||'').toUpperCase()))];
+  if(uniqueCats.some(c=>!RIGHTS_CATEGORIES.includes(c))) return res.status(400).json({error:'Tipo de direito inválido.'});
+  const client=await pool.connect();
+  try{ await client.query('begin');
+    await client.query(`delete from track_rights where track_id=$1`,[track.id]);
+    await client.query(`delete from rights_declarations where track_id=$1`,[track.id]);
+    for(const category of uniqueCats){
+      const input=categories.find((c:any)=>String(c.category||'').toUpperCase()===category);
+      const splits=Array.isArray(input?.splits)?input.splits:[];
+      if(!splits.length) throw new Error(`O tipo ${category} precisa de pelo menos um titular.`);
+      let total=0;
+      for(const sp of splits){
+        const pct=Number(sp.percentage); if(!Number.isFinite(pct)||pct<0||pct>100) throw new Error('Cada split deve estar entre 0 e 100%.');
+        if(!String(sp.name||'').trim()) throw new Error('O nome de cada participante é obrigatório.');
+        if(String(mode)==='SHARED'&&!String(sp.email||'').trim()) throw new Error('No modo compartilhado, o email de cada participante é obrigatório para confirmação.');
+        total+=pct;
+      }
+      if(Math.round(total*100)/100!==100) throw new Error(`Os direitos de ${category} devem totalizar 100%. Atualmente: ${total}%.`);
+      const tr=(await client.query(`insert into track_rights(track_id,right_category,ownership_mode,legitimacy_confirmed,status,created_by) values($1,$2,$3,true,$4,$5) returning *`,[track.id,category,mode,mode==='SOLE'?'LOCKED':'PENDING_ACCEPTANCE',req.user!.id])).rows[0];
+      const agreementText=`BaBuLo Play — Declaração de direitos V10.4.8\nFaixa: ${track.id}\nCategoria: ${category}\nModo: ${mode}\nDeclarante: ${req.user!.id}\nOs participantes e percentagens abaixo representam a declaração de direitos fornecida pelo titular/declarante. A utilização e remuneração ficam sujeitas aos direitos e autorizações legalmente aplicáveis. Versão: 1.`;
+      const contentHash=crypto.createHash('sha256').update(agreementText).digest('hex');
+      await client.query(`insert into rights_agreements(track_right_id,version,agreement_text,content_hash,created_by) values($1,1,$2,$3,$4)`,[tr.id,agreementText,contentHash,req.user!.id]);
+      for(const sp of splits){
+        const email=String(sp.email||'').trim().toLowerCase()||null;
+        const matched=email?(await client.query(`select id from users where lower(email)=lower($1) limit 1`,[email])).rows[0]:null;
+        const isSelf=matched?.id===req.user!.id;
+        const status=mode==='SOLE'||isSelf?'LOCKED':matched?'INVITED':'PENDING';
+        const rs=(await client.query(`insert into rights_splits(track_right_id,participant_user_id,participant_name,participant_email,participant_role,percentage,status,accepted_at,accepted_ip,accepted_user_agent,agreement_version,created_by) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,1,$11) returning *`,[tr.id,matched?.id||null,String(sp.name).trim(),email,String(sp.role||'RIGHTS_HOLDER'),Number(sp.percentage),status,isSelf?new Date():null,isSelf?String(req.ip||''):null,isSelf?String(req.headers['user-agent']||''):null,req.user!.id])).rows[0];
+        await client.query(`insert into rights_declarations(release_id,track_id,party_name,party_role,right_type,percentage,territory,status,created_by) values($1,$2,$3,$4,$5,$6,'WORLDWIDE',$7,$8)`,[release.id,track.id,String(sp.name).trim(),String(sp.role||'RIGHTS_HOLDER'),category,Number(sp.percentage),status==='LOCKED'?'PENDING':'PENDING',req.user!.id]);
+        if(mode==='SHARED'&&!isSelf&&email){
+          const raw=randomToken();
+          await client.query(`insert into rights_invitations(rights_split_id,invite_email,token_hash,status,sent_at,expires_at,created_by) values($1,$2,$3,'PENDING',now(),now()+interval '30 days',$4)`,[rs.id,email,hashToken(raw),req.user!.id]);
+          // O convite é enviado quando o provedor de email está configurado; o link também fica disponível na resposta para ambientes sem email.
+          try{await sendEmail(email,'Convite de participação — BaBuLo Play',`Foste indicado como ${String(sp.role||'titular')} na faixa ${track.id}, com ${Number(sp.percentage)}%. Confirma ou recusa a participação na tua conta BaBuLo Play. Link: ${publicWebUrl('/',raw).replace('?token=','?rightsInvite=')}`);}catch{}
+        }
+      }
+    }
+    await client.query('commit');
+    await audit(req.user!.id,'RIGHTS_SPLITS_SAVED','RIGHTS',track.id,{releaseId:release.id,mode,categories:uniqueCats});
+    res.status(201).json({ok:true,message:'Declaração de direitos guardada.',mode,categories:uniqueCats});
+  }catch(e:any){await client.query('rollback');res.status(400).json({error:e?.message||'Não foi possível guardar os direitos.'});}finally{client.release();}
+});
+
+app.get('/api/rights/invitations', auth, async (req:AuthedRequest,res) => {
+  const email=(await pool.query(`select email from users where id=$1`,[req.user!.id])).rows[0]?.email;
+  if(!email)return res.json({invitations:[]});
+  const q=await pool.query(`select ri.id,ri.status,ri.expires_at,rs.id split_id,rs.participant_name,rs.participant_role,rs.percentage,tr.right_category,t.id track_id,t.title track_title,r.id release_id,r.title release_title from rights_invitations ri join rights_splits rs on rs.id=ri.rights_split_id join track_rights tr on tr.id=rs.track_right_id join tracks t on t.id=tr.track_id join releases r on r.id=t.primary_release_id where lower(ri.invite_email)=lower($1) and ri.status='PENDING' and (ri.expires_at is null or ri.expires_at>now()) order by ri.created_at desc`,[email]);
+  res.json({invitations:q.rows});
+});
+
+app.post('/api/rights/invitations/:id/respond', auth, async (req:AuthedRequest,res) => {
+  const {decision}=req.body||{}; if(!['ACCEPTED','REJECTED'].includes(String(decision)))return res.status(400).json({error:'Resposta inválida.'});
+  const u=(await pool.query(`select email from users where id=$1`,[req.user!.id])).rows[0];
+  const q=await pool.query(`select ri.*,rs.id split_id,rs.participant_user_id,rs.track_right_id from rights_invitations ri join rights_splits rs on rs.id=ri.rights_split_id where ri.id=$1 and lower(ri.invite_email)=lower($2) and ri.status='PENDING' and (ri.expires_at is null or ri.expires_at>now())`,[req.params.id,u?.email||'']);
+  if(!q.rows[0])return res.status(404).json({error:'Convite não encontrado ou expirado.'});
+  const inv=q.rows[0]; const client=await pool.connect(); try{await client.query('begin');
+    await client.query(`update rights_invitations set status=$1,accepted_at=case when $1='ACCEPTED' then now() else null end where id=$2`,[decision,inv.id]);
+    await client.query(`update rights_splits set participant_user_id=$1,status=$2,accepted_at=case when $2='ACCEPTED' then now() else null end,accepted_ip=$3,accepted_user_agent=$4,updated_at=now() where id=$5`,[req.user!.id,decision,String(req.ip||''),String(req.headers['user-agent']||''),inv.split_id]);
+    await client.query(`update track_rights set status=case when $1='ACCEPTED' and not exists(select 1 from rights_splits where track_right_id=$2 and status not in ('ACCEPTED','LOCKED')) then 'ACCEPTED' when $1='REJECTED' then 'REJECTED' else 'PENDING_ACCEPTANCE' end,updated_at=now() where id=$2`,[decision,inv.track_right_id]);
+    await client.query('commit'); await audit(req.user!.id,decision==='ACCEPTED'?'RIGHT_INVITE_ACCEPTED':'RIGHT_INVITE_REJECTED','RIGHTS',inv.split_id,{invitationId:inv.id}); res.json({ok:true,status:decision});
+  }catch(e){await client.query('rollback');res.status(500).json({error:'Não foi possível registar a resposta.'});}finally{client.release();}
+});
+
+app.post('/api/rights/splits/:id/change-request', auth, async (req:AuthedRequest,res) => {
+  const {newPercentage,reason}=req.body||{}; const pct=Number(newPercentage); if(!Number.isFinite(pct)||pct<0||pct>100)return res.status(400).json({error:'Percentagem inválida.'});
+  const q=await pool.query(`select rs.*,tr.created_by as owner_id from rights_splits rs join track_rights tr on tr.id=rs.track_right_id where rs.id=$1 and (rs.participant_user_id=$2 or tr.created_by=$2)`,[req.params.id,req.user!.id]);
+  if(!q.rows[0])return res.status(404).json({error:'Split não encontrado.'}); const row=q.rows[0];
+  if(row.status!=='ACCEPTED'&&row.status!=='LOCKED')return res.status(409).json({error:'Este split ainda não está confirmado.'});
+  await pool.query(`insert into rights_change_requests(rights_split_id,old_percentage,new_percentage,reason,requested_by,request_ip) values($1,$2,$3,$4,$5,$6)`,[row.id,Number(row.percentage),pct,String(reason||'').slice(0,1000),req.user!.id,String(req.ip||'')]);
+  await pool.query(`update rights_splits set status='CHANGE_PENDING',updated_at=now() where id=$1`,[row.id]);
+  await audit(req.user!.id,'RIGHT_CHANGE_REQUESTED','RIGHTS',row.id,{oldPercentage:Number(row.percentage),newPercentage:pct}); res.json({ok:true,status:'CHANGE_PENDING'});
+});
+
+app.get('/api/artists/me/payout-account', auth, artistOnly, async (req:AuthedRequest,res) => {
+  const q=await pool.query(`select id,payout_method,bank_name,account_holder,currency,verified,updated_at,case when iban_enc is not null then true else false end has_iban,case when account_number_enc is not null then true else false end has_account_number,case when multicaixa_phone_enc is not null then true else false end has_multicaixa from royalty_payout_accounts where user_id=$1`,[req.user!.id]);
+  res.json({account:q.rows[0]||null});
+});
+app.put('/api/artists/me/payout-account', auth, artistOnly, async (req:AuthedRequest,res) => {
+  const {payoutMethod,bankName,iban,accountNumber,accountHolder,multicaixaPhone}=req.body||{};
+  if(!['BANK','MULTICAIXA_EXPRESS'].includes(String(payoutMethod)))return res.status(400).json({error:'Método de pagamento inválido.'});
+  if(!String(accountHolder||'').trim())return res.status(400).json({error:'O titular da conta é obrigatório.'});
+  if(payoutMethod==='BANK'&&!String(bankName||'').trim())return res.status(400).json({error:'Informe o banco.'});
+  if(payoutMethod==='BANK'&&!String(iban||accountNumber||'').trim())return res.status(400).json({error:'Informe IBAN ou número da conta.'});
+  if(payoutMethod==='MULTICAIXA_EXPRESS'&&!String(multicaixaPhone||'').trim())return res.status(400).json({error:'Informe o número do Multicaixa Express.'});
+  const encIban=iban?encryptSecret(String(iban).trim()):null,encAcc=accountNumber?encryptSecret(String(accountNumber).trim()):null,encMx=multicaixaPhone?encryptSecret(String(multicaixaPhone).trim()):null;
+  const q=await pool.query(`insert into royalty_payout_accounts(user_id,payout_method,multicaixa_phone_enc,bank_name,iban_enc,account_number_enc,account_holder,verified) values($1,$2,$3,$4,$5,$6,$7,false) on conflict(user_id) do update set payout_method=excluded.payout_method,multicaixa_phone_enc=coalesce(excluded.multicaixa_phone_enc,royalty_payout_accounts.multicaixa_phone_enc),bank_name=excluded.bank_name,iban_enc=coalesce(excluded.iban_enc,royalty_payout_accounts.iban_enc),account_number_enc=coalesce(excluded.account_number_enc,royalty_payout_accounts.account_number_enc),account_holder=excluded.account_holder,verified=false,updated_at=now() returning id,payout_method,bank_name,account_holder,currency,verified`,[req.user!.id, payoutMethod,encMx,bankName||null,encIban,encAcc,String(accountHolder).trim()]);
+  await audit(req.user!.id,'PAYOUT_ACCOUNT_UPDATED','PAYOUT_ACCOUNT',q.rows[0].id,{method:payoutMethod}); res.json({account:q.rows[0],message:'Perfil de recebimento guardado. A verificação financeira será feita antes de pagamentos.'});
+});
+
 // ===== Direitos e aprovação =====
 app.get('/api/releases/:id/rights', auth, async (req:AuthedRequest,res) => {
   const q=await pool.query(`select rd.*,u.email as created_by_email from rights_declarations rd left join users u on u.id=rd.created_by join releases r on r.id=rd.release_id join artists a on a.id=r.primary_artist_id where rd.release_id=$1 and (a.user_id=$2 or $3 in ('ADMIN','OWNER')) order by rd.created_at`,[req.params.id,req.user!.id,req.user!.role]);
@@ -625,10 +810,16 @@ app.post('/api/releases/:id/submit-approval', auth, artistOnly, async (req:Authe
   if(release.preflight_status!=='PASSED') return res.status(400).json({error:'O lançamento precisa passar no preflight técnico antes da aprovação.'});
   const paid=(await pool.query(`select id from payment_transactions where release_id=$1 and service_type='DISTRIBUTION' and status='PAID' order by paid_at desc limit 1`,[release.id])).rows[0];
   if(!paid) return res.status(402).json({error:'O pagamento deste lançamento ainda não foi confirmado. O lançamento permanece em rascunho até o pagamento ser confirmado.'});
-  const rights=(await pool.query(`select right_type,territory,coalesce(track_id,'00000000-0000-0000-0000-000000000000') track_key,sum(percentage) total from rights_declarations where release_id=$1 and status='PENDING' group by right_type,territory,track_id`,[release.id])).rows;
-  if(!rights.length) return res.status(400).json({error:'Declare pelo menos um titular de direitos antes de submeter.'});
-  const invalid=rights.find((r:any)=>Number(r.total)!==100);
-  if(invalid) return res.status(400).json({error:`Os direitos de ${invalid.right_type} (${invalid.territory}) devem totalizar 100%. Atualmente: ${Number(invalid.total)}%.`});
+  const v2=(await pool.query(`select tr.id,tr.right_category,tr.status,sum(rs.percentage) total,count(*) split_count from track_rights tr join tracks t on t.id=tr.track_id left join rights_splits rs on rs.track_right_id=tr.id where t.primary_release_id=$1 group by tr.id,tr.right_category,tr.status`,[release.id])).rows;
+  if(v2.length){
+    const invalid=v2.find((r:any)=>Number(r.total)!==100||!['ACCEPTED','LOCKED'].includes(String(r.status)));
+    if(invalid) return res.status(400).json({error:`Os direitos de ${invalid.right_category} precisam totalizar 100% e estar confirmados. Total: ${Number(invalid.total)}%, estado: ${invalid.status}.`});
+  }else{
+    const rights=(await pool.query(`select right_type,territory,coalesce(track_id,'00000000-0000-0000-0000-000000000000') track_key,sum(percentage) total from rights_declarations where release_id=$1 and status='PENDING' group by right_type,territory,track_id`,[release.id])).rows;
+    if(!rights.length) return res.status(400).json({error:'Declare pelo menos um titular de direitos antes de submeter.'});
+    const invalid=rights.find((r:any)=>Number(r.total)!==100);
+    if(invalid) return res.status(400).json({error:`Os direitos de ${invalid.right_type} (${invalid.territory}) devem totalizar 100%. Atualmente: ${Number(invalid.total)}%.`});
+  }
   await pool.query(`update releases set status='PENDING_APPROVAL',review_reason=null where id=$1`,[release.id]);
   await audit(req.user!.id,'RELEASE_SUBMITTED','RELEASE',release.id,{status:'PENDING_APPROVAL'});
   res.json({ok:true,status:'PENDING_APPROVAL'});

@@ -37,7 +37,7 @@ async function ensureDatabaseSchema() {
             .replace(/^\s*\\i\s+.*$/gm, '')
             .trim();
         await pool.query(schema);
-        for (const file of ['004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql']) {
+        for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql', '024_rights_splits_payouts.sql', '025_rights_matching_scan.sql']) {
             const migrationPath = node_path_1.default.join(migrationsDir, file);
             if (!node_fs_1.default.existsSync(migrationPath))
                 throw new Error(`Migração não encontrada: ${migrationPath}`);
@@ -48,6 +48,51 @@ async function ensureDatabaseSchema() {
     catch (error) {
         console.error('Database schema initialization failed:', error);
         throw error;
+    }
+}
+async function bootstrapFirstOwner() {
+    const enabled = String(process.env.BOOTSTRAP_OWNER_ENABLED || '').toLowerCase() === 'true';
+    if (!enabled)
+        return;
+    const email = String(process.env.BOOTSTRAP_OWNER_EMAIL || '').trim().toLowerCase();
+    const password = String(process.env.BOOTSTRAP_OWNER_PASSWORD || '');
+    if (!email || !email.includes('@'))
+        throw new Error('BOOTSTRAP_OWNER_EMAIL inválido.');
+    if (password.length < 12)
+        throw new Error('BOOTSTRAP_OWNER_PASSWORD deve ter pelo menos 12 caracteres.');
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const marker = (await client.query("select key from system_settings where key='owner_bootstrap_completed' limit 1")).rows[0];
+        if (marker) {
+            await client.query('ROLLBACK');
+            console.log('Owner bootstrap já foi concluído anteriormente; nenhum novo OWNER será criado.');
+            return;
+        }
+        const existing = (await client.query("select id from users where role='OWNER' limit 1")).rows[0];
+        if (existing) {
+            await client.query("insert into system_settings(key,value) values('owner_bootstrap_completed','existing_owner') on conflict (key) do nothing");
+            await client.query('COMMIT');
+            console.log('Já existe um OWNER; bootstrap inicial não criou outra conta.');
+            return;
+        }
+        const duplicate = (await client.query('select id from users where lower(email)=lower($1) limit 1', [email])).rows[0];
+        if (duplicate)
+            throw new Error('BOOTSTRAP_OWNER_EMAIL já pertence a uma conta existente.');
+        const user = (await client.query(`insert into users(email,password_hash,role,status,email_verified) values($1,$2,'OWNER','ACTIVE',true) returning id,email,role,created_at`, [email, hashPassword(password)])).rows[0];
+        await client.query("insert into system_settings(key,value) values('owner_bootstrap_completed',$1)", [user.id]);
+        await client.query('COMMIT');
+        console.log('Primeiro OWNER criado com sucesso pelo bootstrap seguro do Render.');
+    }
+    catch (error) {
+        try {
+            await client.query('ROLLBACK');
+        }
+        catch { }
+        throw error;
+    }
+    finally {
+        client.release();
     }
 }
 app.use((0, cors_1.default)({ origin: process.env.WEB_ORIGIN || 'http://localhost:3000' }));
@@ -65,10 +110,54 @@ function verifyPassword(password, stored) {
     const derived = node_crypto_1.default.scryptSync(password, salt, 64).toString('hex');
     return node_crypto_1.default.timingSafeEqual(Buffer.from(derived, 'hex'), Buffer.from(key, 'hex'));
 }
+function randomToken(bytes = 32) { return node_crypto_1.default.randomBytes(bytes).toString('hex'); }
+function hashToken(value) { return node_crypto_1.default.createHash('sha256').update(value).digest('hex'); }
+function base32Encode(buf) { const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'; let bits = 0, val = 0, out = ''; for (const byte of buf) {
+    val = (val << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+        out += alphabet[(val >>> (bits - 5)) & 31];
+        bits -= 5;
+    }
+} if (bits > 0)
+    out += alphabet[(val << (5 - bits)) & 31]; return out; }
+function base32Decode(input) { const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'; let bits = 0, val = 0, out = []; for (const c of input.replace(/=+$/, '').toUpperCase()) {
+    const n = alphabet.indexOf(c);
+    if (n < 0)
+        continue;
+    val = (val << 5) | n;
+    bits += 5;
+    if (bits >= 8) {
+        out.push((val >>> (bits - 8)) & 255);
+        bits -= 8;
+    }
+} return Buffer.from(out); }
+function totp(secret, counter) { const key = base32Decode(secret); const msg = Buffer.alloc(8); msg.writeBigUInt64BE(BigInt(counter)); const h = node_crypto_1.default.createHmac('sha1', key).update(msg).digest(); const off = h[h.length - 1] & 15; const code = ((h[off] & 127) << 24) | ((h[off + 1] & 255) << 16) | ((h[off + 2] & 255) << 8) | (h[off + 3] & 255); return String(code % 1000000).padStart(6, '0'); }
+function verifyTotp(secret, code) { const now = Math.floor(Date.now() / 1000 / 30); return [-1, 0, 1].some(delta => node_crypto_1.default.timingSafeEqual(Buffer.from(totp(secret, now + delta)), Buffer.from(String(code).padStart(6, '0')))); }
+function encryptSecret(value) { const key = node_crypto_1.default.createHash('sha256').update(JWT_SECRET).digest(); const iv = node_crypto_1.default.randomBytes(12); const cipher = node_crypto_1.default.createCipheriv('aes-256-gcm', key, iv); const enc = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]); return [iv.toString('hex'), cipher.getAuthTag().toString('hex'), enc.toString('hex')].join('$'); }
+function decryptSecret(value) { const [ivHex, tagHex, dataHex] = String(value || '').split('$'); if (!ivHex || !tagHex || !dataHex)
+    throw new Error('Segredo 2FA inválido'); const key = node_crypto_1.default.createHash('sha256').update(JWT_SECRET).digest(); const decipher = node_crypto_1.default.createDecipheriv('aes-256-gcm', key, Buffer.from(ivHex, 'hex')); decipher.setAuthTag(Buffer.from(tagHex, 'hex')); return Buffer.concat([decipher.update(Buffer.from(dataHex, 'hex')), decipher.final()]).toString('utf8'); }
+function sessionIdleLimit(role) { return role === 'ADMIN' || role === 'OWNER' ? 20 * 60 * 1000 : role === 'ARTIST' ? 30 * 60 * 1000 : 60 * 60 * 1000; }
+async function sendEmail(to, subject, text) {
+    const key = String(process.env.RESEND_API_KEY || '');
+    const from = String(process.env.AUTH_FROM_EMAIL || '');
+    if (!key || !from) {
+        console.log(`[BaBuLo AUTH EMAIL DEV] Para: ${to} | ${subject} | ${text}`);
+        return false;
+    }
+    const r = await fetch('https://api.resend.com/emails', { method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ from, to, subject, text }) });
+    if (!r.ok) {
+        const body = await r.text();
+        console.error('Falha ao enviar email:', body);
+        return false;
+    }
+    return true;
+}
+function publicWebUrl(pathname, token) { return `${String(process.env.WEB_ORIGIN || 'http://localhost:3000').replace(/\/$/, '')}${pathname}?token=${encodeURIComponent(token)}`; }
 function b64(value) { return Buffer.from(value).toString('base64url'); }
-function tokenFor(user) {
+function tokenFor(user, sid) {
     const header = b64(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-    const payload = b64(JSON.stringify({ sub: user.id, role: user.role, exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7 }));
+    const payload = b64(JSON.stringify({ sub: user.id, role: user.role, sid, exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 }));
     const signature = node_crypto_1.default.createHmac('sha256', JWT_SECRET).update(`${header}.${payload}`).digest('base64url');
     return `${header}.${payload}.${signature}`;
 }
@@ -84,15 +173,36 @@ function decodeToken(token) {
         return null;
     return data;
 }
-function auth(req, res, next) {
+async function auth(req, res, next) {
     const value = req.headers.authorization;
     if (!value?.startsWith('Bearer '))
         return res.status(401).json({ error: 'Autenticação necessária' });
     const decoded = decodeToken(value.slice(7));
-    if (!decoded)
+    if (!decoded?.sid)
         return res.status(401).json({ error: 'Sessão inválida ou expirada' });
-    req.user = { id: decoded.sub, role: decoded.role };
-    next();
+    try {
+        const row = (await pool.query('select role,status from users where id=$1 limit 1', [decoded.sub])).rows[0];
+        if (!row || row.status !== 'ACTIVE')
+            return res.status(401).json({ error: 'Conta inativa ou não encontrada' });
+        const role = String(row.role || decoded.role);
+        const session = (await pool.query('select last_activity_at,revoked_at from auth_sessions where id=$1 and user_id=$2 limit 1', [decoded.sid, decoded.sub])).rows[0];
+        if (!session || session.revoked_at)
+            return res.status(401).json({ error: 'Sessão encerrada. Faça login novamente.' });
+        const idleLimit = sessionIdleLimit(role);
+        const last = session.last_activity_at ? new Date(session.last_activity_at).getTime() : 0;
+        if (last && Date.now() - last >= idleLimit) {
+            await pool.query('update auth_sessions set revoked_at=now() where id=$1', [decoded.sid]);
+            return res.status(401).json({ error: 'Sessão expirada por inatividade. Faça login novamente.' });
+        }
+        if (!last || Date.now() - last >= 60 * 1000)
+            await pool.query('update auth_sessions set last_activity_at=now() where id=$1 and revoked_at is null', [decoded.sid]);
+        req.user = { id: decoded.sub, role };
+        next();
+    }
+    catch (error) {
+        console.error('auth session check failed:', error);
+        return res.status(500).json({ error: 'Não foi possível validar a sessão' });
+    }
 }
 function artistOnly(req, res, next) {
     if (!['ARTIST', 'ADMIN', 'OWNER'].includes(req.user?.role || ''))
@@ -104,6 +214,50 @@ function adminOnly(req, res, next) {
         return res.status(403).json({ error: 'Acesso reservado à administração' });
     next();
 }
+function ownerOnly(req, res, next) {
+    if (req.user?.role !== 'OWNER')
+        return res.status(403).json({ error: 'Apenas o OWNER pode aprovar operações financeiras.' });
+    next();
+}
+const ADMIN_PERMISSIONS = ['USERS', 'ARTISTS', 'TEAM', 'RELEASES', 'FINANCE', 'WITHDRAWALS', 'MODERATION', 'ANALYTICS', 'ADS', 'SECURITY', 'SETTINGS'];
+function requireAnyAdminPermission(permissions) {
+    return async (req, res, next) => {
+        if (req.user?.role === 'OWNER')
+            return next();
+        if (req.user?.role !== 'ADMIN')
+            return res.status(403).json({ error: 'Acesso reservado à administração' });
+        try {
+            const row = (await pool.query('select admin_permissions from users where id=$1 and role=\'ADMIN\'', [req.user.id])).rows[0];
+            const current = Array.isArray(row?.admin_permissions) ? row.admin_permissions : ADMIN_PERMISSIONS;
+            if (!permissions.some(p => current.includes(p)))
+                return res.status(403).json({ error: 'Este ADMIN não tem a função necessária para esta operação.' });
+            next();
+        }
+        catch (e) {
+            console.error(e);
+            res.status(500).json({ error: 'Não foi possível validar as permissões do ADMIN' });
+        }
+    };
+}
+function requireAdminPermission(permission) {
+    return async (req, res, next) => {
+        if (req.user?.role === 'OWNER')
+            return next();
+        if (req.user?.role !== 'ADMIN')
+            return res.status(403).json({ error: 'Acesso reservado à administração' });
+        try {
+            const row = (await pool.query("select admin_permissions from users where id=$1 and role='ADMIN'", [req.user.id])).rows[0];
+            const permissions = Array.isArray(row?.admin_permissions) ? row.admin_permissions : ADMIN_PERMISSIONS;
+            if (!permissions.includes(permission))
+                return res.status(403).json({ error: `Este ADMIN não tem a função/permissão: ${permission}.` });
+            next();
+        }
+        catch (e) {
+            console.error(e);
+            res.status(500).json({ error: 'Não foi possível validar as permissões do ADMIN' });
+        }
+    };
+}
 async function audit(actorUserId, action, entityType, entityId, details = {}) {
     try {
         await pool.query(`insert into audit_logs(actor_user_id,action,entity_type,entity_id,details) values($1,$2,$3,$4,$5)`, [actorUserId || null, action, entityType, entityId || null, JSON.stringify(details)]);
@@ -113,8 +267,9 @@ async function audit(actorUserId, action, entityType, entityId, details = {}) {
     }
 }
 const RIGHTS_ROLES = ['RIGHTS_HOLDER', 'ARTIST', 'COMPOSER', 'LYRICIST', 'PRODUCER', 'PERFORMER', 'PUBLISHER', 'LABEL'];
+const RIGHTS_CATEGORIES = ['MASTER', 'COMPOSITION', 'LYRICS', 'PRODUCTION', 'PERFORMANCE', 'OTHER'];
 const RIGHT_TYPES = ['STREAMING', 'DOWNLOAD', 'DISTRIBUTION', 'VIDEO', 'ADS', 'SYNC'];
-const PAYMENT_METHODS = ['MULTICAIXA_EXPRESS', 'MULTICAIXA_REFERENCE', 'VISA', 'MASTERCARD'];
+const PAYMENT_METHODS = ['WALLET', 'MULTICAIXA_EXPRESS', 'MULTICAIXA_REFERENCE', 'VISA', 'MASTERCARD'];
 const PAYMENT_STATUSES = ['PENDING', 'PAID', 'FAILED', 'CANCELLED', 'REFUNDED'];
 function makePaymentReference() { return `BBP-${Date.now()}-${node_crypto_1.default.randomBytes(3).toString('hex').toUpperCase()}`; }
 app.get('/api/health', async (_req, res) => { try {
@@ -126,15 +281,16 @@ catch {
 } });
 app.post('/api/auth/register', async (req, res) => {
     const { email, phone, password, role = 'LISTENER', stageName } = req.body || {};
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    if (!normalizedEmail || !normalizedEmail.includes('@'))
+        return res.status(400).json({ error: 'Informe um email válido' });
     if (!password || String(password).length < 8)
         return res.status(400).json({ error: 'A palavra-passe deve ter pelo menos 8 caracteres' });
-    if (!email && !phone)
-        return res.status(400).json({ error: 'Informe email ou telefone' });
     const safeRole = ['LISTENER', 'ARTIST'].includes(role) ? role : 'LISTENER';
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const u = await client.query(`insert into users(email,phone,password_hash,role) values($1,$2,$3,$4) returning id,email,phone,role,created_at`, [email || null, phone || null, hashPassword(password), safeRole]);
+        const u = await client.query(`insert into users(email,phone,password_hash,role,email_verified) values($1,$2,$3,$4,false) returning id,email,phone,role,created_at`, [normalizedEmail, phone || null, hashPassword(password), safeRole]);
         let artist = null;
         if (safeRole === 'ARTIST') {
             if (!stageName) {
@@ -143,8 +299,12 @@ app.post('/api/auth/register', async (req, res) => {
             }
             artist = (await client.query(`insert into artists(user_id,stage_name) values($1,$2) returning id,stage_name`, [u.rows[0].id, stageName])).rows[0];
         }
+        const raw = randomToken();
+        await client.query(`insert into auth_email_tokens(id,user_id,token_hash,type,expires_at) values($1,$2,$3,'VERIFY_EMAIL',now()+interval '24 hours')`, [node_crypto_1.default.randomUUID(), u.rows[0].id, hashToken(raw)]);
         await client.query('COMMIT');
-        res.status(201).json({ user: u.rows[0], artist, token: tokenFor(u.rows[0]) });
+        const link = publicWebUrl('/', raw).replace('?token=', '?verify=');
+        await sendEmail(normalizedEmail, 'Verifica o teu email — BaBuLo Play', `Bem-vindo à BaBuLo Play. Confirma o teu email neste link (válido por 24 horas): ${link}`);
+        res.status(201).json({ ok: true, requiresEmailVerification: true, message: 'Conta criada. Verifica o teu email antes de entrar.', user: u.rows[0], artist });
     }
     catch (e) {
         await client.query('ROLLBACK');
@@ -158,15 +318,112 @@ app.post('/api/auth/login', async (req, res) => {
     const { email, phone, password } = req.body || {};
     if ((!email && !phone) || !password)
         return res.status(400).json({ error: 'Informe os dados de acesso' });
-    const q = await pool.query(`select id,email,phone,password_hash,role,status from users where email=$1 or phone=$2 limit 1`, [email || null, phone || null]);
+    const q = await pool.query(`select id,email,phone,password_hash,role,status,email_verified,mfa_enabled,full_name,birth_date,admin_title,admin_permissions from users where (email=$1 or phone=$2) limit 1`, [String(email || '').trim().toLowerCase() || null, phone || null]);
     const user = q.rows[0];
     if (!user || user.status !== 'ACTIVE' || !verifyPassword(password, user.password_hash))
         return res.status(401).json({ error: 'Credenciais inválidas' });
+    if (!user.email_verified)
+        return res.status(403).json({ error: 'Verifica primeiro o teu email. Podes pedir um novo link de verificação.', code: 'EMAIL_NOT_VERIFIED' });
     delete user.password_hash;
-    res.json({ user, token: tokenFor(user) });
+    if (user.mfa_enabled) {
+        const challenge = randomToken();
+        await pool.query(`insert into auth_challenges(id,user_id,challenge_hash,type,expires_at) values($1,$2,$3,'LOGIN_2FA',now()+interval '10 minutes')`, [node_crypto_1.default.randomUUID(), user.id, hashToken(challenge)]);
+        return res.json({ requires2FA: true, challenge });
+    }
+    const sid = node_crypto_1.default.randomUUID();
+    await pool.query(`insert into auth_sessions(id,user_id,role,last_activity_at,user_agent_hash) values($1,$2,$3,now(),$4)`, [sid, user.id, user.role, hashToken(String(req.headers['user-agent'] || ''))]);
+    res.json({ user, token: tokenFor(user, sid) });
 });
+app.post('/api/auth/verify-2fa', async (req, res) => {
+    const { challenge, code } = req.body || {};
+    if (!challenge || !code)
+        return res.status(400).json({ error: 'Código 2FA obrigatório' });
+    const row = (await pool.query(`select c.id,c.user_id,u.email,u.phone,u.role,u.status,u.mfa_secret_enc,u.full_name,u.birth_date,u.admin_title,u.admin_permissions from auth_challenges c join users u on u.id=c.user_id where c.challenge_hash=$1 and c.type='LOGIN_2FA' and c.used_at is null and c.expires_at>now() limit 1`, [hashToken(String(challenge))])).rows[0];
+    if (!row || row.status !== 'ACTIVE')
+        return res.status(401).json({ error: 'Desafio 2FA inválido ou expirado' });
+    if (!verifyTotp(decryptSecret(row.mfa_secret_enc), String(code)))
+        return res.status(401).json({ error: 'Código 2FA incorreto' });
+    await pool.query('update auth_challenges set used_at=now() where id=$1', [row.id]);
+    const sid = node_crypto_1.default.randomUUID();
+    await pool.query(`insert into auth_sessions(id,user_id,role,last_activity_at,user_agent_hash) values($1,$2,$3,now(),$4)`, [sid, row.user_id, row.role, hashToken(String(req.headers['user-agent'] || ''))]);
+    res.json({ user: { id: row.user_id, email: row.email, phone: row.phone, role: row.role, status: row.status, full_name: row.full_name, birth_date: row.birth_date, admin_title: row.admin_title, admin_permissions: row.admin_permissions }, token: tokenFor({ id: row.user_id, role: row.role }, sid) });
+});
+app.post('/api/auth/resend-verification', async (req, res) => {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!email)
+        return res.status(400).json({ error: 'Informe o email' });
+    const u = (await pool.query(`select id,email,email_verified from users where lower(email)=lower($1) limit 1`, [email])).rows[0];
+    if (u && !u.email_verified) {
+        await pool.query(`update auth_email_tokens set used_at=now() where user_id=$1 and type='VERIFY_EMAIL' and used_at is null`, [u.id]);
+        const raw = randomToken();
+        await pool.query(`insert into auth_email_tokens(id,user_id,token_hash,type,expires_at) values($1,$2,$3,'VERIFY_EMAIL',now()+interval '24 hours')`, [node_crypto_1.default.randomUUID(), u.id, hashToken(raw)]);
+        await sendEmail(email, 'Novo link de verificação — BaBuLo Play', `Confirma o teu email: ${publicWebUrl('/verify-email', raw)}`);
+    }
+    res.json({ ok: true, message: 'Se o email existir e ainda não estiver verificado, enviámos um novo link.' });
+});
+app.post('/api/auth/verify-email', async (req, res) => {
+    const token = String(req.body?.token || '');
+    if (!token)
+        return res.status(400).json({ error: 'Token de verificação obrigatório' });
+    const row = (await pool.query(`select id,user_id from auth_email_tokens where token_hash=$1 and type='VERIFY_EMAIL' and used_at is null and expires_at>now() limit 1`, [hashToken(token)])).rows[0];
+    if (!row)
+        return res.status(400).json({ error: 'Link de verificação inválido ou expirado' });
+    await pool.query('update users set email_verified=true,updated_at=now() where id=$1', [row.user_id]);
+    await pool.query('update auth_email_tokens set used_at=now() where id=$1', [row.id]);
+    res.json({ ok: true, message: 'Email verificado com sucesso. Já podes entrar.' });
+});
+app.post('/api/auth/forgot-password', async (req, res) => {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!email)
+        return res.status(400).json({ error: 'Informe o email' });
+    const u = (await pool.query(`select id,email from users where lower(email)=lower($1) and status<>'BLOCKED' limit 1`, [email])).rows[0];
+    if (u) {
+        await pool.query(`update auth_email_tokens set used_at=now() where user_id=$1 and type='RESET_PASSWORD' and used_at is null`, [u.id]);
+        const raw = randomToken();
+        await pool.query(`insert into auth_email_tokens(id,user_id,token_hash,type,expires_at) values($1,$2,$3,'RESET_PASSWORD',now()+interval '30 minutes')`, [node_crypto_1.default.randomUUID(), u.id, hashToken(raw)]);
+        await sendEmail(email, 'Recuperação de palavra-passe — BaBuLo Play', `Redefine a tua palavra-passe (válido por 30 minutos): ${publicWebUrl('/', raw).replace('?token=', '?reset=')}`);
+    }
+    res.json({ ok: true, message: 'Se o email existir, receberás instruções para recuperar a palavra-passe.' });
+});
+app.post('/api/auth/reset-password', async (req, res) => {
+    const { token, password } = req.body || {};
+    if (!token || !password || String(password).length < 8)
+        return res.status(400).json({ error: 'Token e palavra-passe de pelo menos 8 caracteres são obrigatórios' });
+    const row = (await pool.query(`select id,user_id from auth_email_tokens where token_hash=$1 and type='RESET_PASSWORD' and used_at is null and expires_at>now() limit 1`, [hashToken(String(token))])).rows[0];
+    if (!row)
+        return res.status(400).json({ error: 'Link de recuperação inválido ou expirado' });
+    await pool.query('update users set password_hash=$1,updated_at=now() where id=$2', [hashPassword(String(password)), row.user_id]);
+    await pool.query('update auth_email_tokens set used_at=now() where id=$1', [row.id]);
+    await pool.query('update auth_sessions set revoked_at=now() where user_id=$1 and revoked_at is null', [row.user_id]);
+    res.json({ ok: true, message: 'Palavra-passe alterada. Todas as sessões anteriores foram encerradas.' });
+});
+app.get('/api/auth/sessions', auth, async (req, res) => { const rows = (await pool.query(`select id,role,created_at,last_activity_at,revoked_at from auth_sessions where user_id=$1 order by created_at desc`, [req.user.id])).rows; res.json({ sessions: rows }); });
+app.post('/api/auth/sessions/revoke-all', auth, async (req, res) => { await pool.query(`update auth_sessions set revoked_at=now() where user_id=$1 and revoked_at is null`, [req.user.id]); res.json({ ok: true }); });
+app.post('/api/auth/activity', auth, async (req, res) => { const decoded = decodeToken(String(req.headers.authorization || '').slice(7)); if (decoded?.sid)
+    await pool.query('update auth_sessions set last_activity_at=now() where id=$1 and user_id=$2 and revoked_at is null', [decoded.sid, req.user.id]); res.json({ ok: true }); });
+app.post('/api/auth/logout', auth, async (req, res) => { const decoded = decodeToken(String(req.headers.authorization || '').slice(7)); if (decoded?.sid)
+    await pool.query('update auth_sessions set revoked_at=now() where id=$1 and user_id=$2', [decoded.sid, req.user.id]); res.json({ ok: true }); });
+app.post('/api/auth/2fa/setup', auth, async (req, res) => {
+    if (!['ADMIN', 'OWNER'].includes(req.user.role))
+        return res.status(403).json({ error: '2FA é obrigatório apenas para ADMIN/OWNER.' });
+    const secret = base32Encode(node_crypto_1.default.randomBytes(20));
+    const enc = encryptSecret(secret);
+    await pool.query('update users set mfa_secret_enc=$1,mfa_pending=true where id=$2', [enc, req.user.id]);
+    const u = (await pool.query('select email from users where id=$1', [req.user.id])).rows[0];
+    const issuer = 'BaBuLo Play';
+    const uri = `otpauth://totp/${encodeURIComponent(issuer + ':' + u.email)}?secret=${secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
+    res.json({ secret, otpauthUri: uri, message: 'Adiciona esta chave no Google Authenticator, Microsoft Authenticator ou app compatível e confirma com o código.' });
+});
+app.post('/api/auth/2fa/enable', auth, async (req, res) => { if (!['ADMIN', 'OWNER'].includes(req.user.role))
+    return res.status(403).json({ error: 'Acesso reservado à administração' }); const row = (await pool.query('select mfa_secret_enc from users where id=$1', [req.user.id])).rows[0]; if (!row?.mfa_secret_enc)
+    return res.status(400).json({ error: 'Primeiro inicia a configuração do 2FA' }); if (!verifyTotp(decryptSecret(row.mfa_secret_enc), String(req.body?.code || '')))
+    return res.status(400).json({ error: 'Código 2FA incorreto' }); await pool.query('update users set mfa_enabled=true,mfa_pending=false where id=$1', [req.user.id]); res.json({ ok: true, message: '2FA ativado com sucesso.' }); });
+app.post('/api/auth/2fa/disable', auth, async (req, res) => { if (!['ADMIN', 'OWNER'].includes(req.user.role))
+    return res.status(403).json({ error: 'Acesso reservado à administração' }); const row = (await pool.query('select mfa_secret_enc,mfa_enabled from users where id=$1', [req.user.id])).rows[0]; if (!row?.mfa_enabled)
+    return res.json({ ok: true }); if (!verifyTotp(decryptSecret(row.mfa_secret_enc), String(req.body?.code || '')))
+    return res.status(400).json({ error: 'Código 2FA incorreto' }); await pool.query('update users set mfa_enabled=false,mfa_pending=false,mfa_secret_enc=null where id=$1', [req.user.id]); res.json({ ok: true, message: '2FA desativado.' }); });
 app.get('/api/auth/me', auth, async (req, res) => {
-    const q = await pool.query(`select id,email,phone,role,status,email_verified,phone_verified,created_at from users where id=$1`, [req.user.id]);
+    const q = await pool.query(`select id,email,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,gender,height_cm,education,address,marital_status,profile_photo_url,admin_title,admin_permissions,created_at,updated_at from users where id=$1`, [req.user.id]);
     if (!q.rows[0])
         return res.status(404).json({ error: 'Utilizador não encontrado' });
     const artist = (await pool.query(`select id,stage_name,legal_name,bio,country,city,photo_url,verification_status from artists where user_id=$1`, [req.user.id])).rows[0] || null;
@@ -204,10 +461,19 @@ app.post('/api/releases', auth, artistOnly, async (req, res) => {
 });
 app.put('/api/releases/:id', auth, artistOnly, async (req, res) => {
     const { title, type = 'SINGLE', genreId, language, country, releaseDate, preReleaseDate, coverUrl, description, upc, ean, labelName, phonographicCopyright, copyrightText } = req.body || {};
-    const q = await pool.query(`update releases r set title=coalesce($1,r.title),type=coalesce($2,r.type),genre_id=$3,language=$4,country=$5,release_date=$6,pre_release_date=$7,cover_url=$8,description=$9,upc=$10,ean=$11,label_name=$12,phonographic_copyright=$13,copyright_text=$14 where r.id=$15 and exists(select 1 from artists a where a.id=r.primary_artist_id and a.user_id=$16) returning r.*`, [title || null, type, genreId || null, language || null, country || null, releaseDate || null, preReleaseDate || null, coverUrl || null, description || null, upc || null, ean || null, labelName || null, phonographicCopyright || null, copyrightText || null, req.params.id, req.user.id]);
+    const q = await pool.query(`update releases r set title=coalesce($1::text,r.title),type=coalesce($2::text,r.type),genre_id=$3::uuid,language=$4::text,country=$5::text,release_date=$6::date,pre_release_date=$7::date,cover_url=$8::text,description=$9::text,upc=$10::text,ean=$11::text,label_name=$12::text,phonographic_copyright=$13::text,copyright_text=$14::text where r.id=$15::uuid and exists(select 1 from artists a where a.id=r.primary_artist_id and a.user_id=$16::uuid) returning r.*`, [title || null, type, genreId || null, language || null, country || null, releaseDate || null, preReleaseDate || null, coverUrl || null, description || null, upc || null, ean || null, labelName || null, phonographicCopyright || null, copyrightText || null, req.params.id, req.user.id]);
     if (!q.rows[0])
         return res.status(404).json({ error: 'Lançamento não encontrado' });
     res.json({ release: q.rows[0] });
+});
+app.get('/api/releases/:id/editor', auth, artistOnly, async (req, res) => {
+    const release = (await pool.query(`select r.* from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`, [req.params.id, req.user.id])).rows[0];
+    if (!release)
+        return res.status(404).json({ error: 'Lançamento não encontrado' });
+    const tracks = (await pool.query(`select t.*,tf.storage_key,tf.format as file_format from tracks t left join track_files tf on tf.track_id=t.id and tf.file_type='AUDIO' where t.primary_release_id=$1 order by t.track_number nulls last,t.created_at`, [release.id])).rows;
+    const rights = (await pool.query(`select * from rights_declarations where release_id=$1 order by created_at`, [release.id])).rows;
+    const mappedTracks = tracks.map((t) => ({ ...t, audioUrl: t.storage_key ? `/media/${String(t.storage_key).split('/').pop()}` : '', audioName: t.storage_key ? String(t.storage_key).split('/').pop() : '', serverTrackId: t.id, serverRightId: (rights.find((r) => String(r.track_id) === String(t.id)) || {}).id || undefined }));
+    res.json({ release, tracks: mappedTracks, rights });
 });
 app.get('/api/artists/me/releases', auth, artistOnly, async (req, res) => {
     const artist = (await pool.query('select id from artists where user_id=$1 limit 1', [req.user.id])).rows[0];
@@ -216,8 +482,42 @@ app.get('/api/artists/me/releases', auth, artistOnly, async (req, res) => {
     const q = await pool.query('select id,title,type,cover_url,release_date,status,created_at from releases where primary_artist_id=$1 order by created_at desc', [artist.id]);
     res.json({ releases: q.rows });
 });
+app.delete('/api/releases/:id', auth, artistOnly, async (req, res) => {
+    const release = (await pool.query(`select r.id,r.title,r.type,r.status,r.cover_url from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`, [req.params.id, req.user.id])).rows[0];
+    if (!release)
+        return res.status(404).json({ error: 'Lançamento não encontrado' });
+    if (['PUBLISHED', 'TAKEN_DOWN'].includes(String(release.status)))
+        return res.status(409).json({ error: 'Este lançamento já foi publicado e não pode ser eliminado daqui.' });
+    const order = (await pool.query('select id from distribution_orders where release_id=$1 limit 1', [release.id])).rows[0];
+    if (order)
+        return res.status(409).json({ error: 'Este lançamento já tem uma ordem de distribuição e não pode ser eliminado.' });
+    const files = (await pool.query(`select tf.storage_key from track_files tf join tracks t on t.id=tf.track_id where t.primary_release_id=$1`, [release.id])).rows;
+    const coverKey = release.cover_url ? String(release.cover_url).split('/').pop() : '';
+    await pool.query('delete from releases where id=$1', [release.id]);
+    for (const f of files) {
+        const key = String(f.storage_key || '').replace(/^.*[\/]/, '');
+        if (key) {
+            try {
+                const fp = node_path_1.default.join(uploadDir, key);
+                if (node_fs_1.default.existsSync(fp))
+                    node_fs_1.default.unlinkSync(fp);
+            }
+            catch { }
+        }
+    }
+    if (coverKey && coverKey.startsWith(String(req.user.id) + '-')) {
+        try {
+            const fp = node_path_1.default.join(uploadDir, coverKey);
+            if (node_fs_1.default.existsSync(fp))
+                node_fs_1.default.unlinkSync(fp);
+        }
+        catch { }
+    }
+    await audit(req.user.id, 'RELEASE_DELETED', 'RELEASE', release.id, { title: release.title });
+    res.json({ ok: true, id: release.id });
+});
 app.post('/api/tracks', auth, artistOnly, async (req, res) => {
-    const { title, releaseId, trackNumber, genreId, language, version, durationMs, isExplicit = false, explicitReason, isrc, originalReleaseDate, fileUrl, fileType = 'AUDIO', composer, lyricist, producer, performer, publisher, featuredArtists = '', audioType = 'SONG', aiGenerated = 'NO', aiUsage = '', lyrics = '' } = req.body || {};
+    const { title, releaseId, trackNumber, genreId, language, version, durationMs, isExplicit = false, explicitReason, isrc, originalReleaseDate, fileUrl, fileType = 'AUDIO', composer, lyricist, producer, performer, publisher, featuredArtists = '', audioType = 'SONG', promoStartMs = 0, promoEndMs = 0, aiGenerated = 'NO', aiUsage = '', lyrics = '' } = req.body || {};
     if (!title || !releaseId)
         return res.status(400).json({ error: 'Título e lançamento são obrigatórios' });
     const safeAudioTypes = ['SONG', 'INSTRUMENTAL', 'ACAPELLA', 'LIVE', 'REMIX', 'COVER'];
@@ -226,6 +526,8 @@ app.post('/api/tracks', auth, artistOnly, async (req, res) => {
         return res.status(400).json({ error: 'Tipo de áudio inválido' });
     if (!safeAi.includes(String(aiGenerated)))
         return res.status(400).json({ error: 'Estado de IA inválido' });
+    if (Math.max(0, Number(promoEndMs) || 0) - Math.max(0, Number(promoStartMs) || 0) !== 59000)
+        return res.status(400).json({ error: 'O trecho promocional deve ter exatamente 59 segundos.' });
     const safeFeaturedArtists = Array.isArray(featuredArtists)
         ? featuredArtists.map((x) => String(x).trim()).filter(Boolean).slice(0, 20).join(', ')
         : String(featuredArtists || '').trim().slice(0, 2000);
@@ -240,10 +542,11 @@ app.post('/api/tracks', auth, artistOnly, async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('begin');
-        const t = (await client.query(`insert into tracks(title,track_number,version,duration_ms,language,genre_id,is_explicit,explicit_reason,isrc,isrc_status,isrc_source,original_release_date,composer,lyricist,producer,performer,publisher,featured_artists,audio_type,ai_generated,ai_usage,lyrics,promo_start_ms,promo_end_ms,primary_release_id) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25) returning *`, [title, trackNumber ? Number(trackNumber) : null, version || null, durationMs || null, language || null, genreId || null, Boolean(isExplicit), explicitReason || null, isrc || null, isrc ? 'ASSIGNED' : 'PENDING_ASSIGNMENT', isrc ? 'ARTIST_PROVIDED' : 'NOT_PROVIDED', originalReleaseDate || null, composer || null, lyricist || null, producer || null, performer || null, publisher || null, safeFeaturedArtists || null, String(audioType), String(aiGenerated), safeAiUsage || null, safeLyrics || null, Math.max(0, Number(promoStartMs) || 0), Math.max(0, Number(promoEndMs) || 0), releaseId])).rows[0];
+        const t = (await client.query(`insert into tracks(title,track_number,version,duration_ms,language,genre_id,is_explicit,explicit_reason,isrc,isrc_status,isrc_source,original_release_date,composer,lyricist,producer,performer,publisher,featured_artists,audio_type,ai_generated,ai_usage,lyrics,promo_start_ms,promo_end_ms,primary_release_id) values($1::text,$2::integer,$3::text,$4::integer,$5::text,$6::uuid,$7::boolean,$8::text,$9::text,$10::text,$11::text,$12::date,$13::text,$14::text,$15::text,$16::text,$17::text,$18::text,$19::text,$20::text,$21::text,$22::text,$23::integer,$24::integer,$25::uuid) returning *`, [title, trackNumber ? Number(trackNumber) : null, version || null, durationMs || null, language || null, genreId || null, Boolean(isExplicit), explicitReason || null, isrc || null, isrc ? 'ASSIGNED' : 'PENDING_ASSIGNMENT', isrc ? 'ARTIST_PROVIDED' : 'NOT_PROVIDED', originalReleaseDate || null, composer || null, lyricist || null, producer || null, performer || null, publisher || null, safeFeaturedArtists || null, String(audioType), String(aiGenerated), safeAiUsage || null, safeLyrics || null, Math.max(0, Number(promoStartMs) || 0), Math.max(0, Number(promoEndMs) || 0), releaseId])).rows[0];
         await client.query(`insert into track_artists(track_id,artist_id,role) values($1,$2,'PRIMARY')`, [t.id, artist.id]);
         if (fileUrl) {
-            await client.query(`insert into track_files(track_id,storage_key,file_type,format,status) values($1,$2,$3,$4,'UPLOADED')`, [t.id, fileUrl, fileType, 'unknown']);
+            const storageKey = String(fileUrl).split('/').pop() || String(fileUrl);
+            await client.query(`insert into track_files(track_id,storage_key,file_type,format,status) values($1,$2,$3,$4,'UPLOADED')`, [t.id, storageKey, fileType, 'unknown']);
         }
         await client.query('commit');
         res.status(201).json({ track: t });
@@ -256,6 +559,23 @@ app.post('/api/tracks', auth, artistOnly, async (req, res) => {
     finally {
         client.release();
     }
+});
+app.put('/api/tracks/:trackId', auth, artistOnly, async (req, res) => {
+    const { title, trackNumber, genreId, language, version, durationMs, isExplicit = false, explicitReason, isrc, originalReleaseDate, composer, lyricist, producer, performer, publisher, featuredArtists = '', audioType = 'SONG', promoStartMs = 0, promoEndMs = 0, aiGenerated = 'NO', aiUsage = '', lyrics = '', fileUrl } = req.body || {};
+    const t = (await pool.query(`select t.id,t.primary_release_id from tracks t join releases r on r.id=t.primary_release_id join artists a on a.id=r.primary_artist_id where t.id=$1 and a.user_id=$2`, [req.params.trackId, req.user.id])).rows[0];
+    if (!t)
+        return res.status(404).json({ error: 'Faixa não encontrada' });
+    if (Math.max(0, Number(promoEndMs) || 0) - Math.max(0, Number(promoStartMs) || 0) !== 59000)
+        return res.status(400).json({ error: 'O trecho promocional deve ter exatamente 59 segundos.' });
+    const safeFeaturedArtists = Array.isArray(featuredArtists) ? featuredArtists.map((x) => String(x).trim()).filter(Boolean).slice(0, 20).join(', ') : String(featuredArtists || '').trim().slice(0, 2000);
+    const safeAiUsage = Array.isArray(aiUsage) ? aiUsage.map((x) => String(x).trim()).filter(Boolean).slice(0, 20).join(', ') : String(aiUsage || '').trim().slice(0, 2000);
+    const q = await pool.query(`update tracks set title=coalesce($1::text,title),track_number=$2::integer,genre_id=$3::uuid,language=$4::text,version=$5::text,duration_ms=$6::integer,is_explicit=$7::boolean,explicit_reason=$8::text,isrc=$9::text,isrc_status=case when $9::text is not null and $9::text<>'' then 'ASSIGNED' else isrc_status end,isrc_source=case when $9::text is not null and $9::text<>'' then 'ARTIST_PROVIDED' else isrc_source end,original_release_date=$10::date,composer=$11::text,lyricist=$12::text,producer=$13::text,performer=$14::text,publisher=$15::text,featured_artists=$16::text,audio_type=$17::text,ai_generated=$18::text,ai_usage=$19::text,lyrics=$20::text,promo_start_ms=$21::integer,promo_end_ms=$22::integer where id=$23::uuid returning *`, [title || null, trackNumber ? Number(trackNumber) : null, genreId || null, language || null, version || null, durationMs || null, Boolean(isExplicit), explicitReason || null, isrc || null, originalReleaseDate || null, composer || null, lyricist || null, producer || null, performer || null, publisher || null, safeFeaturedArtists || null, String(audioType), String(aiGenerated), safeAiUsage || null, String(lyrics || '').slice(0, 100000), Math.max(0, Number(promoStartMs) || 0), Math.max(0, Number(promoEndMs) || 0), t.id]);
+    if (fileUrl) {
+        const key = String(fileUrl).split('/').pop() || String(fileUrl);
+        await pool.query(`delete from track_files where track_id=$1 and file_type='AUDIO'`, [t.id]);
+        await pool.query(`insert into track_files(track_id,storage_key,file_type,format,status) values($1,$2,'AUDIO',$3,'UPLOADED')`, [t.id, key, 'unknown']);
+    }
+    res.json({ track: q.rows[0] });
 });
 app.put('/api/artists/me', auth, artistOnly, async (req, res) => {
     const { stageName, legalName, bio, country, city, photoUrl } = req.body || {};
@@ -290,6 +610,19 @@ app.post('/api/uploads', auth, upload.single('file'), async (req, res) => {
     const finalPath = node_path_1.default.join(uploadDir, finalName);
     node_fs_1.default.renameSync(req.file.path, finalPath);
     res.status(201).json({ file: { name: req.file.originalname, size: req.file.size, mimeType: req.file.mimetype, storageKey: finalName, url: `/media/${finalName}`, kind } });
+});
+app.delete('/api/uploads', auth, artistOnly, async (req, res) => {
+    const key = String(req.query.key || '').split('/').pop() || '';
+    if (!key || !key.startsWith(String(req.user.id) + '-'))
+        return res.status(403).json({ error: 'Ficheiro não pertence à tua conta.' });
+    const fp = node_path_1.default.join(uploadDir, key);
+    try {
+        if (node_fs_1.default.existsSync(fp))
+            node_fs_1.default.unlinkSync(fp);
+    }
+    catch { }
+    await pool.query(`delete from track_files where storage_key=$1`, [key]);
+    res.json({ ok: true });
 });
 app.delete('/api/tracks/:trackId/audio', auth, artistOnly, async (req, res) => {
     const q = await pool.query(`select tf.id,tf.storage_key,t.primary_release_id from track_files tf join tracks t on t.id=tf.track_id join releases r on r.id=t.primary_release_id join artists a on a.id=r.primary_artist_id where tf.track_id=$1 and tf.file_type='AUDIO' and a.user_id=$2 order by tf.created_at desc limit 1`, [req.params.trackId, req.user.id]);
@@ -351,6 +684,8 @@ app.post('/api/releases/:id/preflight', auth, artistOnly, async (req, res) => {
             errors.push('Uma faixa está sem título.');
         if (!t.storage_key)
             errors.push(`A faixa “${t.title}” não tem áudio enviado.`);
+        if (Number(t.promo_end_ms) - Number(t.promo_start_ms) !== 59000)
+            errors.push(`O trecho promocional da faixa “${t.title || 'Sem título'}” deve ter exatamente 59 segundos.`);
     }
     if (release.cover_url) {
         const key = String(release.cover_url).split('/').pop();
@@ -387,12 +722,17 @@ app.get('/api/releases/:id/payment', auth, artistOnly, async (req, res) => {
     const mode = payment?.metadata?.distributionMode || 'MAIN';
     const fullExtra = Math.round(Number(product.amount) * 0.5 * 100) / 100;
     const total = mode === 'ALL' ? Number(product.amount) + fullExtra : Number(product.amount);
-    res.json({ release, product, payment, paid: Boolean(payment?.status === 'PAID'), distribution: { mode, selectedCodes, mainPlatformCodes: MAIN_PLATFORM_CODES, allPlatformCodes: ALL_PLATFORM_CODES, baseAmount: Number(product.amount), extraAllPlatforms: fullExtra, totalAmount: total, surchargePercent: 50 } });
+    const wallet = Number((await pool.query(`select coalesce(sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount else 0 end),0) balance from financial_ledger where artist_id=$1`, [release.artist_id])).rows[0].balance || 0);
+    const walletApplied = Number(payment?.metadata?.walletAmount || 0);
+    const externalDue = Math.max(0, total - walletApplied);
+    res.json({ release, product, payment, paid: Boolean(payment?.status === 'PAID'), wallet: { balance: wallet, applied: walletApplied, externalDue }, distribution: { mode, selectedCodes, mainPlatformCodes: MAIN_PLATFORM_CODES, allPlatformCodes: ALL_PLATFORM_CODES, baseAmount: Number(product.amount), extraAllPlatforms: fullExtra, totalAmount: total, surchargePercent: 50 } });
 });
 app.post('/api/releases/:id/payment', auth, artistOnly, async (req, res) => {
-    const { paymentMethod = 'MULTICAIXA_EXPRESS', distributionMode = 'MAIN' } = req.body || {};
+    const { paymentMethod = 'WALLET', fallbackPaymentMethod = 'MULTICAIXA_EXPRESS', distributionMode = 'MAIN' } = req.body || {};
     if (!PAYMENT_METHODS.includes(String(paymentMethod)))
         return res.status(400).json({ error: 'Método de pagamento inválido' });
+    if (!['MULTICAIXA_EXPRESS', 'MULTICAIXA_REFERENCE', 'VISA', 'MASTERCARD'].includes(String(fallbackPaymentMethod)))
+        return res.status(400).json({ error: 'Método para a diferença inválido' });
     if (!['MAIN', 'ALL'].includes(String(distributionMode)))
         return res.status(400).json({ error: 'Plano de distribuição inválido' });
     const release = (await pool.query(`select r.id,r.title,r.type,a.id artist_id from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`, [req.params.id, req.user.id])).rows[0];
@@ -418,23 +758,345 @@ app.post('/api/releases/:id/payment', auth, artistOnly, async (req, res) => {
     const pending = (await pool.query(`select id,reference,amount,currency,payment_method,gateway,status,metadata,paid_at,created_at from payment_transactions where release_id=$1 and status='PENDING' order by created_at desc limit 1`, [release.id])).rows[0];
     if (pending)
         return res.json({ payment: pending, paid: false, message: 'Já existe um pagamento pendente para este lançamento.' });
-    const reference = makePaymentReference();
-    const gateway = paymentMethod === 'MULTICAIXA_EXPRESS' ? 'MULTICAIXA_EXPRESS' : paymentMethod === 'MULTICAIXA_REFERENCE' ? 'MULTICAIXA' : 'CARD';
-    const metadata = { releaseId: release.id, releaseTitle: release.title, productCode, productName: product.name, paymentInstructions: paymentMethod === 'MULTICAIXA_REFERENCE' ? 'Use a referência apresentada para concluir o pagamento.' : 'Conclua o pagamento pelo método selecionado e aguarde a confirmação.', distributionMode, platformCodes: selectedCodes, surchargePercent: distributionMode === 'ALL' ? 50 : 0, paymentType };
-    const q = await pool.query(`insert into payment_transactions(user_id,product_id,release_id,service_type,payment_method,gateway,reference,idempotency_key,amount,currency,net_amount,status,metadata) values($1,$2,$3,'DISTRIBUTION',$4,$5,$6,$7,$8,$9,$8,'PENDING',$10) returning id,reference,amount,currency,payment_method,gateway,status,metadata,paid_at,created_at`, [req.user.id, product.id, release.id, paymentMethod, gateway, reference, node_crypto_1.default.randomUUID(), amount, product.currency, JSON.stringify(metadata)]);
-    await audit(req.user.id, 'RELEASE_PAYMENT_CREATED', 'PAYMENT', q.rows[0].id, { releaseId: release.id, productCode, paymentMethod, distributionMode, paymentType, amount });
-    res.status(201).json({ payment: q.rows[0], paid: false, message: 'Pedido de pagamento criado. Aguarda a confirmação do pagamento.' });
+    const client = await pool.connect();
+    try {
+        await client.query('begin');
+        await client.query(`select id from artists where id=$1 for update`, [release.artist_id]);
+        const bal = Number((await client.query(`select coalesce(sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount else 0 end),0) balance from financial_ledger where artist_id=$1`, [release.artist_id])).rows[0].balance || 0);
+        const walletRequested = String(paymentMethod) === 'WALLET';
+        const walletAmount = walletRequested ? Math.min(Math.max(0, bal), amount) : 0;
+        const externalAmount = Math.max(0, amount - walletAmount);
+        if (walletRequested && walletAmount <= 0) {
+            await client.query('rollback');
+            return res.status(400).json({ error: 'O teu saldo de streams não tem fundos disponíveis para este pagamento. Escolhe um método para pagar o valor.', walletBalance: bal, required: amount });
+        }
+        const effectiveMethod = externalAmount > 0 ? String(fallbackPaymentMethod) : 'WALLET';
+        const reference = makePaymentReference();
+        const gateway = effectiveMethod === 'WALLET' ? 'WALLET' : effectiveMethod === 'MULTICAIXA_EXPRESS' ? 'MULTICAIXA_EXPRESS' : effectiveMethod === 'MULTICAIXA_REFERENCE' ? 'MULTICAIXA' : 'CARD';
+        const metadata = { releaseId: release.id, releaseTitle: release.title, productCode, productName: product.name, paymentInstructions: effectiveMethod === 'MULTICAIXA_REFERENCE' ? 'Use a referência apresentada para concluir o pagamento.' : effectiveMethod === 'WALLET' ? 'Pagamento efetuado com saldo acumulado dos streams.' : 'Conclua o pagamento pelo método selecionado e aguarde a confirmação.', distributionMode, platformCodes: selectedCodes, surchargePercent: distributionMode === 'ALL' ? 50 : 0, paymentType, walletAmount, externalAmount, totalAmount: amount };
+        const status = externalAmount === 0 ? 'PAID' : 'PENDING';
+        const q = await client.query(`insert into payment_transactions(user_id,product_id,release_id,service_type,payment_method,gateway,reference,idempotency_key,amount,currency,net_amount,status,metadata,paid_at) values($1::uuid,$2::uuid,$3::uuid,'DISTRIBUTION',$4::text,$5::text,$6::text,$7::text,$8::numeric,$9::text,$8::numeric,$10::text,$11::jsonb,case when $10='PAID' then now() else null end) returning id,reference,amount,currency,payment_method,gateway,status,metadata,paid_at,created_at`, [req.user.id, product.id, release.id, effectiveMethod, gateway, reference, node_crypto_1.default.randomUUID(), externalAmount, product.currency, status, JSON.stringify(metadata)]);
+        if (walletAmount > 0) {
+            const after = bal - walletAmount;
+            await client.query(`insert into financial_ledger(artist_id,entry_type,reference_type,reference_id,amount,currency,balance_after,description) values($1,'DEBIT','RELEASE_PAYMENT',$2,$3,'AOA',$4,$5)`, [release.artist_id, q.rows[0].id, walletAmount, after, externalAmount > 0 ? 'Reserva de saldo dos streams para pagamento do lançamento' : 'Pagamento do lançamento com saldo dos streams']);
+        }
+        await client.query('commit');
+        await audit(req.user.id, 'RELEASE_PAYMENT_CREATED', 'PAYMENT', q.rows[0].id, { releaseId: release.id, productCode, paymentMethod: effectiveMethod, distributionMode, paymentType, amount, walletAmount, externalAmount });
+        res.status(201).json({ payment: q.rows[0], paid: status === 'PAID', wallet: { balance: bal - walletAmount, applied: walletAmount, externalDue: externalAmount }, message: status === 'PAID' ? '✓ Lançamento pago com o saldo dos streams.' : 'Saldo dos streams aplicado. Paga agora apenas a diferença.' });
+    }
+    catch (e) {
+        try {
+            await client.query('rollback');
+        }
+        catch { }
+        console.error('release wallet payment error', e);
+        res.status(500).json({ error: 'Não foi possível processar o pagamento do lançamento.' });
+    }
+    finally {
+        client.release();
+    }
 });
-app.post('/api/admin/payments/:id/confirm', auth, adminOnly, async (req, res) => {
-    const q = await pool.query(`update payment_transactions set status='PAID',paid_at=now(),updated_at=now() where id=$1 and status='PENDING' returning id,release_id,status,paid_at,reference,amount,currency`, [req.params.id]);
+app.post('/api/admin/payments/:id/confirm', auth, ownerOnly, async (req, res) => {
+    const q = await pool.query(`update payment_transactions set status='PAID',paid_at=now(),updated_at=now(),reviewed_by=$2,reviewed_at=now(),review_reason=null where id=$1 and status='PENDING' returning id,release_id,status,paid_at,reference,amount,currency`, [req.params.id, req.user.id]);
     if (!q.rows[0])
         return res.status(404).json({ error: 'Pagamento pendente não encontrado' });
-    await audit(req.user.id, 'RELEASE_PAYMENT_CONFIRMED', 'PAYMENT', q.rows[0].id, { releaseId: q.rows[0].release_id });
+    await audit(req.user.id, 'RELEASE_PAYMENT_CONFIRMED', 'PAYMENT', q.rows[0].id, { releaseId: q.rows[0].release_id, approvedByOwner: true });
     res.json({ ok: true, payment: q.rows[0] });
 });
-app.get('/api/admin/payments/pending', auth, adminOnly, async (_req, res) => {
+app.post('/api/owner/payments/:id/decision', auth, ownerOnly, async (req, res) => {
+    const { decision, reason } = req.body || {};
+    if (!['APPROVED', 'REJECTED'].includes(decision))
+        return res.status(400).json({ error: 'Decisão financeira inválida' });
+    if (decision === 'REJECTED' && !String(reason || '').trim())
+        return res.status(400).json({ error: 'Informe o motivo da rejeição do pagamento' });
+    const client = await pool.connect();
+    try {
+        await client.query('begin');
+        const status = decision === 'APPROVED' ? 'PAID' : 'CANCELLED';
+        const q = await client.query(`update payment_transactions set status=$1,paid_at=case when $1='PAID' then now() else null end,updated_at=now(),reviewed_by=$2,reviewed_at=now(),review_reason=$3,metadata=metadata || $4::jsonb where id=$5 and status='PENDING' returning id,release_id,user_id,status,paid_at,reference,amount,currency,payment_method,reviewed_at,review_reason,created_at,metadata`, [status, req.user.id, reason || null, JSON.stringify(decision === 'REJECTED' ? { ownerDecision: 'REJECTED', ownerDecisionReason: String(reason || '') } : { ownerDecision: 'APPROVED' }), req.params.id]);
+        if (!q.rows[0]) {
+            await client.query('rollback');
+            return res.status(404).json({ error: 'Pagamento pendente não encontrado' });
+        }
+        const payment = q.rows[0];
+        if (decision === 'REJECTED') {
+            const walletAmount = Number(payment.metadata?.walletAmount || 0);
+            const releaseId = payment.release_id;
+            if (walletAmount > 0 && releaseId) {
+                const artist = (await client.query(`select r.primary_artist_id artist_id from releases r where r.id=$1 limit 1`, [releaseId])).rows[0];
+                if (artist?.artist_id) {
+                    const bal = Number((await client.query(`select coalesce(sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount else 0 end),0) balance from financial_ledger where artist_id=$1`, [artist.artist_id])).rows[0].balance || 0);
+                    await client.query(`insert into financial_ledger(artist_id,entry_type,reference_type,reference_id,amount,currency,balance_after,description) values($1,'CREDIT','RELEASE_PAYMENT',$2,$3,'AOA',$4,'Devolução de saldo dos streams após rejeição do pagamento')`, [artist.artist_id, payment.id, walletAmount, bal + walletAmount]);
+                }
+            }
+        }
+        await client.query('commit');
+        await audit(req.user.id, decision === 'APPROVED' ? 'PAYMENT_APPROVED' : 'PAYMENT_REJECTED', 'PAYMENT', payment.id, { releaseId: payment.release_id, reason: reason || null, walletRefunded: decision === 'REJECTED' ? Number(payment.metadata?.walletAmount || 0) : 0 });
+        res.json({ ok: true, payment });
+    }
+    catch (e) {
+        await client.query('rollback');
+        console.error('owner payment decision error', e);
+        res.status(500).json({ error: 'Não foi possível guardar a decisão financeira' });
+    }
+    finally {
+        client.release();
+    }
+});
+app.get('/api/admin/payments/pending', auth, requireAdminPermission('FINANCE'), async (_req, res) => {
     const q = await pool.query(`select p.id,p.reference,p.amount,p.currency,p.payment_method,p.status,p.created_at,p.release_id,r.title release_title,a.stage_name from payment_transactions p left join releases r on r.id=p.release_id left join artists a on a.id=r.primary_artist_id where p.service_type='DISTRIBUTION' and p.status='PENDING' order by p.created_at asc`);
     res.json({ payments: q.rows });
+});
+// ===== Direitos V10.4.9: scan de áudio, matching e reserva de royalties =====
+function normalizeStorageKey(value) {
+    const raw = String(value || '').split('?')[0].split('/').pop() || '';
+    if (!raw || raw.includes('..') || raw.includes('/') || raw.includes('\\'))
+        return '';
+    return raw;
+}
+async function runRightsScan(opts) {
+    const key = normalizeStorageKey(opts.storageKey);
+    if (!key)
+        throw new Error('Ficheiro de áudio inválido.');
+    const fp = node_path_1.default.join(uploadDir, key);
+    if (!node_fs_1.default.existsSync(fp))
+        throw new Error('Ficheiro de áudio não encontrado no armazenamento.');
+    const sha256 = node_crypto_1.default.createHash('sha256').update(node_fs_1.default.readFileSync(fp)).digest('hex');
+    const providerUrl = String(process.env.RIGHTS_MATCH_PROVIDER_URL || '').trim();
+    let provider = 'INTERNAL', result = { status: 'NO_MATCH', confidence: 0, matches: [], reference: null };
+    // Sem provedor externo, o motor interno só consegue reconhecer correspondências
+    // já conhecidas pelo próprio BaBuLo. Isto não é uma prova de ausência de copyright.
+    const known = (await pool.query(`select rm.holder_name,rm.holder_email,rm.country,rm.right_category,rm.isrc,rm.iswc,rm.ipi,rm.catalog_code,rm.match_type,rm.confidence,rm.confirmed,rm.royalty_percentage,rm.source,rm.source_reference from rights_scans rs join rights_matches rm on rm.scan_id=rs.id where rs.audio_sha256=$1 order by rm.created_at desc`, [sha256])).rows;
+    if (known.length) {
+        result = { status: known.some((x) => x.confirmed) ? 'CONFIRMED_MATCH' : 'POSSIBLE_MATCH', confidence: Math.max(...known.map((x) => Number(x.confidence || 0))), matches: known, reference: 'INTERNAL-SHA256' };
+    }
+    if (providerUrl) {
+        provider = 'EXTERNAL';
+        try {
+            const r = await fetch(providerUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': process.env.RIGHTS_MATCH_PROVIDER_TOKEN ? `Bearer ${process.env.RIGHTS_MATCH_PROVIDER_TOKEN}` : '' }, body: JSON.stringify({ audioSha256: sha256, trackId: opts.trackId || null }) });
+            if (r.ok) {
+                const d = await r.json();
+                result = { status: d.status || 'POSSIBLE_MATCH', confidence: Number(d.confidence || 0), matches: Array.isArray(d.matches) ? d.matches : [], reference: d.reference || null };
+            }
+            else
+                console.warn('RIGHTS_MATCH_PROVIDER devolveu', r.status);
+        }
+        catch (e) {
+            console.warn('Falha no provedor externo de direitos:', e);
+        }
+    }
+    const scan = (await pool.query(`insert into rights_scans(track_id,storage_key,audio_sha256,provider,status,result_status,confidence,provider_reference,created_by) values($1,$2,$3,$4,'COMPLETED',$5,$6,$7,$8) returning *`, [opts.trackId || null, key, sha256, provider, result.status, Number(result.confidence || 0), result.reference || null, opts.userId])).rows[0];
+    for (const m of (result.matches || [])) {
+        await pool.query(`insert into rights_matches(scan_id,holder_name,holder_email,country,right_category,isrc,iswc,ipi,catalog_code,match_type,confidence,confirmed,royalty_percentage,source,source_reference) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, [scan.id, m.holderName || m.holder_name || null, m.holderEmail || m.holder_email || null, m.country || null, m.rightCategory || m.right_category || null, m.isrc || null, m.iswc || null, m.ipi || null, m.catalogCode || m.catalog_code || null, m.matchType || m.match_type || 'POSSIBLE', Number(m.confidence || 0), Boolean(m.confirmed), m.royaltyPercentage == null ? null : Number(m.royaltyPercentage), m.source || provider, m.sourceReference || result.reference || null]);
+    }
+    return { scanId: scan.id, sha256, provider, status: result.status, confidence: Number(result.confidence || 0), matches: result.matches || [], reference: result.reference || null, disclaimer: 'Uma correspondência automática identifica uma possível relação; não determina sozinha a titularidade jurídica nem a percentagem de royalties.' };
+}
+app.post('/api/rights/scan-upload', auth, artistOnly, async (req, res) => {
+    try {
+        const key = normalizeStorageKey(req.body?.storageKey);
+        if (!key)
+            return res.status(400).json({ error: 'storageKey é obrigatório.' });
+        const trackId = req.body?.trackId ? String(req.body.trackId) : null;
+        if (trackId) {
+            const own = (await pool.query(`select t.id from tracks t join releases r on r.id=t.primary_release_id join artists a on a.id=r.primary_artist_id where t.id=$1 and a.user_id=$2`, [trackId, req.user.id])).rows[0];
+            if (!own)
+                return res.status(404).json({ error: 'Faixa não encontrada.' });
+        }
+        const result = await runRightsScan({ storageKey: key, trackId, userId: req.user.id });
+        res.json(result);
+    }
+    catch (e) {
+        console.error('rights scan error', e);
+        res.status(400).json({ error: e.message || 'Não foi possível verificar os direitos.' });
+    }
+});
+app.get('/api/tracks/:trackId/rights-scan', auth, artistOnly, async (req, res) => {
+    const own = (await pool.query(`select t.id from tracks t join releases r on r.id=t.primary_release_id join artists a on a.id=r.primary_artist_id where t.id=$1 and a.user_id=$2`, [req.params.trackId, req.user.id])).rows[0];
+    if (!own)
+        return res.status(404).json({ error: 'Faixa não encontrada.' });
+    const scan = (await pool.query(`select rs.*,coalesce(json_agg(json_build_object('holderName',rm.holder_name,'holderEmail',rm.holder_email,'country',rm.country,'rightCategory',rm.right_category,'isrc',rm.isrc,'iswc',rm.iswc,'ipi',rm.ipi,'catalogCode',rm.catalog_code,'matchType',rm.match_type,'confidence',rm.confidence,'confirmed',rm.confirmed,'royaltyPercentage',rm.royalty_percentage,'source',rm.source,'sourceReference',rm.source_reference) order by rm.created_at) filter(where rm.id is not null),'[]'::json) matches from rights_scans rs left join rights_matches rm on rm.scan_id=rs.id where rs.track_id=$1 group by rs.id order by rs.scanned_at desc limit 1`, [req.params.trackId])).rows[0];
+    res.json({ scan: scan || null });
+});
+app.post('/api/rights/matches/:matchId/confirm', auth, artistOnly, async (req, res) => {
+    const match = (await pool.query(`select rm.*,rs.track_id,t.primary_release_id from rights_matches rm join rights_scans rs on rs.id=rm.scan_id join tracks t on t.id=rs.track_id join releases r on r.id=t.primary_release_id join artists a on a.id=r.primary_artist_id where rm.id=$1 and a.user_id=$2`, [req.params.matchId, req.user.id])).rows[0];
+    if (!match)
+        return res.status(404).json({ error: 'Correspondência não encontrada.' });
+    const pct = Number(req.body?.royaltyPercentage ?? match.royalty_percentage);
+    if (!Number.isFinite(pct) || pct <= 0 || pct > 100)
+        return res.status(400).json({ error: 'Indica uma percentagem válida entre 0,01% e 100%. A confirmação deve ter base documental.' });
+    const client = await pool.connect();
+    try {
+        await client.query('begin');
+        await client.query(`update rights_matches set confirmed=true,royalty_percentage=$1 where id=$2`, [pct, match.id]);
+        let holderId = match.rights_holder_id || null;
+        if (!holderId) {
+            holderId = (await client.query(`insert into rights_holders(user_id,display_name,email) values(null,$1,$2) returning id`, [match.holder_name || 'Titular identificado', match.holder_email || null])).rows[0].id;
+        }
+        const code = `BRR-${new Date().getUTCFullYear()}-${randomToken(5).toUpperCase()}`;
+        const reservation = (await client.query(`insert into royalty_reservations(track_id,rights_match_id,holder_id,holder_name,holder_email,right_category,percentage,payout_code,monthly_period) values($1,$2,$3,$4,$5,$6,$7,$8,to_char(current_date,'YYYY-MM')) returning *`, [match.track_id, match.id, holderId, match.holder_name || 'Titular identificado', match.holder_email || null, match.right_category || 'OTHER', pct, code])).rows[0];
+        await client.query('commit');
+        await audit(req.user.id, 'RIGHTS_MATCH_CONFIRMED', 'TRACK', match.track_id, { matchId: match.id, percentage: pct, payoutCode: code });
+        res.json({ ok: true, reservation, warning: 'A reserva só deve ser paga após validação documental/contratual e regras de pagamento aplicáveis.' });
+    }
+    catch (e) {
+        await client.query('rollback');
+        console.error(e);
+        res.status(500).json({ error: 'Não foi possível criar a reserva de royalties.' });
+    }
+    finally {
+        client.release();
+    }
+});
+// ===== Direitos V10.4.8: splits, convites e perfis de recebimento =====
+app.get('/api/releases/:id/rights-v2', auth, artistOnly, async (req, res) => {
+    const release = (await pool.query(`select r.id from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`, [req.params.id, req.user.id])).rows[0];
+    if (!release)
+        return res.status(404).json({ error: 'Lançamento não encontrado' });
+    const q = await pool.query(`select tr.*,json_agg(json_build_object('id',rs.id,'name',rs.participant_name,'email',rs.participant_email,'role',rs.participant_role,'percentage',rs.percentage,'status',rs.status,'acceptedAt',rs.accepted_at) order by rs.created_at) filter (where rs.id is not null) splits from track_rights tr left join rights_splits rs on rs.track_right_id=tr.id join tracks t on t.id=tr.track_id where t.primary_release_id=$1 group by tr.id order by t.track_number,tr.right_category`, [release.id]);
+    res.json({ rights: q.rows });
+});
+app.post('/api/releases/:id/tracks/:trackId/rights-v2', auth, artistOnly, async (req, res) => {
+    const { mode = 'SOLE', legitimacyConfirmed = false, categories = [] } = req.body || {};
+    const release = (await pool.query(`select r.id,a.id artist_id from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`, [req.params.id, req.user.id])).rows[0];
+    const track = (await pool.query(`select id from tracks where id=$1 and primary_release_id=$2`, [req.params.trackId, release?.id])).rows[0];
+    if (!release || !track)
+        return res.status(404).json({ error: 'Faixa ou lançamento não encontrado' });
+    if (!['SOLE', 'SHARED'].includes(String(mode)))
+        return res.status(400).json({ error: 'Modo de direitos inválido' });
+    if (!legitimacyConfirmed)
+        return res.status(400).json({ error: 'Confirma que tens legitimidade para declarar estes direitos.' });
+    if (!Array.isArray(categories) || !categories.length)
+        return res.status(400).json({ error: 'Selecione pelo menos um tipo de direito.' });
+    const uniqueCats = [...new Set(categories.map((c) => String(c.category || '').toUpperCase()))];
+    if (uniqueCats.some(c => !RIGHTS_CATEGORIES.includes(c)))
+        return res.status(400).json({ error: 'Tipo de direito inválido.' });
+    const client = await pool.connect();
+    try {
+        await client.query('begin');
+        await client.query(`delete from track_rights where track_id=$1`, [track.id]);
+        await client.query(`delete from rights_declarations where track_id=$1`, [track.id]);
+        for (const category of uniqueCats) {
+            const input = categories.find((c) => String(c.category || '').toUpperCase() === category);
+            const splits = Array.isArray(input?.splits) ? input.splits : [];
+            if (!splits.length)
+                throw new Error(`O tipo ${category} precisa de pelo menos um titular.`);
+            let total = 0;
+            for (const sp of splits) {
+                const pct = Number(sp.percentage);
+                if (!Number.isFinite(pct) || pct < 0 || pct > 100)
+                    throw new Error('Cada split deve estar entre 0 e 100%.');
+                if (!String(sp.name || '').trim())
+                    throw new Error('O nome de cada participante é obrigatório.');
+                if (String(mode) === 'SHARED' && !String(sp.email || '').trim())
+                    throw new Error('No modo compartilhado, o email de cada participante é obrigatório para confirmação.');
+                total += pct;
+            }
+            if (Math.round(total * 100) / 100 !== 100)
+                throw new Error(`Os direitos de ${category} devem totalizar 100%. Atualmente: ${total}%.`);
+            const tr = (await client.query(`insert into track_rights(track_id,right_category,ownership_mode,legitimacy_confirmed,status,created_by) values($1,$2,$3,true,$4,$5) returning *`, [track.id, category, mode, mode === 'SOLE' ? 'LOCKED' : 'PENDING_ACCEPTANCE', req.user.id])).rows[0];
+            const agreementText = `BaBuLo Play — Declaração de direitos V10.4.8\nFaixa: ${track.id}\nCategoria: ${category}\nModo: ${mode}\nDeclarante: ${req.user.id}\nOs participantes e percentagens abaixo representam a declaração de direitos fornecida pelo titular/declarante. A utilização e remuneração ficam sujeitas aos direitos e autorizações legalmente aplicáveis. Versão: 1.`;
+            const contentHash = node_crypto_1.default.createHash('sha256').update(agreementText).digest('hex');
+            await client.query(`insert into rights_agreements(track_right_id,version,agreement_text,content_hash,created_by) values($1,1,$2,$3,$4)`, [tr.id, agreementText, contentHash, req.user.id]);
+            for (const sp of splits) {
+                const email = String(sp.email || '').trim().toLowerCase() || null;
+                const matched = email ? (await client.query(`select id from users where lower(email)=lower($1) limit 1`, [email])).rows[0] : null;
+                const isSelf = matched?.id === req.user.id;
+                const status = mode === 'SOLE' || isSelf ? 'LOCKED' : matched ? 'INVITED' : 'PENDING';
+                const rs = (await client.query(`insert into rights_splits(track_right_id,participant_user_id,participant_name,participant_email,participant_role,percentage,status,accepted_at,accepted_ip,accepted_user_agent,agreement_version,created_by) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,1,$11) returning *`, [tr.id, matched?.id || null, String(sp.name).trim(), email, String(sp.role || 'RIGHTS_HOLDER'), Number(sp.percentage), status, isSelf ? new Date() : null, isSelf ? String(req.ip || '') : null, isSelf ? String(req.headers['user-agent'] || '') : null, req.user.id])).rows[0];
+                await client.query(`insert into rights_declarations(release_id,track_id,party_name,party_role,right_type,percentage,territory,status,created_by) values($1,$2,$3,$4,$5,$6,'WORLDWIDE',$7,$8)`, [release.id, track.id, String(sp.name).trim(), String(sp.role || 'RIGHTS_HOLDER'), category, Number(sp.percentage), status === 'LOCKED' ? 'PENDING' : 'PENDING', req.user.id]);
+                if (mode === 'SHARED' && !isSelf && email) {
+                    const raw = randomToken();
+                    await client.query(`insert into rights_invitations(rights_split_id,invite_email,token_hash,status,sent_at,expires_at,created_by) values($1,$2,$3,'PENDING',now(),now()+interval '30 days',$4)`, [rs.id, email, hashToken(raw), req.user.id]);
+                    // O convite é enviado quando o provedor de email está configurado; o link também fica disponível na resposta para ambientes sem email.
+                    try {
+                        await sendEmail(email, 'Convite de participação — BaBuLo Play', `Foste indicado como ${String(sp.role || 'titular')} na faixa ${track.id}, com ${Number(sp.percentage)}%. Confirma ou recusa a participação na tua conta BaBuLo Play. Link: ${publicWebUrl('/', raw).replace('?token=', '?rightsInvite=')}`);
+                    }
+                    catch { }
+                }
+            }
+        }
+        await client.query('commit');
+        await audit(req.user.id, 'RIGHTS_SPLITS_SAVED', 'RIGHTS', track.id, { releaseId: release.id, mode, categories: uniqueCats });
+        res.status(201).json({ ok: true, message: 'Declaração de direitos guardada.', mode, categories: uniqueCats });
+    }
+    catch (e) {
+        await client.query('rollback');
+        res.status(400).json({ error: e?.message || 'Não foi possível guardar os direitos.' });
+    }
+    finally {
+        client.release();
+    }
+});
+app.get('/api/rights/invitations', auth, async (req, res) => {
+    const email = (await pool.query(`select email from users where id=$1`, [req.user.id])).rows[0]?.email;
+    if (!email)
+        return res.json({ invitations: [] });
+    const q = await pool.query(`select ri.id,ri.status,ri.expires_at,rs.id split_id,rs.participant_name,rs.participant_role,rs.percentage,tr.right_category,t.id track_id,t.title track_title,r.id release_id,r.title release_title from rights_invitations ri join rights_splits rs on rs.id=ri.rights_split_id join track_rights tr on tr.id=rs.track_right_id join tracks t on t.id=tr.track_id join releases r on r.id=t.primary_release_id where lower(ri.invite_email)=lower($1) and ri.status='PENDING' and (ri.expires_at is null or ri.expires_at>now()) order by ri.created_at desc`, [email]);
+    res.json({ invitations: q.rows });
+});
+app.post('/api/rights/invitations/:id/respond', auth, async (req, res) => {
+    const { decision } = req.body || {};
+    if (!['ACCEPTED', 'REJECTED'].includes(String(decision)))
+        return res.status(400).json({ error: 'Resposta inválida.' });
+    const u = (await pool.query(`select email from users where id=$1`, [req.user.id])).rows[0];
+    const q = await pool.query(`select ri.*,rs.id split_id,rs.participant_user_id,rs.track_right_id from rights_invitations ri join rights_splits rs on rs.id=ri.rights_split_id where ri.id=$1 and lower(ri.invite_email)=lower($2) and ri.status='PENDING' and (ri.expires_at is null or ri.expires_at>now())`, [req.params.id, u?.email || '']);
+    if (!q.rows[0])
+        return res.status(404).json({ error: 'Convite não encontrado ou expirado.' });
+    const inv = q.rows[0];
+    const client = await pool.connect();
+    try {
+        await client.query('begin');
+        await client.query(`update rights_invitations set status=$1,accepted_at=case when $1='ACCEPTED' then now() else null end where id=$2`, [decision, inv.id]);
+        await client.query(`update rights_splits set participant_user_id=$1,status=$2,accepted_at=case when $2='ACCEPTED' then now() else null end,accepted_ip=$3,accepted_user_agent=$4,updated_at=now() where id=$5`, [req.user.id, decision, String(req.ip || ''), String(req.headers['user-agent'] || ''), inv.split_id]);
+        await client.query(`update track_rights set status=case when $1='ACCEPTED' and not exists(select 1 from rights_splits where track_right_id=$2 and status not in ('ACCEPTED','LOCKED')) then 'ACCEPTED' when $1='REJECTED' then 'REJECTED' else 'PENDING_ACCEPTANCE' end,updated_at=now() where id=$2`, [decision, inv.track_right_id]);
+        await client.query('commit');
+        await audit(req.user.id, decision === 'ACCEPTED' ? 'RIGHT_INVITE_ACCEPTED' : 'RIGHT_INVITE_REJECTED', 'RIGHTS', inv.split_id, { invitationId: inv.id });
+        res.json({ ok: true, status: decision });
+    }
+    catch (e) {
+        await client.query('rollback');
+        res.status(500).json({ error: 'Não foi possível registar a resposta.' });
+    }
+    finally {
+        client.release();
+    }
+});
+app.post('/api/rights/splits/:id/change-request', auth, async (req, res) => {
+    const { newPercentage, reason } = req.body || {};
+    const pct = Number(newPercentage);
+    if (!Number.isFinite(pct) || pct < 0 || pct > 100)
+        return res.status(400).json({ error: 'Percentagem inválida.' });
+    const q = await pool.query(`select rs.*,tr.created_by as owner_id from rights_splits rs join track_rights tr on tr.id=rs.track_right_id where rs.id=$1 and (rs.participant_user_id=$2 or tr.created_by=$2)`, [req.params.id, req.user.id]);
+    if (!q.rows[0])
+        return res.status(404).json({ error: 'Split não encontrado.' });
+    const row = q.rows[0];
+    if (row.status !== 'ACCEPTED' && row.status !== 'LOCKED')
+        return res.status(409).json({ error: 'Este split ainda não está confirmado.' });
+    await pool.query(`insert into rights_change_requests(rights_split_id,old_percentage,new_percentage,reason,requested_by,request_ip) values($1,$2,$3,$4,$5,$6)`, [row.id, Number(row.percentage), pct, String(reason || '').slice(0, 1000), req.user.id, String(req.ip || '')]);
+    await pool.query(`update rights_splits set status='CHANGE_PENDING',updated_at=now() where id=$1`, [row.id]);
+    await audit(req.user.id, 'RIGHT_CHANGE_REQUESTED', 'RIGHTS', row.id, { oldPercentage: Number(row.percentage), newPercentage: pct });
+    res.json({ ok: true, status: 'CHANGE_PENDING' });
+});
+app.get('/api/artists/me/payout-account', auth, artistOnly, async (req, res) => {
+    const q = await pool.query(`select id,payout_method,bank_name,account_holder,currency,verified,updated_at,case when iban_enc is not null then true else false end has_iban,case when account_number_enc is not null then true else false end has_account_number,case when multicaixa_phone_enc is not null then true else false end has_multicaixa from royalty_payout_accounts where user_id=$1`, [req.user.id]);
+    res.json({ account: q.rows[0] || null });
+});
+app.put('/api/artists/me/payout-account', auth, artistOnly, async (req, res) => {
+    const { payoutMethod, bankName, iban, accountNumber, accountHolder, multicaixaPhone } = req.body || {};
+    if (!['BANK', 'MULTICAIXA_EXPRESS'].includes(String(payoutMethod)))
+        return res.status(400).json({ error: 'Método de pagamento inválido.' });
+    if (!String(accountHolder || '').trim())
+        return res.status(400).json({ error: 'O titular da conta é obrigatório.' });
+    if (payoutMethod === 'BANK' && !String(bankName || '').trim())
+        return res.status(400).json({ error: 'Informe o banco.' });
+    if (payoutMethod === 'BANK' && !String(iban || accountNumber || '').trim())
+        return res.status(400).json({ error: 'Informe IBAN ou número da conta.' });
+    if (payoutMethod === 'MULTICAIXA_EXPRESS' && !String(multicaixaPhone || '').trim())
+        return res.status(400).json({ error: 'Informe o número do Multicaixa Express.' });
+    const encIban = iban ? encryptSecret(String(iban).trim()) : null, encAcc = accountNumber ? encryptSecret(String(accountNumber).trim()) : null, encMx = multicaixaPhone ? encryptSecret(String(multicaixaPhone).trim()) : null;
+    const q = await pool.query(`insert into royalty_payout_accounts(user_id,payout_method,multicaixa_phone_enc,bank_name,iban_enc,account_number_enc,account_holder,verified) values($1,$2,$3,$4,$5,$6,$7,false) on conflict(user_id) do update set payout_method=excluded.payout_method,multicaixa_phone_enc=coalesce(excluded.multicaixa_phone_enc,royalty_payout_accounts.multicaixa_phone_enc),bank_name=excluded.bank_name,iban_enc=coalesce(excluded.iban_enc,royalty_payout_accounts.iban_enc),account_number_enc=coalesce(excluded.account_number_enc,royalty_payout_accounts.account_number_enc),account_holder=excluded.account_holder,verified=false,updated_at=now() returning id,payout_method,bank_name,account_holder,currency,verified`, [req.user.id, payoutMethod, encMx, bankName || null, encIban, encAcc, String(accountHolder).trim()]);
+    await audit(req.user.id, 'PAYOUT_ACCOUNT_UPDATED', 'PAYOUT_ACCOUNT', q.rows[0].id, { method: payoutMethod });
+    res.json({ account: q.rows[0], message: 'Perfil de recebimento guardado. A verificação financeira será feita antes de pagamentos.' });
 });
 // ===== Direitos e aprovação =====
 app.get('/api/releases/:id/rights', auth, async (req, res) => {
@@ -460,9 +1122,25 @@ app.post('/api/releases/:id/rights', auth, artistOnly, async (req, res) => {
         if (!t)
             return res.status(400).json({ error: 'Faixa não pertence a este lançamento' });
     }
-    const q = await pool.query(`insert into rights_declarations(release_id,track_id,party_name,party_role,right_type,percentage,territory,valid_from,valid_to,document_url,created_by) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning *`, [release.id, trackId || null, partyName, partyRole, rightType, pct, territory, validFrom || null, validTo || null, documentUrl || null, req.user.id]);
+    const q = await pool.query(`insert into rights_declarations(release_id,track_id,party_name,party_role,right_type,percentage,territory,valid_from,valid_to,document_url,created_by) values($1::uuid,$2::uuid,$3::text,$4::text,$5::text,$6::numeric,$7::text,$8::date,$9::date,$10::text,$11::uuid) returning *`, [release.id, trackId || null, partyName, partyRole, rightType, pct, territory, validFrom || null, validTo || null, documentUrl || null, req.user.id]);
     await audit(req.user.id, 'RIGHT_CREATED', 'RIGHTS', q.rows[0].id, { releaseId: release.id });
     res.status(201).json({ right: q.rows[0] });
+});
+app.put('/api/releases/:id/rights/:rightId', auth, artistOnly, async (req, res) => {
+    const { partyName, partyRole = 'RIGHTS_HOLDER', rightType = 'STREAMING', percentage, territory = 'WORLDWIDE' } = req.body || {};
+    const release = (await pool.query(`select r.id from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`, [req.params.id, req.user.id])).rows[0];
+    if (!release)
+        return res.status(404).json({ error: 'Lançamento não encontrado' });
+    if (!partyName || percentage === undefined)
+        return res.status(400).json({ error: 'Nome do titular e percentagem são obrigatórios' });
+    const pct = Number(percentage);
+    if (!Number.isFinite(pct) || pct < 0 || pct > 100)
+        return res.status(400).json({ error: 'A percentagem deve estar entre 0 e 100' });
+    const q = await pool.query(`update rights_declarations set party_name=$1,party_role=$2,right_type=$3,percentage=$4,territory=$5 where id=$6 and release_id=$7 returning *`, [String(partyName).trim(), partyRole, rightType, pct, territory, req.params.rightId, release.id]);
+    if (!q.rows[0])
+        return res.status(404).json({ error: 'Declaração de direitos não encontrada' });
+    await audit(req.user.id, 'RIGHT_UPDATED', 'RIGHTS', q.rows[0].id, { releaseId: release.id });
+    res.json({ right: q.rows[0] });
 });
 app.delete('/api/releases/:id/rights/:rightId', auth, artistOnly, async (req, res) => {
     const q = await pool.query(`delete from rights_declarations rd using releases r,artists a where rd.id=$1 and rd.release_id=r.id and r.primary_artist_id=a.id and r.id=$2 and a.user_id=$3 returning rd.id`, [req.params.rightId, req.params.id, req.user.id]);
@@ -480,21 +1158,29 @@ app.post('/api/releases/:id/submit-approval', auth, artistOnly, async (req, res)
     const paid = (await pool.query(`select id from payment_transactions where release_id=$1 and service_type='DISTRIBUTION' and status='PAID' order by paid_at desc limit 1`, [release.id])).rows[0];
     if (!paid)
         return res.status(402).json({ error: 'O pagamento deste lançamento ainda não foi confirmado. O lançamento permanece em rascunho até o pagamento ser confirmado.' });
-    const rights = (await pool.query(`select right_type,territory,coalesce(track_id,'00000000-0000-0000-0000-000000000000') track_key,sum(percentage) total from rights_declarations where release_id=$1 and status='PENDING' group by right_type,territory,track_id`, [release.id])).rows;
-    if (!rights.length)
-        return res.status(400).json({ error: 'Declare pelo menos um titular de direitos antes de submeter.' });
-    const invalid = rights.find((r) => Number(r.total) !== 100);
-    if (invalid)
-        return res.status(400).json({ error: `Os direitos de ${invalid.right_type} (${invalid.territory}) devem totalizar 100%. Atualmente: ${Number(invalid.total)}%.` });
+    const v2 = (await pool.query(`select tr.id,tr.right_category,tr.status,sum(rs.percentage) total,count(*) split_count from track_rights tr join tracks t on t.id=tr.track_id left join rights_splits rs on rs.track_right_id=tr.id where t.primary_release_id=$1 group by tr.id,tr.right_category,tr.status`, [release.id])).rows;
+    if (v2.length) {
+        const invalid = v2.find((r) => Number(r.total) !== 100 || !['ACCEPTED', 'LOCKED'].includes(String(r.status)));
+        if (invalid)
+            return res.status(400).json({ error: `Os direitos de ${invalid.right_category} precisam totalizar 100% e estar confirmados. Total: ${Number(invalid.total)}%, estado: ${invalid.status}.` });
+    }
+    else {
+        const rights = (await pool.query(`select right_type,territory,coalesce(track_id,'00000000-0000-0000-0000-000000000000') track_key,sum(percentage) total from rights_declarations where release_id=$1 and status='PENDING' group by right_type,territory,track_id`, [release.id])).rows;
+        if (!rights.length)
+            return res.status(400).json({ error: 'Declare pelo menos um titular de direitos antes de submeter.' });
+        const invalid = rights.find((r) => Number(r.total) !== 100);
+        if (invalid)
+            return res.status(400).json({ error: `Os direitos de ${invalid.right_type} (${invalid.territory}) devem totalizar 100%. Atualmente: ${Number(invalid.total)}%.` });
+    }
     await pool.query(`update releases set status='PENDING_APPROVAL',review_reason=null where id=$1`, [release.id]);
     await audit(req.user.id, 'RELEASE_SUBMITTED', 'RELEASE', release.id, { status: 'PENDING_APPROVAL' });
     res.json({ ok: true, status: 'PENDING_APPROVAL' });
 });
-app.get('/api/admin/releases/pending', auth, adminOnly, async (req, res) => {
+app.get('/api/admin/releases/pending', auth, requireAdminPermission('RELEASES'), async (req, res) => {
     const q = await pool.query(`select r.id,r.title,r.type,r.status,r.preflight_status,r.submitted_at,r.cover_url,a.stage_name from releases r join artists a on a.id=r.primary_artist_id where r.status='PENDING_APPROVAL' order by r.submitted_at asc nulls last`);
     res.json({ releases: q.rows });
 });
-app.get('/api/admin/releases/:id', auth, adminOnly, async (req, res) => {
+app.get('/api/admin/releases/:id', auth, requireAdminPermission('RELEASES'), async (req, res) => {
     const release = (await pool.query(`select r.*,a.stage_name from releases r join artists a on a.id=r.primary_artist_id where r.id=$1`, [req.params.id])).rows[0];
     if (!release)
         return res.status(404).json({ error: 'Lançamento não encontrado' });
@@ -502,7 +1188,7 @@ app.get('/api/admin/releases/:id', auth, adminOnly, async (req, res) => {
     const rights = (await pool.query(`select * from rights_declarations where release_id=$1 order by created_at`, [release.id])).rows;
     res.json({ release, tracks, rights });
 });
-app.post('/api/admin/releases/:id/decision', auth, adminOnly, async (req, res) => {
+app.post('/api/admin/releases/:id/decision', auth, requireAdminPermission('RELEASES'), async (req, res) => {
     const { decision, reason } = req.body || {};
     if (!['APPROVED', 'REJECTED'].includes(decision))
         return res.status(400).json({ error: 'Decisão inválida' });
@@ -540,11 +1226,11 @@ app.post('/api/copyright-complaints', async (req, res) => {
     await audit(undefined, 'COPYRIGHT_COMPLAINT_CREATED', 'COPYRIGHT_COMPLAINT', q.rows[0].id, { releaseId: releaseId || null, trackId: trackId || null });
     res.status(201).json({ complaint: q.rows[0] });
 });
-app.get('/api/admin/copyright-complaints', auth, adminOnly, async (_req, res) => {
+app.get('/api/admin/copyright-complaints', auth, requireAdminPermission('MODERATION'), async (_req, res) => {
     const q = await pool.query(`select c.*,r.title release_title,t.title track_title from copyright_complaints c left join releases r on r.id=c.release_id left join tracks t on t.id=c.track_id order by c.created_at desc`);
     res.json({ complaints: q.rows });
 });
-app.post('/api/admin/copyright-complaints/:id/decision', auth, adminOnly, async (req, res) => {
+app.post('/api/admin/copyright-complaints/:id/decision', auth, requireAdminPermission('MODERATION'), async (req, res) => {
     const { decision, reason } = req.body || {};
     if (!['SUSPEND', 'REJECT', 'RESOLVE', 'REACTIVATE', 'REMOVE'].includes(decision))
         return res.status(400).json({ error: 'Decisão de reclamação inválida' });
@@ -576,11 +1262,204 @@ app.post('/api/admin/copyright-complaints/:id/decision', auth, adminOnly, async 
         client.release();
     }
 });
-app.get('/api/admin/audit-logs', auth, adminOnly, async (_req, res) => {
-    const q = await pool.query(`select al.*,u.email actor_email from audit_logs al left join users u on u.id=al.actor_user_id order by al.created_at desc limit 200`);
+// ===== V10.4.2: Gestão de utilizadores, artistas e equipa =====
+const ACCOUNT_STATUSES = ['ACTIVE', 'SUSPENDED', 'BLOCKED'];
+const VERIFICATION_STATUSES = ['UNVERIFIED', 'PENDING', 'VERIFIED', 'REJECTED'];
+app.get('/api/admin/users', auth, requireAnyAdminPermission(['USERS', 'ARTISTS', 'TEAM']), async (req, res) => {
+    const qtext = String(req.query.q || '').trim();
+    const role = String(req.query.role || '').trim().toUpperCase();
+    const status = String(req.query.status || '').trim().toUpperCase();
+    const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 200);
+    const params = [];
+    const where = [];
+    if (qtext) {
+        params.push(`%${qtext}%`);
+        where.push(`(coalesce(u.email,'') ilike $${params.length} or coalesce(u.phone,'') ilike $${params.length} or coalesce(a.stage_name,'') ilike $${params.length})`);
+    }
+    if (['LISTENER', 'ARTIST', 'ADMIN', 'OWNER'].includes(role)) {
+        params.push(role);
+        where.push(`u.role=$${params.length}`);
+    }
+    if (ACCOUNT_STATUSES.includes(status)) {
+        params.push(status);
+        where.push(`u.status=$${params.length}`);
+    }
+    params.push(limit);
+    const sql = `select u.id,u.phone,u.role,u.status,u.email_verified,u.phone_verified,u.admin_title,u.admin_permissions,u.full_name,u.birth_date,u.gender,u.height_cm,u.education,u.address,u.marital_status,u.profile_photo_url,u.created_at,u.updated_at,
+    a.id artist_id,a.stage_name,a.country,a.city,a.photo_url,a.verification_status,a.status artist_status,
+    (select count(*)::int from releases r where r.primary_artist_id=a.id) release_count,
+    (select count(*)::int from stream_events se join tracks t on t.id=se.track_id where t.primary_release_id in (select r2.id from releases r2 where r2.primary_artist_id=a.id) and se.is_valid=true) valid_streams
+    from users u left join artists a on a.user_id=u.id ${where.length ? 'where ' + where.join(' and ') : ''}
+    order by case when u.role='OWNER' then 0 when u.role='ADMIN' then 1 when u.role='ARTIST' then 2 else 3 end,u.created_at desc limit $${params.length}`;
+    const rows = (await pool.query(sql, params)).rows;
+    res.json({ users: rows });
+});
+app.get('/api/admin/users/:id', auth, requireAnyAdminPermission(['USERS', 'ARTISTS', 'TEAM']), async (req, res) => {
+    const user = (await pool.query(`select id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,gender,height_cm,education,address,marital_status,profile_photo_url,admin_title,admin_permissions,created_at,updated_at from users where id=$1`, [req.params.id])).rows[0];
+    if (!user)
+        return res.status(404).json({ error: 'Utilizador não encontrado' });
+    const artist = (await pool.query(`select id,stage_name,legal_name,bio,country,city,photo_url,verification_status,status,created_at from artists where user_id=$1`, [req.params.id])).rows[0] || null;
+    const releases = artist ? (await pool.query(`select id,title,type,status,preflight_status,submitted_at,reviewed_at,review_reason,created_at from releases where primary_artist_id=$1 order by created_at desc limit 100`, [artist.id])).rows : [];
+    const withdrawals = artist ? (await pool.query(`select id,amount,currency,method,status,rejection_reason,created_at,reviewed_at from withdrawals where artist_id=$1 order by created_at desc limit 50`, [artist.id])).rows : [];
+    const streamStats = artist ? (await pool.query(`select count(*) filter(where se.is_valid=true)::int valid_streams,count(distinct se.listener_key) filter(where se.is_valid=true)::int unique_listeners from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where r.primary_artist_id=$1`, [artist.id])).rows[0] : null;
+    const listenerStats = !artist ? (await pool.query(`select count(*) filter(where se.is_valid=true)::int valid_streams,count(distinct se.listener_key) filter(where se.is_valid=true)::int unique_listeners from stream_events se where se.user_id=$1`, [req.params.id])).rows[0] : null;
+    const sessions = (await pool.query(`select id,created_at,last_activity_at,revoked_at from auth_sessions where user_id=$1 order by created_at desc limit 20`, [req.params.id])).rows;
+    const logs = (await pool.query(`select al.id,al.action,al.entity_type,al.entity_id,al.details,al.created_at,u.role actor_role,u.full_name actor_name from audit_logs al left join users u on u.id=al.actor_user_id where al.entity_id=$1 or al.actor_user_id=$1 order by al.created_at desc limit 50`, [req.params.id])).rows;
+    res.json({ user, artist, releases, withdrawals, streamStats: streamStats || listenerStats || { valid_streams: 0, unique_listeners: 0 }, sessions, logs });
+});
+app.post('/api/admin/users/:id/status', auth, requireAnyAdminPermission(['USERS', 'ARTISTS', 'TEAM']), async (req, res) => {
+    const status = String(req.body?.status || '').toUpperCase();
+    if (!ACCOUNT_STATUSES.includes(status))
+        return res.status(400).json({ error: 'Estado de conta inválido' });
+    if (req.params.id === req.user.id)
+        return res.status(400).json({ error: 'Não podes alterar o estado da tua própria conta.' });
+    const target = (await pool.query(`select id,role,status from users where id=$1`, [req.params.id])).rows[0];
+    if (!target)
+        return res.status(404).json({ error: 'Utilizador não encontrado' });
+    if (target.role === 'OWNER')
+        return res.status(403).json({ error: 'A conta OWNER é protegida e não pode ser bloqueada por este painel.' });
+    if (target.role === 'ADMIN' && req.user.role !== 'OWNER')
+        return res.status(403).json({ error: 'Apenas o OWNER pode alterar o estado de uma conta ADMIN.' });
+    const q = await pool.query(`update users set status=$1,updated_at=now() where id=$2 returning id,email,phone,role,status`, [status, target.id]);
+    await audit(req.user.id, `USER_STATUS_${status}`, 'USER', target.id, { from: target.status, to: status });
+    res.json({ ok: true, user: q.rows[0] });
+});
+app.post('/api/admin/artists/:id/verification', auth, requireAdminPermission('ARTISTS'), async (req, res) => {
+    const verificationStatus = String(req.body?.verificationStatus || '').toUpperCase();
+    if (!VERIFICATION_STATUSES.includes(verificationStatus))
+        return res.status(400).json({ error: 'Estado de verificação inválido' });
+    const artist = (await pool.query(`select id,user_id,stage_name,verification_status from artists where id=$1`, [req.params.id])).rows[0];
+    if (!artist)
+        return res.status(404).json({ error: 'Artista não encontrado' });
+    const q = await pool.query(`update artists set verification_status=$1 where id=$2 returning id,stage_name,verification_status`, [verificationStatus, artist.id]);
+    await audit(req.user.id, 'ARTIST_VERIFICATION_UPDATED', 'ARTIST', artist.id, { from: artist.verification_status, to: verificationStatus });
+    res.json({ ok: true, artist: q.rows[0] });
+});
+app.delete('/api/owner/admins/:id', auth, async (req, res) => {
+    if (req.user?.role !== 'OWNER')
+        return res.status(403).json({ error: 'Apenas o OWNER pode apagar contas ADMIN.' });
+    const target = (await pool.query(`select id,email,role,status,admin_title from users where id=$1`, [req.params.id])).rows[0];
+    if (!target)
+        return res.status(404).json({ error: 'ADMIN não encontrado' });
+    if (target.role !== 'ADMIN')
+        return res.status(400).json({ error: 'Só é possível apagar contas ADMIN por esta operação.' });
+    if (target.id === req.user.id)
+        return res.status(400).json({ error: 'Não podes apagar a tua própria conta.' });
+    await audit(req.user.id, 'ADMIN_DELETED', 'USER', target.id, { email: target.email, adminTitle: target.admin_title, status: target.status });
+    await pool.query("delete from users where id=$1 and role='ADMIN'", [target.id]);
+    res.json({ ok: true, message: 'Conta ADMIN apagada com sucesso.' });
+});
+app.patch('/api/owner/admins/:id', auth, async (req, res) => {
+    if (req.user?.role !== 'OWNER')
+        return res.status(403).json({ error: 'Apenas o OWNER pode alterar funções de ADMIN.' });
+    const target = (await pool.query(`select id,role,admin_title,admin_permissions from users where id=$1`, [req.params.id])).rows[0];
+    if (!target)
+        return res.status(404).json({ error: 'ADMIN não encontrado' });
+    if (target.role !== 'ADMIN')
+        return res.status(400).json({ error: 'Só é possível alterar funções de contas ADMIN.' });
+    const adminTitle = String(req.body?.adminTitle || 'Administrador').trim().slice(0, 100) || 'Administrador';
+    const fullName = String(req.body?.fullName || '').trim().slice(0, 160) || null;
+    const phone = String(req.body?.phone || '').trim().slice(0, 40) || null;
+    const birthDate = String(req.body?.birthDate || '').trim() || null;
+    const gender = String(req.body?.gender || '').trim().slice(0, 40) || null;
+    const heightCm = req.body?.heightCm === '' || req.body?.heightCm == null ? null : Number(req.body.heightCm);
+    const education = String(req.body?.education || '').trim().slice(0, 240) || null;
+    const address = String(req.body?.address || '').trim().slice(0, 500) || null;
+    const maritalStatus = String(req.body?.maritalStatus || '').trim().slice(0, 60) || null;
+    const profilePhotoUrl = String(req.body?.profilePhotoUrl || '').trim().slice(0, 1000) || null;
+    if (birthDate && !/^\d{4}-\d{2}-\d{2}$/.test(birthDate))
+        return res.status(400).json({ error: 'Data de nascimento inválida.' });
+    if (heightCm !== null && (!Number.isFinite(heightCm) || heightCm < 110 || heightCm > 220))
+        return res.status(400).json({ error: 'Altura inválida. Deve estar entre 1,10 m e 2,20 m.' });
+    const permissions = Array.isArray(req.body?.permissions) ? req.body.permissions.filter((p) => ADMIN_PERMISSIONS.includes(String(p))) : [];
+    if (!permissions.length)
+        return res.status(400).json({ error: 'Selecione pelo menos uma função/permissão.' });
+    const q = await pool.query(`update users set admin_title=$1,admin_permissions=$2::jsonb,full_name=$3,phone=$4,birth_date=$5,gender=$6,height_cm=$7,education=$8,address=$9,marital_status=$10,profile_photo_url=$11,updated_at=now() where id=$12 and role='ADMIN' returning id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,gender,height_cm,education,address,marital_status,profile_photo_url,admin_title,admin_permissions,created_at,updated_at`, [adminTitle, JSON.stringify(permissions), fullName, phone, birthDate, gender, heightCm, education, address, maritalStatus, profilePhotoUrl, target.id]);
+    await pool.query(`update auth_sessions set revoked_at=now() where user_id=$1 and revoked_at is null`, [target.id]);
+    await audit(req.user.id, 'ADMIN_ROLE_UPDATED', 'USER', target.id, { fromTitle: target.admin_title, toTitle: adminTitle, fromPermissions: target.admin_permissions, toPermissions: permissions });
+    res.json({ ok: true, user: q.rows[0], message: 'Função e permissões atualizadas. O ADMIN deverá iniciar uma nova sessão.' });
+});
+app.patch('/api/admin/me/profile', auth, async (req, res) => {
+    if (req.user?.role !== 'ADMIN')
+        return res.status(403).json({ error: 'Apenas ADMIN pode atualizar o próprio perfil por esta rota.' });
+    const fullName = String(req.body?.fullName || '').trim().slice(0, 160) || null;
+    const phone = String(req.body?.phone || '').trim().slice(0, 40) || null;
+    const birthDate = String(req.body?.birthDate || '').trim() || null;
+    const gender = String(req.body?.gender || '').trim().slice(0, 40) || null;
+    const heightCm = req.body?.heightCm === '' || req.body?.heightCm == null ? null : Number(req.body.heightCm);
+    const education = String(req.body?.education || '').trim().slice(0, 240) || null;
+    const address = String(req.body?.address || '').trim().slice(0, 500) || null;
+    const maritalStatus = String(req.body?.maritalStatus || '').trim().slice(0, 60) || null;
+    const profilePhotoUrl = String(req.body?.profilePhotoUrl || '').trim().slice(0, 1000) || null;
+    if (birthDate && !/^\d{4}-\d{2}-\d{2}$/.test(birthDate))
+        return res.status(400).json({ error: 'Data de nascimento inválida.' });
+    if (heightCm !== null && (!Number.isFinite(heightCm) || heightCm < 110 || heightCm > 220))
+        return res.status(400).json({ error: 'Altura inválida. Deve estar entre 1,10 m e 2,20 m.' });
+    try {
+        const q = await pool.query(`update users set full_name=$1,phone=$2,birth_date=$3,gender=$4,height_cm=$5,education=$6,address=$7,marital_status=$8,profile_photo_url=$9,updated_at=now() where id=$10 and role='ADMIN' returning id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,gender,height_cm,education,address,marital_status,profile_photo_url,admin_title,admin_permissions,created_at,updated_at`, [fullName, phone, birthDate, gender, heightCm, education, address, maritalStatus, profilePhotoUrl, req.user.id]);
+        if (!q.rows[0])
+            return res.status(404).json({ error: 'ADMIN não encontrado' });
+        await audit(req.user.id, 'ADMIN_PROFILE_UPDATED', 'USER', req.user.id, { phoneChanged: Boolean(phone), profileFields: ['full_name', 'phone', 'birth_date', 'gender', 'height_cm', 'education', 'address', 'marital_status', 'profile_photo_url'] });
+        res.json({ ok: true, user: q.rows[0] });
+    }
+    catch (e) {
+        res.status(e.code === '23505' ? 409 : 500).json({ error: e.code === '23505' ? 'Este telefone já está registado.' : 'Não foi possível atualizar o perfil.' });
+    }
+});
+app.post('/api/owner/admins', auth, async (req, res) => {
+    if (req.user?.role !== 'OWNER')
+        return res.status(403).json({ error: 'Apenas o OWNER pode criar contas ADMIN.' });
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+    const adminTitle = String(req.body?.adminTitle || 'Administrador').trim().slice(0, 100) || 'Administrador';
+    const fullName = String(req.body?.fullName || '').trim().slice(0, 160) || null;
+    const phone = String(req.body?.phone || '').trim().slice(0, 40) || null;
+    const birthDate = String(req.body?.birthDate || '').trim() || null;
+    if (birthDate && !/^\d{4}-\d{2}-\d{2}$/.test(birthDate))
+        return res.status(400).json({ error: 'Data de nascimento inválida.' });
+    const permissions = Array.isArray(req.body?.permissions) ? req.body.permissions.filter((p) => ADMIN_PERMISSIONS.includes(String(p))) : [];
+    if (!/^\S+@\S+\.\S+$/.test(email))
+        return res.status(400).json({ error: 'Informe um email válido.' });
+    if (password.length < 12)
+        return res.status(400).json({ error: 'A palavra-passe do ADMIN deve ter pelo menos 12 caracteres.' });
+    if (!permissions.length)
+        return res.status(400).json({ error: 'Selecione pelo menos uma função para o ADMIN.' });
+    const duplicate = (await pool.query(`select id from users where lower(email)=lower($1) limit 1`, [email])).rows[0];
+    if (duplicate)
+        return res.status(409).json({ error: 'Este email já está registado.' });
+    const q = await pool.query(`insert into users(email,phone,password_hash,role,status,email_verified,full_name,birth_date,admin_title,admin_permissions) values($1,$2,$3,'ADMIN','ACTIVE',false,$4,$5,$6,$7::jsonb) returning id,email,phone,role,status,full_name,birth_date,admin_title,admin_permissions,created_at`, [email, phone, hashPassword(password), fullName, birthDate, adminTitle, JSON.stringify(permissions)]);
+    const raw = randomToken();
+    await pool.query(`insert into auth_email_tokens(id,user_id,token_hash,type,expires_at) values($1,$2,$3,'VERIFY_EMAIL',now()+interval '24 hours')`, [node_crypto_1.default.randomUUID(), q.rows[0].id, hashToken(raw)]);
+    await sendEmail(email, 'Ativação da conta ADMIN — BaBuLo Play', `A tua conta de administrador foi criada. Confirma o teu email neste link (válido por 24 horas): ${publicWebUrl('/', raw).replace('?token=', '?verify=')}`);
+    await audit(req.user.id, 'ADMIN_CREATED', 'USER', q.rows[0].id, { email, adminTitle, permissions });
+    res.status(201).json({ ok: true, user: q.rows[0], requiresEmailVerification: true });
+});
+app.get('/api/admin/audit-logs', auth, requireAdminPermission('SECURITY'), async (_req, res) => {
+    const q = await pool.query(`select al.*,u.role actor_role,u.full_name actor_name from audit_logs al left join users u on u.id=al.actor_user_id order by al.created_at desc limit 200`);
     res.json({ logs: q.rows });
 });
 // ===== Streaming events + Royalty Engine =====
+function firstHeader(req, names) {
+    for (const name of names) {
+        const value = req.headers[name.toLowerCase()];
+        if (typeof value === 'string' && value.trim())
+            return value.split(',')[0].trim();
+    }
+    return null;
+}
+function safeGeo(value) {
+    if (!value)
+        return null;
+    try {
+        value = decodeURIComponent(value);
+    }
+    catch { }
+    return value.replace(/[\x00-\x1f<>]/g, '').trim().slice(0, 120) || null;
+}
+function listenerKey(userId, sessionId) {
+    const raw = userId ? `user:${userId}` : (sessionId ? `session:${sessionId}` : `anon:${node_crypto_1.default.randomUUID()}`);
+    return node_crypto_1.default.createHash('sha256').update(raw + '|' + JWT_SECRET).digest('hex');
+}
 app.post('/api/streams/events', async (req, res) => {
     const { trackId, eventType = 'PLAY_30S', playedSeconds = 0, sessionId } = req.body || {};
     if (!trackId)
@@ -591,8 +1470,76 @@ app.post('/api/streams/events', async (req, res) => {
     const validEvents = ['PLAY_30S', 'COMPLETED'];
     const isValid = validEvents.includes(String(eventType)) && Number(playedSeconds) >= 30;
     const userIdHeader = req.headers['x-user-id'] || null;
-    const q = await pool.query(`insert into stream_events(user_id,track_id,event_type,played_seconds,session_id,is_valid) values($1,$2,$3,$4,$5,$6) returning id,event_type,is_valid,occurred_at`, [userIdHeader, trackId, String(eventType), Number(playedSeconds) || 0, sessionId || null, isValid]);
+    const country = safeGeo(firstHeader(req, ['cf-ipcountry', 'x-country', 'x-geo-country']));
+    const city = safeGeo(firstHeader(req, ['cf-ipcity', 'x-city', 'x-geo-city']));
+    const key = listenerKey(userIdHeader, sessionId || null);
+    const q = await pool.query(`insert into stream_events(user_id,track_id,event_type,played_seconds,session_id,is_valid,listener_country,listener_city,listener_key) values($1,$2,$3,$4,$5,$6,$7,$8,$9) returning id,event_type,is_valid,occurred_at,listener_country,listener_city`, [userIdHeader, trackId, String(eventType), Number(playedSeconds) || 0, sessionId || null, isValid, country, city, key]);
     res.status(201).json({ event: q.rows[0] });
+});
+function dateRange(req) {
+    const now = new Date();
+    const toRaw = typeof req.query.to === 'string' ? req.query.to : '';
+    const fromRaw = typeof req.query.from === 'string' ? req.query.from : '';
+    const to = toRaw ? new Date(`${toRaw}T23:59:59.999Z`) : now;
+    const from = fromRaw ? new Date(`${fromRaw}T00:00:00Z`) : new Date(now.getTime() - 29 * 24 * 60 * 60 * 1000);
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to)
+        return null;
+    return { from, to };
+}
+async function streamAnalytics(artistId, from, to) {
+    const where = artistId ? `and r.primary_artist_id=$3` : '';
+    const params = [from, to];
+    if (artistId)
+        params.push(artistId);
+    const totals = (await pool.query(`select count(*) filter(where se.is_valid) valid_streams,count(distinct se.listener_key) filter(where se.is_valid) unique_listeners,count(distinct se.listener_key) filter(where se.is_valid and se.occurred_at >= $1) listeners_in_period from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where se.occurred_at between $1 and $2 ${where}`, params)).rows[0] || {};
+    const countries = (await pool.query(`select coalesce(nullif(se.listener_country,''),'Desconhecido') country,count(*)::int streams,count(distinct se.listener_key)::int unique_listeners from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where se.is_valid=true and se.occurred_at between $1 and $2 ${where} group by 1 order by streams desc limit 20`, params)).rows;
+    const cities = (await pool.query(`select coalesce(nullif(se.listener_city,''),'Desconhecida') city,coalesce(nullif(se.listener_country,''),'--') country,count(*)::int streams,count(distinct se.listener_key)::int unique_listeners from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where se.is_valid=true and se.occurred_at between $1 and $2 ${where} group by 1,2 order by streams desc limit 30`, params)).rows;
+    const tracks = (await pool.query(`select t.id,t.title,count(*)::int streams,count(distinct se.listener_key)::int unique_listeners from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where se.is_valid=true and se.occurred_at between $1 and $2 ${where} group by t.id,t.title order by streams desc limit 20`, params)).rows;
+    const daily = (await pool.query(`select to_char(se.occurred_at,'YYYY-MM-DD') as day_label,count(*) filter(where se.is_valid)::int streams,count(distinct se.listener_key) filter(where se.is_valid)::int unique_listeners from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where se.occurred_at between $1 and $2 ${where} group by 1 order by 1`, params)).rows;
+    const hours = (await pool.query(`select extract(hour from se.occurred_at)::int as hour_value,count(*)::int streams from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where se.is_valid=true and se.occurred_at between $1 and $2 ${where} group by 1 order by streams desc`, params)).rows;
+    return { from, to, totals: { validStreams: Number(totals.valid_streams || 0), uniqueListeners: Number(totals.unique_listeners || 0) }, countries, cities, tracks, daily, peakHours: hours };
+}
+app.get('/api/artists/me/analytics', auth, artistOnly, async (req, res) => {
+    const artist = (await pool.query('select id,stage_name from artists where user_id=$1 limit 1', [req.user.id])).rows[0];
+    if (!artist)
+        return res.status(404).json({ error: 'Perfil de artista não encontrado' });
+    const range = dateRange(req);
+    if (!range)
+        return res.status(400).json({ error: 'Período inválido' });
+    res.json({ artist, analytics: await streamAnalytics(artist.id, range.from, range.to) });
+});
+app.get('/api/owner/dashboard', auth, adminOnly, async (req, res) => {
+    if (req.user?.role !== 'OWNER')
+        return res.status(403).json({ error: 'Apenas o OWNER pode consultar o painel principal.' });
+    try {
+        const counts = (await pool.query(`select
+      count(*)::int as total_users,
+      count(*) filter(where role='ARTIST')::int as total_artists,
+      count(*) filter(where role='LISTENER')::int as total_listeners,
+      count(*) filter(where role='ADMIN')::int as total_admins
+      from users`)).rows[0] || {};
+        const recent = (await pool.query(`select r.id,r.title,r.type,r.status,r.cover_url,r.release_date,r.created_at,a.stage_name
+      from releases r join artists a on a.id=r.primary_artist_id
+      order by r.created_at desc limit 6`)).rows;
+        const topArtists = (await pool.query(`select a.id,a.stage_name,count(se.id)::int streams
+      from artists a
+      left join releases r on r.primary_artist_id=a.id
+      left join tracks t on t.primary_release_id=r.id
+      left join stream_events se on se.track_id=t.id and se.is_valid=true
+      group by a.id,a.stage_name order by streams desc,a.stage_name asc limit 5`)).rows;
+        const pending = (await pool.query(`select count(*)::int as count from releases where status='PENDING_APPROVAL'`)).rows[0] || {};
+        res.json({ counts: { totalUsers: Number(counts.total_users || 0), totalArtists: Number(counts.total_artists || 0), totalListeners: Number(counts.total_listeners || 0), totalAdmins: Number(counts.total_admins || 0) }, recent, recentPending: Number(pending.count || 0), topArtists });
+    }
+    catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Não foi possível carregar o painel do OWNER' });
+    }
+});
+app.get('/api/admin/analytics/streams', auth, requireAdminPermission('ANALYTICS'), async (req, res) => {
+    const range = dateRange(req);
+    if (!range)
+        return res.status(400).json({ error: 'Período inválido' });
+    res.json({ analytics: await streamAnalytics(null, range.from, range.to) });
 });
 app.get('/api/artists/me/royalties', auth, artistOnly, async (req, res) => {
     const artist = (await pool.query('select id,stage_name from artists where user_id=$1 limit 1', [req.user.id])).rows[0];
@@ -646,11 +1593,263 @@ app.post('/api/artists/me/withdrawals', auth, artistOnly, async (req, res) => {
         client.release();
     }
 });
-app.get('/api/admin/royalty-periods', auth, adminOnly, async (_req, res) => {
+app.get('/api/admin/finance/summary', auth, requireAdminPermission('FINANCE'), async (_req, res) => {
+    const q = await pool.query(`select
+    (select count(*) from stream_events where is_valid=true)::int as valid_streams,
+    coalesce((select sum(amount) from payment_transactions where status='PAID' and payment_method<>'WALLET'),0) as external_paid,
+    coalesce((select sum(net_amount) from payment_transactions where status='PAID' and payment_method<>'WALLET'),0) as external_net,
+    coalesce((select sum(amount) from payment_transactions where status='PENDING'),0) as pending_payments,
+    coalesce((select sum(amount) from payment_transactions where status='REFUNDED'),0) as refunds,
+    coalesce((select sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount else 0 end) from financial_ledger),0) as artist_royalty_balance,
+    coalesce((select sum(w.amount) from withdrawals w where w.status='PAID'),0) as artist_payments_paid,
+    coalesce((select sum(w.amount) from withdrawals w where w.status='PENDING'),0) as artist_payments_pending,
+    coalesce((select sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount end) from owner_finance_ledger where account_code='ADVERTISING'),0) as advertising_balance,
+    coalesce((select sum(amount) from owner_finance_transactions where transaction_type='AD_REVENUE' and status='PAID'),0) as advertising_revenue,
+    coalesce((select sum(amount) from owner_finance_transactions where transaction_type='ADMIN_SALARY' and status in ('APPROVED','SENT_TO_BANK','PAID')),0) as payroll_total,
+    coalesce((select sum(amount) from owner_finance_transactions where transaction_type='ARTIST_PAYOUT' and status in ('APPROVED','SENT_TO_BANK','PAID')),0) as owner_artist_payouts,
+    coalesce((select sum(amount) from owner_finance_transactions where status='PENDING_APPROVAL'),0) as owner_pending_approvals`);
+    const row = q.rows[0];
+    const externalNet = Number(row.external_net || 0), royalty = Number(row.artist_royalty_balance || 0), advertising = Number(row.advertising_balance || 0);
+    res.json({ currency: 'AOA', balances: {
+            streamBalance: { validStreams: Number(row.valid_streams || 0) },
+            artistPayments: { paid: Number(row.artist_payments_paid || 0), pending: Number(row.artist_payments_pending || 0) },
+            artistRoyalties: royalty, pendingPayments: Number(row.pending_payments || 0), refunds: Number(row.refunds || 0), babuloRevenue: externalNet,
+            advertisingRevenue: Number(row.advertising_revenue || 0), advertisingBalance: advertising, payrollTotal: Number(row.payroll_total || 0), ownerArtistPayouts: Number(row.owner_artist_payouts || 0), ownerPendingApprovals: Number(row.owner_pending_approvals || 0),
+            netAfterArtistPayments: externalNet - Number(row.artist_payments_paid || 0) - Number(row.payroll_total || 0)
+        }, updatedAt: new Date().toISOString() });
+});
+// ===== V10.4.7 ADMIN — CENTRO FINANCEIRO OPERACIONAL =====
+app.get('/api/admin/finance/overview', auth, requireAdminPermission('FINANCE'), async (_req, res) => {
+    try {
+        const [artists, admins, pendingPayments, pendingWithdrawals] = await Promise.all([
+            pool.query(`select a.id,a.stage_name,u.full_name,u.phone,
+        coalesce((select sum(case when fl.entry_type='CREDIT' then fl.amount when fl.entry_type='DEBIT' then -fl.amount end) from financial_ledger fl where fl.artist_id=a.id),0) balance,
+        coalesce((select count(*) from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where r.primary_artist_id=a.id and se.is_valid=true),0) valid_streams
+        from artists a left join users u on u.id=a.user_id order by balance desc,a.stage_name asc`),
+            pool.query(`select id,full_name,admin_title,salary_amount,salary_currency,status from users where role='ADMIN' order by full_name asc`),
+            pool.query(`select p.id,p.reference,p.amount,p.currency,p.payment_method,p.status,p.created_at,p.release_id,r.title release_title,a.stage_name from payment_transactions p left join releases r on r.id=p.release_id left join artists a on a.id=r.primary_artist_id where p.service_type='DISTRIBUTION' and p.status='PENDING' order by p.created_at asc`),
+            pool.query(`select w.id,w.amount,w.currency,w.method,w.status,w.created_at,a.stage_name,u.full_name from withdrawals w join artists a on a.id=w.artist_id left join users u on u.id=a.user_id where w.status='PENDING' order by w.created_at asc`)
+        ]);
+        res.json({ artists: artists.rows, admins: admins.rows, pendingPayments: pendingPayments.rows, pendingWithdrawals: pendingWithdrawals.rows });
+    }
+    catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Não foi possível carregar o centro financeiro administrativo' });
+    }
+});
+// ===== V10.4.7 ADMIN — PUBLICIDADE OPERACIONAL (SEM PODER DE PAGAMENTO/ATIVAÇÃO) =====
+app.get('/api/admin/ads/overview', auth, requireAdminPermission('ADS'), async (_req, res) => {
+    try {
+        const [campaigns, placements, pricing] = await Promise.all([
+            pool.query(`select id,name,advertiser_name,format,pricing_model,budget,spend,currency,status,payment_status,start_at,end_at,target_country,target_city,impressions,clicks,video_views from ad_campaigns order by created_at desc`),
+            pool.query(`select id,code,name,description,active,sort_order from ad_placements order by sort_order asc`),
+            pool.query(`select id,name,format,pricing_model,price,currency,unit,active from ad_pricing order by created_at desc`)
+        ]);
+        res.json({ campaigns: campaigns.rows, placements: placements.rows, pricing: pricing.rows });
+    }
+    catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Não foi possível carregar a publicidade' });
+    }
+});
+app.get('/api/admin/ads/reports', auth, requireAdminPermission('ADS'), async (_req, res) => {
+    try {
+        const q = await pool.query(`select c.id,c.name,c.advertiser_name,c.format,c.status,c.impressions,c.clicks,c.video_views,c.spend,c.budget,
+      case when c.impressions>0 then round((c.clicks::numeric/c.impressions::numeric)*100,2) else 0 end ctr
+      from ad_campaigns c order by c.created_at desc`);
+        res.json({ reports: q.rows });
+    }
+    catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Não foi possível carregar os relatórios de publicidade' });
+    }
+});
+// ===== V10.4.7 OWNER — CONTROLO FINANCEIRO CENTRAL =====
+app.get('/api/owner/finance/overview', auth, ownerOnly, async (_req, res) => {
+    try {
+        const [artists, admins, pending, ledger] = await Promise.all([
+            pool.query(`select a.id,a.stage_name,a.country,a.city,u.id user_id,u.full_name,u.phone,
+        coalesce((select sum(case when fl.entry_type='CREDIT' then fl.amount when fl.entry_type='DEBIT' then -fl.amount end) from financial_ledger fl where fl.artist_id=a.id),0) balance,
+        coalesce((select sum(w.amount) from withdrawals w where w.artist_id=a.id and w.status in ('PAID','APPROVED')),0) paid_withdrawals,
+        coalesce((select count(*) from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where r.primary_artist_id=a.id and se.is_valid=true),0) valid_streams
+        from artists a left join users u on u.id=a.user_id order by balance desc,a.stage_name asc`),
+            pool.query(`select id,full_name,phone,role,status,admin_title,salary_amount,salary_currency from users where role='ADMIN' and status='ACTIVE' order by full_name nulls last,created_at desc`),
+            pool.query(`select count(*)::int count,coalesce(sum(amount),0) amount from owner_finance_transactions where status='PENDING_APPROVAL'`),
+            pool.query(`select account_code,coalesce(sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount end),0) balance from owner_finance_ledger group by account_code order by account_code`)
+        ]);
+        res.json({ artists: artists.rows, admins: admins.rows, pending: pending.rows[0] || { count: 0, amount: 0 }, accounts: ledger.rows });
+    }
+    catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Não foi possível carregar o centro financeiro do OWNER' });
+    }
+});
+app.get('/api/owner/finance/transactions', auth, ownerOnly, async (_req, res) => {
+    try {
+        const q = await pool.query(`select t.*,coalesce(a.stage_name,u.full_name,u2.full_name,'—') recipient_name from owner_finance_transactions t left join artists a on a.id=t.recipient_artist_id left join users u on u.id=a.user_id left join users u2 on u2.id=t.recipient_user_id order by t.created_at desc limit 200`);
+        res.json({ transactions: q.rows });
+    }
+    catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Não foi possível carregar o histórico financeiro' });
+    }
+});
+app.post('/api/owner/finance/artist-payout', auth, ownerOnly, async (req, res) => {
+    const { artistId, amount, paymentMethod = 'BANK', destination, description = 'Pagamento de saldo ao artista' } = req.body || {};
+    const value = Number(amount);
+    if (!artistId || !Number.isFinite(value) || value <= 0)
+        return res.status(400).json({ error: 'Informe artista e valor válidos' });
+    if (!destination)
+        return res.status(400).json({ error: 'Informe o destino bancário ou método de pagamento' });
+    if (!['BANK', 'MULTICAIXA_EXPRESS'].includes(String(paymentMethod)))
+        return res.status(400).json({ error: 'Método de pagamento inválido' });
+    const client = await pool.connect();
+    try {
+        await client.query('begin');
+        const artist = (await client.query(`select a.id,a.stage_name,a.user_id,coalesce((select sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount end) from financial_ledger where artist_id=a.id),0) balance from artists a where a.id=$1 for update`, [artistId])).rows[0];
+        if (!artist) {
+            await client.query('rollback');
+            return res.status(404).json({ error: 'Artista não encontrado' });
+        }
+        const bal = Number(artist.balance || 0);
+        if (value > bal) {
+            await client.query('rollback');
+            return res.status(400).json({ error: `Saldo insuficiente do artista. Disponível: ${bal.toFixed(2)} Kz.` });
+        }
+        const reference = 'BP-ART-' + node_crypto_1.default.randomBytes(6).toString('hex').toUpperCase();
+        const tx = (await client.query(`insert into owner_finance_transactions(transaction_type,status,amount,payment_method,recipient_user_id,recipient_artist_id,destination,reference,description,created_by) values('ARTIST_PAYOUT','PENDING_APPROVAL',$1,$2,$3,$4,$5,$6,$7,$8) returning *`, [value, paymentMethod, artist.user_id, artist.id, String(destination), reference, String(description), req.user.id])).rows[0];
+        const after = bal - value;
+        await client.query(`insert into financial_ledger(artist_id,entry_type,reference_type,reference_id,amount,currency,balance_after,description) values($1,'DEBIT','OWNER_PAYOUT',$2,$3,'AOA',$4,'Reserva para pagamento feito pelo OWNER')`, [artist.id, tx.id, value, after]);
+        await client.query('commit');
+        await audit(req.user.id, 'OWNER_ARTIST_PAYOUT_CREATED', 'OWNER_FINANCE', tx.id, { artistId, amount: value, reference });
+        res.status(201).json({ transaction: tx, artistBalance: after });
+    }
+    catch (e) {
+        await client.query('rollback');
+        console.error(e);
+        res.status(500).json({ error: 'Não foi possível criar o pagamento do artista' });
+    }
+    finally {
+        client.release();
+    }
+});
+app.post('/api/owner/finance/admin-salary', auth, ownerOnly, async (req, res) => {
+    const { adminUserId, amount, paymentMethod = 'BANK', destination, description = 'Salário / remuneração do funcionário' } = req.body || {};
+    const value = Number(amount);
+    if (!adminUserId || !Number.isFinite(value) || value <= 0)
+        return res.status(400).json({ error: 'Informe funcionário e valor válidos' });
+    if (!destination)
+        return res.status(400).json({ error: 'Informe o destino bancário ou método de pagamento' });
+    const admin = (await pool.query(`select id,full_name,role,status from users where id=$1 and role='ADMIN'`, [adminUserId])).rows[0];
+    if (!admin)
+        return res.status(404).json({ error: 'Administrador/funcionário não encontrado' });
+    try {
+        const reference = 'BP-SAL-' + node_crypto_1.default.randomBytes(6).toString('hex').toUpperCase();
+        const q = await pool.query(`insert into owner_finance_transactions(transaction_type,status,amount,payment_method,recipient_user_id,destination,reference,description,created_by) values('ADMIN_SALARY','PENDING_APPROVAL',$1,$2,$3,$4,$5,$6,$7) returning *`, [value, paymentMethod, admin.id, String(destination), reference, String(description), req.user.id]);
+        await audit(req.user.id, 'OWNER_ADMIN_SALARY_CREATED', 'OWNER_FINANCE', q.rows[0].id, { adminUserId, amount: value, reference });
+        res.status(201).json({ transaction: q.rows[0] });
+    }
+    catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Não foi possível criar o pagamento do funcionário' });
+    }
+});
+app.post('/api/owner/finance/advertising-revenue', auth, ownerOnly, async (req, res) => {
+    const { amount, description = 'Receita de publicidade', reference } = req.body || {};
+    const value = Number(amount);
+    if (!Number.isFinite(value) || value <= 0)
+        return res.status(400).json({ error: 'Informe um valor válido' });
+    const client = await pool.connect();
+    try {
+        await client.query('begin');
+        const ref = String(reference || ('BP-ADS-' + node_crypto_1.default.randomBytes(6).toString('hex').toUpperCase()));
+        const tx = (await client.query(`insert into owner_finance_transactions(transaction_type,status,amount,payment_method,reference,description,created_by,approved_by,approved_at,executed_at) values('AD_REVENUE','PAID',$1,'BANK',$2,$3,$4,$4,now(),now()) returning *`, [value, ref, String(description), req.user.id])).rows[0];
+        await client.query(`insert into owner_finance_ledger(account_code,entry_type,amount,reference_type,reference_id,description,created_by) values('ADVERTISING','CREDIT',$1,'AD_REVENUE',$2,$3,$4)`, [value, tx.id, String(description), req.user.id]);
+        await client.query('commit');
+        await audit(req.user.id, 'OWNER_AD_REVENUE_RECORDED', 'OWNER_FINANCE', tx.id, { amount: value, reference: ref });
+        res.status(201).json({ transaction: tx });
+    }
+    catch (e) {
+        await client.query('rollback');
+        console.error(e);
+        res.status(500).json({ error: 'Não foi possível registar a receita de publicidade' });
+    }
+    finally {
+        client.release();
+    }
+});
+app.post('/api/owner/finance/:id/decision', auth, ownerOnly, async (req, res) => {
+    const { decision, reason } = req.body || {};
+    if (!['APPROVED', 'REJECTED'].includes(decision))
+        return res.status(400).json({ error: 'Decisão inválida' });
+    if (decision === 'REJECTED' && !String(reason || '').trim())
+        return res.status(400).json({ error: 'Informe o motivo da rejeição' });
+    const client = await pool.connect();
+    try {
+        await client.query('begin');
+        const tx = (await client.query(`update owner_finance_transactions set status=$1,approved_by=$2,approved_at=case when $1='APPROVED' then now() else null end,rejection_reason=$3,updated_at=now() where id=$4 and status='PENDING_APPROVAL' returning *`, [decision === 'APPROVED' ? 'APPROVED' : 'REJECTED', req.user.id, reason || null, req.params.id])).rows[0];
+        if (!tx) {
+            await client.query('rollback');
+            return res.status(404).json({ error: 'Operação pendente não encontrada' });
+        }
+        if (decision === 'REJECTED' && tx.transaction_type === 'ARTIST_PAYOUT' && tx.recipient_artist_id) {
+            const bal = Number((await client.query(`select coalesce(sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount end),0) balance from financial_ledger where artist_id=$1`, [tx.recipient_artist_id])).rows[0].balance || 0);
+            await client.query(`insert into financial_ledger(artist_id,entry_type,reference_type,reference_id,amount,currency,balance_after,description) values($1,'CREDIT','OWNER_PAYOUT',$2,$3,'AOA',$4,'Devolução da reserva de pagamento rejeitada pelo OWNER')`, [tx.recipient_artist_id, tx.id, tx.amount, bal + Number(tx.amount)]);
+        }
+        await client.query('commit');
+        await audit(req.user.id, decision === 'APPROVED' ? 'OWNER_FINANCE_APPROVED' : 'OWNER_FINANCE_REJECTED', 'OWNER_FINANCE', tx.id, { reason: reason || null, type: tx.transaction_type });
+        res.json({ ok: true, transaction: tx });
+    }
+    catch (e) {
+        await client.query('rollback');
+        console.error(e);
+        res.status(500).json({ error: 'Não foi possível guardar a decisão financeira' });
+    }
+    finally {
+        client.release();
+    }
+});
+app.post('/api/owner/finance/:id/execute', auth, ownerOnly, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('begin');
+        const tx = (await client.query(`update owner_finance_transactions set status='SENT_TO_BANK',executed_at=now(),updated_at=now() where id=$1 and status='APPROVED' returning *`, [req.params.id])).rows[0];
+        if (!tx) {
+            await client.query('rollback');
+            return res.status(404).json({ error: 'Operação aprovada não encontrada' });
+        }
+        if (tx.transaction_type === 'AD_REVENUE') {
+            await client.query('commit');
+            return res.json({ ok: true, transaction: tx });
+        }
+        if (tx.transaction_type === 'ADMIN_SALARY' || tx.transaction_type === 'ARTIST_PAYOUT') {
+            await client.query(`insert into owner_finance_ledger(account_code,entry_type,amount,reference_type,reference_id,description,created_by) values('BANK','DEBIT',$1,'OWNER_FINANCE',$2,$3,$4)`, [tx.amount, tx.id, `Ordem bancária ${tx.reference}`, req.user.id]);
+        }
+        await client.query('commit');
+        await audit(req.user.id, 'OWNER_FINANCE_SENT_TO_BANK', 'OWNER_FINANCE', tx.id, { reference: tx.reference });
+        res.json({ ok: true, transaction: tx, message: 'Ordem registada como enviada ao banco. A execução bancária real depende da integração com o banco/gateway.' });
+    }
+    catch (e) {
+        await client.query('rollback');
+        console.error(e);
+        res.status(500).json({ error: 'Não foi possível registar o envio ao banco' });
+    }
+    finally {
+        client.release();
+    }
+});
+app.post('/api/owner/finance/:id/mark-paid', auth, ownerOnly, async (req, res) => {
+    const q = await pool.query(`update owner_finance_transactions set status='PAID',updated_at=now() where id=$1 and status in ('APPROVED','SENT_TO_BANK') returning *`, [req.params.id]);
+    if (!q.rows[0])
+        return res.status(404).json({ error: 'Operação aprovada/enviada não encontrada' });
+    await audit(req.user.id, 'OWNER_FINANCE_MARKED_PAID', 'OWNER_FINANCE', req.params.id, {});
+    res.json({ ok: true, transaction: q.rows[0] });
+});
+app.get('/api/admin/royalty-periods', auth, requireAdminPermission('FINANCE'), async (_req, res) => {
     const q = await pool.query(`select rp.*,u.email calculated_by_email from royalty_periods rp left join users u on u.id=rp.calculated_by order by period_start desc`);
     res.json({ periods: q.rows });
 });
-app.post('/api/admin/royalty-periods/calculate', auth, adminOnly, async (req, res) => {
+app.post('/api/admin/royalty-periods/calculate', auth, requireAdminPermission('FINANCE'), async (req, res) => {
     const { periodStart, periodEnd, grossRevenue = 0, paymentFees = 0, taxes = 0, adjustments = 0, artistSharePercent = 70 } = req.body || {};
     if (!periodStart || !periodEnd)
         return res.status(400).json({ error: 'periodStart e periodEnd são obrigatórios' });
@@ -694,11 +1893,25 @@ app.post('/api/admin/royalty-periods/calculate', auth, adminOnly, async (req, re
         client.release();
     }
 });
-app.get('/api/admin/withdrawals', auth, adminOnly, async (_req, res) => {
+app.get('/api/owner/finance/approvals', auth, ownerOnly, async (_req, res) => {
+    try {
+        const [payments, withdrawals, summary] = await Promise.all([
+            pool.query(`select p.id,p.reference,p.amount,p.currency,p.payment_method,p.gateway,p.status,p.created_at,p.release_id,r.title release_title,a.stage_name,u.full_name from payment_transactions p left join releases r on r.id=p.release_id left join artists a on a.id=r.primary_artist_id left join users u on u.id=a.user_id where p.status='PENDING' order by p.created_at asc`),
+            pool.query(`select w.id,w.amount,w.currency,w.method,w.destination,w.status,w.fee,w.net_amount,w.created_at,a.stage_name,u.full_name from withdrawals w join artists a on a.id=w.artist_id left join users u on u.id=a.user_id where w.status='PENDING' order by w.created_at asc`),
+            pool.query(`select (select count(*) from payment_transactions where status='PENDING')::int pending_payment_count, coalesce((select sum(amount) from payment_transactions where status='PENDING'),0) pending_payment_amount, (select count(*) from withdrawals where status='PENDING')::int pending_withdrawal_count, coalesce((select sum(amount) from withdrawals where status='PENDING'),0) pending_withdrawal_amount`)
+        ]);
+        res.json({ payments: payments.rows, withdrawals: withdrawals.rows, summary: summary.rows[0] || {} });
+    }
+    catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Não foi possível carregar as aprovações financeiras' });
+    }
+});
+app.get('/api/admin/withdrawals', auth, requireAdminPermission('WITHDRAWALS'), async (_req, res) => {
     const q = await pool.query(`select w.*,a.stage_name,u.email from withdrawals w join artists a on a.id=w.artist_id left join users u on u.id=a.user_id order by w.created_at desc`);
     res.json({ withdrawals: q.rows });
 });
-app.post('/api/admin/withdrawals/:id/decision', auth, adminOnly, async (req, res) => {
+app.post('/api/admin/withdrawals/:id/decision', auth, ownerOnly, async (req, res) => {
     const { decision, reason } = req.body || {};
     if (!['APPROVED', 'REJECTED'].includes(decision))
         return res.status(400).json({ error: 'Decisão inválida' });
@@ -777,10 +1990,118 @@ app.post('/api/distribution/catalog-migrations', auth, artistOnly, async (req, r
     return res.status(400).json({ error: 'releaseId e distribuidor anterior são obrigatórios' }); const a = (await pool.query('select id from artists where user_id=$1 limit 1', [req.user.id])).rows[0]; const r = (await pool.query('select id from releases where id=$1 and primary_artist_id=$2', [releaseId, a?.id])).rows[0]; if (!r)
     return res.status(404).json({ error: 'Lançamento não encontrado' }); const q = await pool.query(`insert into catalog_migrations(release_id,artist_id,previous_distributor,old_isrc,old_upc,original_release_date,platform_links,old_status) values($1,$2,$3,$4,$5,$6,$7,$8) returning *`, [releaseId, a.id, previousDistributor, oldIsrc || null, oldUpc || null, originalReleaseDate || null, JSON.stringify(platformLinks), oldStatus || null]); await audit(req.user.id, 'CATALOG_MIGRATION_CREATED', 'CATALOG_MIGRATION', q.rows[0].id, { preserveIdentity: true }); res.status(201).json({ migration: q.rows[0] }); });
 app.get('/api/distribution/catalog-migrations', auth, artistOnly, async (req, res) => { const a = (await pool.query('select id from artists where user_id=$1 limit 1', [req.user.id])).rows[0]; res.json({ migrations: (await pool.query(`select cm.*,r.title release_title from catalog_migrations cm join releases r on r.id=cm.release_id where cm.artist_id=$1 order by cm.created_at desc`, [a?.id])).rows }); });
-app.get('/api/admin/distribution/orders', auth, adminOnly, async (_q, res) => res.json({ orders: (await pool.query(`select o.*,r.title release_title,a.stage_name from distribution_orders o join releases r on r.id=o.release_id join artists a on a.id=o.artist_id order by o.created_at desc`)).rows }));
-app.post('/api/admin/distribution/deliveries/:id/status', auth, adminOnly, async (req, res) => { const { status, externalReleaseId, externalUrl, errorCode, errorMessage } = req.body || {}; if (!DIST_STATUSES.includes(status))
+app.get('/api/admin/distribution/orders', auth, requireAdminPermission('RELEASES'), async (_q, res) => res.json({ orders: (await pool.query(`select o.*,r.title release_title,a.stage_name from distribution_orders o join releases r on r.id=o.release_id join artists a on a.id=o.artist_id order by o.created_at desc`)).rows }));
+app.post('/api/admin/distribution/deliveries/:id/status', auth, requireAdminPermission('RELEASES'), async (req, res) => { const { status, externalReleaseId, externalUrl, errorCode, errorMessage } = req.body || {}; if (!DIST_STATUSES.includes(status))
     return res.status(400).json({ error: 'Estado inválido' }); const d = (await pool.query(`select d.*,o.id order_id,p.name platform_name from distribution_deliveries d join distribution_orders o on o.id=d.order_id join distribution_platforms p on p.id=d.platform_id where d.id=$1`, [req.params.id])).rows[0]; if (!d)
     return res.status(404).json({ error: 'Entrega não encontrada' }); await pool.query(`update distribution_deliveries set status=$1,external_release_id=coalesce($2,external_release_id),external_url=coalesce($3,external_url),error_code=$4,error_message=$5,delivered_at=case when $1='DELIVERED' then now() else delivered_at end,published_at=case when $1='PUBLISHED' then now() else published_at end,updated_at=now() where id=$6`, [status, externalReleaseId || null, externalUrl || null, errorCode || null, errorMessage || null, d.id]); const c = (await pool.query(`select count(*)::int total,count(*) filter(where status='PUBLISHED')::int published,count(*) filter(where status='FAILED')::int failed from distribution_deliveries where order_id=$1`, [d.order_id])).rows[0]; const os = Number(c.published) === Number(c.total) ? 'PUBLISHED' : Number(c.failed) + Number(c.published) === Number(c.total) && Number(c.failed) > 0 ? 'FAILED' : 'PROCESSING'; await pool.query(`update distribution_orders set status=$1,error=$2,completed_at=case when $1 in ('PUBLISHED','FAILED') then now() else completed_at end,updated_at=now() where id=$3`, [os, errorMessage || null, d.order_id]); await distHistory(d.order_id, d.id, d.status, status, `Estado ${d.platform_name}: ${status}`, req.user.id); await audit(req.user.id, 'DISTRIBUTION_DELIVERY_STATUS', 'DISTRIBUTION_DELIVERY', d.id, { status }); res.json({ ok: true, status, orderStatus: os }); });
+// V10.4.7 — Owner Advertising / BaBuLo Ads
+app.get('/api/owner/ads/overview', auth, ownerOnly, async (_req, res) => {
+    const [summary, campaigns, placements] = await Promise.all([
+        pool.query(`select count(*) filter(where status='ACTIVE')::int active_campaigns,count(*) filter(where status in ('PENDING_PAYMENT','PENDING_APPROVAL'))::int pending_campaigns,coalesce(sum(budget) filter(where payment_status='PAID'),0) paid_budget,coalesce(sum(spend),0) spend,coalesce(sum(impressions),0)::bigint impressions,coalesce(sum(clicks),0)::bigint clicks,coalesce(sum(video_views),0)::bigint video_views from ad_campaigns`),
+        pool.query(`select c.*,coalesce(cr.name,'Sem criativo') creative_name from ad_campaigns c left join lateral (select name from ad_creatives where campaign_id=c.id order by created_at desc limit 1) cr on true order by c.created_at desc limit 100`),
+        pool.query(`select * from ad_placements order by active desc,sort_order,name`)
+    ]);
+    res.json({ summary: summary.rows[0], campaigns: campaigns.rows, placements: placements.rows });
+});
+app.get('/api/owner/ads/pricing', auth, ownerOnly, async (_req, res) => res.json({ pricing: (await pool.query('select * from ad_pricing order by active desc,sort_order,name')).rows }));
+app.post('/api/owner/ads/placements/:id/toggle', auth, ownerOnly, async (req, res) => { const q = await pool.query(`update ad_placements set active=not active where id=$1 returning *`, [req.params.id]); if (!q.rows[0])
+    return res.status(404).json({ error: 'Espaço publicitário não encontrado' }); await audit(req.user.id, 'AD_PLACEMENT_TOGGLE', 'AD_PLACEMENT', req.params.id, { active: q.rows[0].active }); res.json({ placement: q.rows[0] }); });
+app.post('/api/owner/ads/pricing', auth, ownerOnly, async (req, res) => {
+    const { id, name, format, pricingModel, price, currency = 'AOA', unit = 'CAMPAIGN', active = true } = req.body || {};
+    if (!name || !format || !['FIXED', 'CPM', 'CPC', 'CPV'].includes(pricingModel) || Number(price) <= 0)
+        return res.status(400).json({ error: 'Preencha nome, formato, modelo e preço válido.' });
+    const q = id ? await pool.query(`update ad_pricing set name=$1,format=$2,pricing_model=$3,price=$4,currency=$5,unit=$6,active=$7,updated_at=now() where id=$8 returning *`, [String(name).trim(), format, pricingModel, Number(price), currency, unit, Boolean(active), id]) : await pool.query(`insert into ad_pricing(name,format,pricing_model,price,currency,unit,active) values($1,$2,$3,$4,$5,$6,$7) returning *`, [String(name).trim(), format, pricingModel, Number(price), currency, unit, Boolean(active)]);
+    await audit(req.user.id, id ? 'AD_PRICING_UPDATED' : 'AD_PRICING_CREATED', 'AD_PRICING', q.rows[0].id, { name, format, pricingModel, price });
+    res.status(201).json({ pricing: q.rows[0] });
+});
+app.post('/api/owner/ads/campaigns', auth, ownerOnly, async (req, res) => {
+    const { id, name, advertiserName, contactEmail, format, pricingModel = 'FIXED', budget, currency = 'AOA', startAt, endAt, targetCountry = '', targetCity = '', targetAudience = 'FREE_USERS', destinationUrl = '', creativeUrl = '', creativeName = '', headline = '', bodyText = '', cta = 'Saiba mais', paymentReference = '' } = req.body || {};
+    if (!name || !advertiserName || !format || Number(budget) <= 0 || !startAt || !endAt)
+        return res.status(400).json({ error: 'Nome, anunciante, formato, orçamento e período são obrigatórios.' });
+    if (new Date(endAt) <= new Date(startAt))
+        return res.status(400).json({ error: 'A data final deve ser posterior à inicial.' });
+    const client = await pool.connect();
+    try {
+        await client.query('begin');
+        let campaign;
+        if (id) {
+            campaign = (await client.query(`update ad_campaigns set name=$1,advertiser_name=$2,contact_email=$3,format=$4,pricing_model=$5,budget=$6,currency=$7,start_at=$8,end_at=$9,target_country=$10,target_city=$11,target_audience=$12,destination_url=$13,payment_reference=$14,updated_at=now() where id=$15 returning *`, [String(name).trim(), String(advertiserName).trim(), contactEmail || null, format, pricingModel, Number(budget), currency, startAt, endAt, targetCountry || null, targetCity || null, targetAudience, destinationUrl || null, paymentReference || null, id])).rows[0];
+            if (!campaign)
+                throw Error('Campanha não encontrada');
+        }
+        else
+            campaign = (await client.query(`insert into ad_campaigns(name,advertiser_name,contact_email,format,pricing_model,budget,currency,start_at,end_at,target_country,target_city,target_audience,destination_url,payment_reference,created_by) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) returning *`, [String(name).trim(), String(advertiserName).trim(), contactEmail || null, format, pricingModel, Number(budget), currency, startAt, endAt, targetCountry || null, targetCity || null, targetAudience, destinationUrl || null, paymentReference || null, req.user.id])).rows[0];
+        if (creativeUrl) {
+            await client.query(`insert into ad_creatives(campaign_id,name,format,asset_url,headline,body_text,cta,destination_url) values($1,$2,$3,$4,$5,$6,$7,$8)`, [campaign.id, creativeName || `${name} — criativo`, format, creativeUrl, headline || null, bodyText || null, cta || null, destinationUrl || null]);
+        }
+        await client.query('commit');
+        await audit(req.user.id, id ? 'AD_CAMPAIGN_UPDATED' : 'AD_CAMPAIGN_CREATED', 'AD_CAMPAIGN', campaign.id, { advertiserName, format, budget });
+        res.status(201).json({ campaign });
+    }
+    catch (e) {
+        await client.query('rollback');
+        res.status(400).json({ error: e.message || 'Não foi possível guardar a campanha' });
+    }
+    finally {
+        client.release();
+    }
+});
+app.post('/api/owner/ads/campaigns/:id/payment', auth, ownerOnly, async (req, res) => { const { status = 'PAID', reference = '' } = req.body || {}; if (!['PENDING', 'PAID', 'REFUNDED'].includes(status))
+    return res.status(400).json({ error: 'Estado de pagamento inválido' }); const q = await pool.query(`update ad_campaigns set payment_status=$1,payment_reference=coalesce(nullif($2,''),payment_reference),paid_at=case when $1='PAID' then coalesce(paid_at,now()) else paid_at end,updated_at=now() where id=$3 returning *`, [status, reference, req.params.id]); if (!q.rows[0])
+    return res.status(404).json({ error: 'Campanha não encontrada' }); await audit(req.user.id, 'AD_CAMPAIGN_PAYMENT', 'AD_CAMPAIGN', req.params.id, { status, reference }); res.json({ campaign: q.rows[0] }); });
+app.post('/api/owner/ads/campaigns/:id/status', auth, ownerOnly, async (req, res) => { const { status, reason = '' } = req.body || {}; if (!['DRAFT', 'PENDING_PAYMENT', 'PENDING_APPROVAL', 'ACTIVE', 'PAUSED', 'COMPLETED', 'REJECTED', 'CANCELLED'].includes(status))
+    return res.status(400).json({ error: 'Estado inválido' }); const q = await pool.query(`update ad_campaigns set status=$1,rejection_reason=$2,updated_at=now() where id=$3 returning *`, [status, reason || null, req.params.id]); if (!q.rows[0])
+    return res.status(404).json({ error: 'Campanha não encontrada' }); await audit(req.user.id, 'AD_CAMPAIGN_STATUS', 'AD_CAMPAIGN', req.params.id, { status, reason }); res.json({ campaign: q.rows[0] }); });
+app.post('/api/owner/ads/campaigns/:id/creative', auth, ownerOnly, async (req, res) => { const { name, format, assetUrl, headline = '', bodyText = '', cta = 'Saiba mais', destinationUrl = '' } = req.body || {}; if (!name || !format || !assetUrl)
+    return res.status(400).json({ error: 'Nome, formato e URL do criativo são obrigatórios' }); const q = await pool.query(`insert into ad_creatives(campaign_id,name,format,asset_url,headline,body_text,cta,destination_url) values($1,$2,$3,$4,$5,$6,$7,$8) returning *`, [req.params.id, name, format, assetUrl, headline || null, bodyText || null, cta || null, destinationUrl || null]); res.status(201).json({ creative: q.rows[0] }); });
+app.get('/api/owner/ads/reports', auth, ownerOnly, async (req, res) => { const from = req.query.from || new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10), to = req.query.to || new Date().toISOString().slice(0, 10); const q = await pool.query(`select c.id,c.name,c.advertiser_name,c.format,c.status,c.budget,c.spend,c.impressions,c.clicks,c.video_views,case when c.impressions>0 then round(c.clicks::numeric*100/c.impressions,2) else 0 end ctr,coalesce(sum(e.value),0) event_value from ad_campaigns c left join ad_events e on e.campaign_id=c.id and e.created_at>=($1::date) and e.created_at<($2::date+interval '1 day') where c.created_at<($2::date+interval '1 day') group by c.id order by c.created_at desc`, [from, to]); res.json({ from, to, reports: q.rows }); });
+// API de entrega de anúncios — mesma API para Web, Android e iPhone.
+app.get('/api/ads/serve', async (req, res) => {
+    const placement = String(req.query.placement || 'HOME_BANNER');
+    const country = String(req.query.country || req.headers['cf-ipcountry'] || req.headers['x-country'] || '').toUpperCase();
+    const city = String(req.query.city || req.headers['cf-ipcity'] || req.headers['x-city'] || '');
+    const token = String(req.headers.authorization || '').startsWith('Bearer ') ? String(req.headers.authorization).slice(7) : '';
+    let userId = null;
+    let premium = false;
+    if (token) {
+        try {
+            const d = decodeToken(token);
+            if (d?.sid) {
+                const u = (await pool.query(`select id from users where id=$1 and status='ACTIVE'`, [d.sub])).rows[0];
+                if (u) {
+                    userId = u.id;
+                    premium = Boolean((await pool.query(`select 1 from subscriptions where user_id=$1 and status='ACTIVE' and ends_at>now() limit 1`, [u.id])).rows[0]);
+                }
+            }
+        }
+        catch { }
+    }
+    if (premium)
+        return res.json({ ad: null, premium: true });
+    const q = await pool.query(`select c.id,c.name,c.advertiser_name,c.format,c.pricing_model,c.destination_url,c.target_country,c.target_city,c.target_audience,cr.id creative_id,cr.name creative_name,cr.asset_url,cr.headline,cr.body_text,cr.cta,cr.destination_url creative_destination from ad_campaigns c join lateral (select * from ad_creatives where campaign_id=c.id order by created_at desc limit 1) cr on true where c.status='ACTIVE' and c.payment_status='PAID' and now() between c.start_at and c.end_at and c.format=$1 and (c.target_country is null or c.target_country='' or upper(c.target_country)=$2) and (c.target_city is null or c.target_city='' or lower(c.target_city)=lower($3)) and (c.target_audience='ALL' or c.target_audience='FREE_USERS') order by random() limit 1`, [placement, country, city]);
+    if (!q.rows[0])
+        return res.json({ ad: null, premium: false });
+    const a = q.rows[0];
+    await pool.query(`update ad_campaigns set impressions=impressions+1,updated_at=now() where id=$1`, [a.id]);
+    await pool.query(`insert into ad_events(campaign_id,creative_id,event_type,user_id,country,city,visitor_key) values($1,$2,'IMPRESSION',$3,$4,$5,$6)`, [a.id, a.creative_id, userId, country || null, city || null, hashToken(userId || `${req.headers['user-agent'] || ''}|${country}|${city}`)]);
+    res.json({ ad: { id: a.id, creativeId: a.creative_id, format: a.format, assetUrl: a.asset_url, headline: a.headline, bodyText: a.body_text, cta: a.cta, destinationUrl: a.creative_destination || a.destination_url, advertiserName: a.advertiser_name }, premium: false });
+});
+app.post('/api/ads/event', async (req, res) => { const { campaignId, creativeId, eventType, value = 0, country = '', city = '', visitorKey = '' } = req.body || {}; if (!campaignId || !['CLICK', 'VIDEO_VIEW', 'INTERACTION'].includes(eventType))
+    return res.status(400).json({ error: 'Evento publicitário inválido' }); const key = String(visitorKey || `${req.headers['user-agent'] || ''}|${country}|${city}`).slice(0, 500); const q = await pool.query(`select id,pricing_model from ad_campaigns where id=$1 and status='ACTIVE'`, [campaignId]); if (!q.rows[0])
+    return res.status(404).json({ error: 'Campanha não encontrada' }); const c = q.rows[0]; await pool.query(`insert into ad_events(campaign_id,creative_id,event_type,value,country,city,visitor_key) values($1,$2,$3,$4,$5,$6,$7)`, [campaignId, creativeId || null, eventType, Number(value) || 0, country || null, city || null, hashToken(key)]); const field = eventType === 'CLICK' ? 'clicks' : eventType === 'VIDEO_VIEW' ? 'video_views' : null; if (field)
+    await pool.query(`update ad_campaigns set ${field}=${field}+1,updated_at=now() where id=$1`, [campaignId]); res.json({ ok: true }); });
+// Garantir que erros inesperados da API nunca chegam ao frontend como HTML.
+// Isto evita o erro "Unexpected token '<', '<!DOCTYPE'..." e permite mostrar a causa real.
+app.use((err, _req, res, _next) => {
+    console.error('Unhandled API error:', err);
+    if (res.headersSent)
+        return;
+    res.status(Number(err?.statusCode || err?.status || 500)).json({
+        error: err?.message || 'Erro interno do servidor.',
+        code: err?.code || undefined
+    });
+});
 ensureDatabaseSchema()
+    .then(() => bootstrapFirstOwner())
     .then(() => app.listen(port, () => console.log(`BaBuLo API running on :${port}`)))
     .catch(() => process.exit(1));
