@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -296,7 +296,7 @@ app.post('/api/auth/2fa/enable', auth, async (req:AuthedRequest,res)=>{ if(!['AD
 app.post('/api/auth/2fa/disable', auth, async (req:AuthedRequest,res)=>{ if(!['ADMIN','OWNER'].includes(req.user!.role)) return res.status(403).json({error:'Acesso reservado à administração'}); const row=(await pool.query('select mfa_secret_enc,mfa_enabled from users where id=$1',[req.user!.id])).rows[0]; if(!row?.mfa_enabled) return res.json({ok:true}); if(!verifyTotp(decryptSecret(row.mfa_secret_enc),String(req.body?.code||''))) return res.status(400).json({error:'Código 2FA incorreto'}); await pool.query('update users set mfa_enabled=false,mfa_pending=false,mfa_secret_enc=null where id=$1',[req.user!.id]); res.json({ok:true,message:'2FA desativado.'}); });
 
 app.get('/api/auth/me', auth, async (req:AuthedRequest,res) => {
-  const q = await pool.query(`select id,email,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,admin_title,admin_permissions,created_at,updated_at from users where id=$1`, [req.user!.id]);
+  const q = await pool.query(`select id,email,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,gender,height_cm,education,address,marital_status,profile_photo_url,admin_title,admin_permissions,created_at,updated_at from users where id=$1`, [req.user!.id]);
   if (!q.rows[0]) return res.status(404).json({error:'Utilizador não encontrado'});
   const artist = (await pool.query(`select id,stage_name,legal_name,bio,country,city,photo_url,verification_status from artists where user_id=$1`, [req.user!.id])).rows[0] || null;
   res.json({user:q.rows[0],artist});
@@ -711,7 +711,7 @@ app.get('/api/admin/users', auth, requireAnyAdminPermission(['USERS','ARTISTS','
   if(['LISTENER','ARTIST','ADMIN','OWNER'].includes(role)){params.push(role);where.push(`u.role=$${params.length}`);}
   if(ACCOUNT_STATUSES.includes(status)){params.push(status);where.push(`u.status=$${params.length}`);}
   params.push(limit);
-  const sql=`select u.id,u.phone,u.role,u.status,u.email_verified,u.phone_verified,u.admin_title,u.admin_permissions,u.full_name,u.birth_date,u.created_at,u.updated_at,
+  const sql=`select u.id,u.phone,u.role,u.status,u.email_verified,u.phone_verified,u.admin_title,u.admin_permissions,u.full_name,u.birth_date,u.gender,u.height_cm,u.education,u.address,u.marital_status,u.profile_photo_url,u.created_at,u.updated_at,
     a.id artist_id,a.stage_name,a.country,a.city,a.photo_url,a.verification_status,a.status artist_status,
     (select count(*)::int from releases r where r.primary_artist_id=a.id) release_count,
     (select count(*)::int from stream_events se join tracks t on t.id=se.track_id where t.primary_release_id in (select r2.id from releases r2 where r2.primary_artist_id=a.id) and se.is_valid=true) valid_streams
@@ -722,7 +722,7 @@ app.get('/api/admin/users', auth, requireAnyAdminPermission(['USERS','ARTISTS','
 });
 
 app.get('/api/admin/users/:id', auth, requireAnyAdminPermission(['USERS','ARTISTS','TEAM']), async (req:AuthedRequest,res) => {
-  const user=(await pool.query(`select id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,admin_title,admin_permissions,created_at,updated_at from users where id=$1`,[req.params.id])).rows[0];
+  const user=(await pool.query(`select id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,gender,height_cm,education,address,marital_status,profile_photo_url,admin_title,admin_permissions,created_at,updated_at from users where id=$1`,[req.params.id])).rows[0];
   if(!user) return res.status(404).json({error:'Utilizador não encontrado'});
   const artist=(await pool.query(`select id,stage_name,legal_name,bio,country,city,photo_url,verification_status,status,created_at from artists where user_id=$1`,[req.params.id])).rows[0]||null;
   const releases=artist?(await pool.query(`select id,title,type,status,preflight_status,submitted_at,reviewed_at,review_reason,created_at from releases where primary_artist_id=$1 order by created_at desc limit 100`,[artist.id])).rows:[];
@@ -777,10 +777,17 @@ app.patch('/api/owner/admins/:id', auth, async (req:AuthedRequest,res:Response) 
   const fullName=String(req.body?.fullName||'').trim().slice(0,160)||null;
   const phone=String(req.body?.phone||'').trim().slice(0,40)||null;
   const birthDate=String(req.body?.birthDate||'').trim()||null;
+  const gender=String(req.body?.gender||'').trim().slice(0,40)||null;
+  const heightCm=req.body?.heightCm===''||req.body?.heightCm==null?null:Number(req.body.heightCm);
+  const education=String(req.body?.education||'').trim().slice(0,240)||null;
+  const address=String(req.body?.address||'').trim().slice(0,500)||null;
+  const maritalStatus=String(req.body?.maritalStatus||'').trim().slice(0,60)||null;
+  const profilePhotoUrl=String(req.body?.profilePhotoUrl||'').trim().slice(0,1000)||null;
   if(birthDate && !/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) return res.status(400).json({error:'Data de nascimento inválida.'});
+  if(heightCm!==null && (!Number.isFinite(heightCm)||heightCm<80||heightCm>250)) return res.status(400).json({error:'Altura inválida.'});
   const permissions=Array.isArray(req.body?.permissions)?req.body.permissions.filter((p:any)=>ADMIN_PERMISSIONS.includes(String(p))):[];
   if(!permissions.length) return res.status(400).json({error:'Selecione pelo menos uma função/permissão.'});
-  const q=await pool.query(`update users set admin_title=$1,admin_permissions=$2::jsonb,full_name=$3,phone=$4,birth_date=$5,updated_at=now() where id=$6 and role='ADMIN' returning id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,admin_title,admin_permissions,created_at,updated_at`,[adminTitle,JSON.stringify(permissions),fullName,phone,birthDate,target.id]);
+  const q=await pool.query(`update users set admin_title=$1,admin_permissions=$2::jsonb,full_name=$3,phone=$4,birth_date=$5,gender=$6,height_cm=$7,education=$8,address=$9,marital_status=$10,profile_photo_url=$11,updated_at=now() where id=$12 and role='ADMIN' returning id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,gender,height_cm,education,address,marital_status,profile_photo_url,admin_title,admin_permissions,created_at,updated_at`,[adminTitle,JSON.stringify(permissions),fullName,phone,birthDate,gender,heightCm,education,address,maritalStatus,profilePhotoUrl,target.id]);
   await pool.query(`update auth_sessions set revoked_at=now() where user_id=$1 and revoked_at is null`,[target.id]);
   await audit(req.user!.id,'ADMIN_ROLE_UPDATED','USER',target.id,{fromTitle:target.admin_title,toTitle:adminTitle,fromPermissions:target.admin_permissions,toPermissions:permissions});
   res.json({ok:true,user:q.rows[0],message:'Função e permissões atualizadas. O ADMIN deverá iniciar uma nova sessão.'});
@@ -791,11 +798,18 @@ app.patch('/api/admin/me/profile', auth, async (req:AuthedRequest,res:Response) 
   const fullName=String(req.body?.fullName||'').trim().slice(0,160)||null;
   const phone=String(req.body?.phone||'').trim().slice(0,40)||null;
   const birthDate=String(req.body?.birthDate||'').trim()||null;
+  const gender=String(req.body?.gender||'').trim().slice(0,40)||null;
+  const heightCm=req.body?.heightCm===''||req.body?.heightCm==null?null:Number(req.body.heightCm);
+  const education=String(req.body?.education||'').trim().slice(0,240)||null;
+  const address=String(req.body?.address||'').trim().slice(0,500)||null;
+  const maritalStatus=String(req.body?.maritalStatus||'').trim().slice(0,60)||null;
+  const profilePhotoUrl=String(req.body?.profilePhotoUrl||'').trim().slice(0,1000)||null;
   if(birthDate && !/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) return res.status(400).json({error:'Data de nascimento inválida.'});
+  if(heightCm!==null && (!Number.isFinite(heightCm)||heightCm<80||heightCm>250)) return res.status(400).json({error:'Altura inválida.'});
   try{
-    const q=await pool.query(`update users set full_name=$1,phone=$2,birth_date=$3,updated_at=now() where id=$4 and role='ADMIN' returning id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,admin_title,admin_permissions,created_at,updated_at`,[fullName,phone,birthDate,req.user.id]);
+    const q=await pool.query(`update users set full_name=$1,phone=$2,birth_date=$3,gender=$4,height_cm=$5,education=$6,address=$7,marital_status=$8,profile_photo_url=$9,updated_at=now() where id=$10 and role='ADMIN' returning id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,gender,height_cm,education,address,marital_status,profile_photo_url,admin_title,admin_permissions,created_at,updated_at`,[fullName,phone,birthDate,gender,heightCm,education,address,maritalStatus,profilePhotoUrl,req.user.id]);
     if(!q.rows[0]) return res.status(404).json({error:'ADMIN não encontrado'});
-    await audit(req.user.id,'ADMIN_PROFILE_UPDATED','USER',req.user.id,{phoneChanged:Boolean(phone),profileFields:['full_name','phone','birth_date']});
+    await audit(req.user.id,'ADMIN_PROFILE_UPDATED','USER',req.user.id,{phoneChanged:Boolean(phone),profileFields:['full_name','phone','birth_date','gender','height_cm','education','address','marital_status','profile_photo_url']});
     res.json({ok:true,user:q.rows[0]});
   }catch(e:any){res.status(e.code==='23505'?409:500).json({error:e.code==='23505'?'Este telefone já está registado.':'Não foi possível atualizar o perfil.'});}
 });
