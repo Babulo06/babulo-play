@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -591,6 +591,77 @@ app.post('/api/admin/copyright-complaints/:id/decision', auth, adminOnly, async 
     await audit(req.user!.id,'COPYRIGHT_DECISION','COPYRIGHT_COMPLAINT',c.id,{decision,reason});
     res.json({ok:true,status});
   } catch(e){await client.query('rollback');console.error(e);res.status(500).json({error:'Não foi possível guardar a decisão'});} finally {client.release();}
+});
+
+
+// ===== V10.4.2: Gestão de utilizadores, artistas e equipa =====
+const ACCOUNT_STATUSES=['ACTIVE','SUSPENDED','BLOCKED'];
+const VERIFICATION_STATUSES=['UNVERIFIED','PENDING','VERIFIED','REJECTED'];
+
+app.get('/api/admin/users', auth, adminOnly, async (req:AuthedRequest,res) => {
+  const qtext=String(req.query.q||'').trim();
+  const role=String(req.query.role||'').trim().toUpperCase();
+  const status=String(req.query.status||'').trim().toUpperCase();
+  const limit=Math.min(Math.max(Number(req.query.limit)||100,1),200);
+  const params:any[]=[]; const where:string[]=[];
+  if(qtext){params.push(`%${qtext}%`); where.push(`(coalesce(u.email,'') ilike $${params.length} or coalesce(u.phone,'') ilike $${params.length} or coalesce(a.stage_name,'') ilike $${params.length})`);}
+  if(['LISTENER','ARTIST','ADMIN','OWNER'].includes(role)){params.push(role);where.push(`u.role=$${params.length}`);}
+  if(ACCOUNT_STATUSES.includes(status)){params.push(status);where.push(`u.status=$${params.length}`);}
+  params.push(limit);
+  const sql=`select u.id,u.email,u.phone,u.role,u.status,u.email_verified,u.phone_verified,u.created_at,u.updated_at,
+    a.id artist_id,a.stage_name,a.country,a.city,a.photo_url,a.verification_status,a.status artist_status,
+    (select count(*)::int from releases r where r.primary_artist_id=a.id) release_count,
+    (select count(*)::int from stream_events se join tracks t on t.id=se.track_id where t.primary_release_id in (select r2.id from releases r2 where r2.primary_artist_id=a.id) and se.is_valid=true) valid_streams
+    from users u left join artists a on a.user_id=u.id ${where.length?'where '+where.join(' and '):''}
+    order by case when u.role='OWNER' then 0 when u.role='ADMIN' then 1 when u.role='ARTIST' then 2 else 3 end,u.created_at desc limit $${params.length}`;
+  const rows=(await pool.query(sql,params)).rows;
+  res.json({users:rows});
+});
+
+app.get('/api/admin/users/:id', auth, adminOnly, async (req:AuthedRequest,res) => {
+  const user=(await pool.query(`select id,email,phone,role,status,email_verified,phone_verified,created_at,updated_at from users where id=$1`,[req.params.id])).rows[0];
+  if(!user) return res.status(404).json({error:'Utilizador não encontrado'});
+  const artist=(await pool.query(`select id,stage_name,legal_name,bio,country,city,photo_url,verification_status,status,created_at from artists where user_id=$1`,[req.params.id])).rows[0]||null;
+  const releases=artist?(await pool.query(`select id,title,type,status,preflight_status,submitted_at,reviewed_at,review_reason,created_at from releases where primary_artist_id=$1 order by created_at desc limit 100`,[artist.id])).rows:[];
+  const withdrawals=artist?(await pool.query(`select id,amount,currency,method,status,rejection_reason,created_at,reviewed_at from withdrawals where artist_id=$1 order by created_at desc limit 50`,[artist.id])).rows:[];
+  const logs=(await pool.query(`select al.id,al.action,al.entity_type,al.entity_id,al.details,al.created_at,u.email actor_email from audit_logs al left join users u on u.id=al.actor_user_id where al.entity_id=$1 or al.actor_user_id=$1 order by al.created_at desc limit 50`,[req.params.id])).rows;
+  res.json({user,artist,releases,withdrawals,logs});
+});
+
+app.post('/api/admin/users/:id/status', auth, adminOnly, async (req:AuthedRequest,res) => {
+  const status=String(req.body?.status||'').toUpperCase();
+  if(!ACCOUNT_STATUSES.includes(status)) return res.status(400).json({error:'Estado de conta inválido'});
+  if(req.params.id===req.user!.id) return res.status(400).json({error:'Não podes alterar o estado da tua própria conta.'});
+  const target=(await pool.query(`select id,role,status from users where id=$1`,[req.params.id])).rows[0];
+  if(!target) return res.status(404).json({error:'Utilizador não encontrado'});
+  if(target.role==='OWNER') return res.status(403).json({error:'A conta OWNER é protegida e não pode ser bloqueada por este painel.'});
+  if(target.role==='ADMIN' && req.user!.role!=='OWNER') return res.status(403).json({error:'Apenas o OWNER pode alterar o estado de uma conta ADMIN.'});
+  const q=await pool.query(`update users set status=$1,updated_at=now() where id=$2 returning id,email,phone,role,status`,[status,target.id]);
+  await audit(req.user!.id,`USER_STATUS_${status}`,'USER',target.id,{from:target.status,to:status});
+  res.json({ok:true,user:q.rows[0]});
+});
+
+app.post('/api/admin/artists/:id/verification', auth, adminOnly, async (req:AuthedRequest,res) => {
+  const verificationStatus=String(req.body?.verificationStatus||'').toUpperCase();
+  if(!VERIFICATION_STATUSES.includes(verificationStatus)) return res.status(400).json({error:'Estado de verificação inválido'});
+  const artist=(await pool.query(`select id,user_id,stage_name,verification_status from artists where id=$1`,[req.params.id])).rows[0];
+  if(!artist) return res.status(404).json({error:'Artista não encontrado'});
+  const q=await pool.query(`update artists set verification_status=$1 where id=$2 returning id,stage_name,verification_status`,[verificationStatus,artist.id]);
+  await audit(req.user!.id,'ARTIST_VERIFICATION_UPDATED','ARTIST',artist.id,{from:artist.verification_status,to:verificationStatus});
+  res.json({ok:true,artist:q.rows[0]});
+});
+
+app.post('/api/owner/admins', auth, async (req:AuthedRequest,res) => {
+  if(req.user?.role!=='OWNER') return res.status(403).json({error:'Apenas o OWNER pode criar contas ADMIN.'});
+  const email=String(req.body?.email||'').trim().toLowerCase();
+  const password=String(req.body?.password||'');
+  if(!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({error:'Informe um email válido.'});
+  if(password.length<12) return res.status(400).json({error:'A palavra-passe do ADMIN deve ter pelo menos 12 caracteres.'});
+  const duplicate=(await pool.query(`select id from users where lower(email)=lower($1) limit 1`,[email])).rows[0];
+  if(duplicate) return res.status(409).json({error:'Este email já está registado.'});
+  const q=await pool.query(`insert into users(email,password_hash,role,status,email_verified) values($1,$2,'ADMIN','ACTIVE',true) returning id,email,role,status,created_at`,[email,hashPassword(password)]);
+  await audit(req.user!.id,'ADMIN_CREATED','USER',q.rows[0].id,{email});
+  res.status(201).json({ok:true,user:q.rows[0]});
 });
 
 app.get('/api/admin/audit-logs', auth, adminOnly, async (_req,res) => {
