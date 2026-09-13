@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -167,6 +167,11 @@ function artistOnly(req: AuthedRequest, res: Response, next: NextFunction) {
 
 function adminOnly(req: AuthedRequest, res: Response, next: NextFunction) {
   if (!['ADMIN','OWNER'].includes(req.user?.role || '')) return res.status(403).json({ error: 'Acesso reservado à administração' });
+  next();
+}
+
+function ownerOnly(req: AuthedRequest, res: Response, next: NextFunction) {
+  if (req.user?.role !== 'OWNER') return res.status(403).json({ error: 'Apenas o OWNER pode aprovar operações financeiras.' });
   next();
 }
 
@@ -535,11 +540,39 @@ app.post('/api/releases/:id/payment', auth, artistOnly, async (req:AuthedRequest
   }finally{client.release()}
 });
 
-app.post('/api/admin/payments/:id/confirm', auth, adminOnly, async (req:AuthedRequest,res) => {
-  const q=await pool.query(`update payment_transactions set status='PAID',paid_at=now(),updated_at=now() where id=$1 and status='PENDING' returning id,release_id,status,paid_at,reference,amount,currency`,[req.params.id]);
+app.post('/api/admin/payments/:id/confirm', auth, ownerOnly, async (req:AuthedRequest,res) => {
+  const q=await pool.query(`update payment_transactions set status='PAID',paid_at=now(),updated_at=now(),reviewed_by=$2,reviewed_at=now(),review_reason=null where id=$1 and status='PENDING' returning id,release_id,status,paid_at,reference,amount,currency`,[req.params.id,req.user!.id]);
   if(!q.rows[0]) return res.status(404).json({error:'Pagamento pendente não encontrado'});
-  await audit(req.user!.id,'RELEASE_PAYMENT_CONFIRMED','PAYMENT',q.rows[0].id,{releaseId:q.rows[0].release_id});
+  await audit(req.user!.id,'RELEASE_PAYMENT_CONFIRMED','PAYMENT',q.rows[0].id,{releaseId:q.rows[0].release_id,approvedByOwner:true});
   res.json({ok:true,payment:q.rows[0]});
+});
+
+app.post('/api/owner/payments/:id/decision', auth, ownerOnly, async (req:AuthedRequest,res) => {
+  const {decision,reason}=req.body||{};
+  if(!['APPROVED','REJECTED'].includes(decision)) return res.status(400).json({error:'Decisão financeira inválida'});
+  if(decision==='REJECTED'&&!String(reason||'').trim()) return res.status(400).json({error:'Informe o motivo da rejeição do pagamento'});
+  const client=await pool.connect();
+  try{
+    await client.query('begin');
+    const status=decision==='APPROVED'?'PAID':'CANCELLED';
+    const q=await client.query(`update payment_transactions set status=$1,paid_at=case when $1='PAID' then now() else null end,updated_at=now(),reviewed_by=$2,reviewed_at=now(),review_reason=$3,metadata=metadata || $4::jsonb where id=$5 and status='PENDING' returning id,release_id,user_id,status,paid_at,reference,amount,currency,payment_method,reviewed_at,review_reason,created_at,metadata`,[status,req.user!.id,reason||null,JSON.stringify(decision==='REJECTED'?{ownerDecision:'REJECTED',ownerDecisionReason:String(reason||'')}:{ownerDecision:'APPROVED'}),req.params.id]);
+    if(!q.rows[0]){await client.query('rollback');return res.status(404).json({error:'Pagamento pendente não encontrado'});}
+    const payment=q.rows[0];
+    if(decision==='REJECTED'){
+      const walletAmount=Number(payment.metadata?.walletAmount||0);
+      const releaseId=payment.release_id;
+      if(walletAmount>0 && releaseId){
+        const artist=(await client.query(`select r.primary_artist_id artist_id from releases r where r.id=$1 limit 1`,[releaseId])).rows[0];
+        if(artist?.artist_id){
+          const bal=Number((await client.query(`select coalesce(sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount else 0 end),0) balance from financial_ledger where artist_id=$1`,[artist.artist_id])).rows[0].balance||0);
+          await client.query(`insert into financial_ledger(artist_id,entry_type,reference_type,reference_id,amount,currency,balance_after,description) values($1,'CREDIT','RELEASE_PAYMENT',$2,$3,'AOA',$4,'Devolução de saldo dos streams após rejeição do pagamento')`,[artist.artist_id,payment.id,walletAmount,bal+walletAmount]);
+        }
+      }
+    }
+    await client.query('commit');
+    await audit(req.user!.id,decision==='APPROVED'?'PAYMENT_APPROVED':'PAYMENT_REJECTED','PAYMENT',payment.id,{releaseId:payment.release_id,reason:reason||null,walletRefunded:decision==='REJECTED'?Number(payment.metadata?.walletAmount||0):0});
+    res.json({ok:true,payment});
+  }catch(e){await client.query('rollback');console.error('owner payment decision error',e);res.status(500).json({error:'Não foi possível guardar a decisão financeira'});}finally{client.release();}
 });
 
 app.get('/api/admin/payments/pending', auth, adminOnly, async (_req,res) => {
@@ -972,12 +1005,23 @@ app.post('/api/admin/royalty-periods/calculate', auth, adminOnly, async (req:Aut
   }catch(e){await client.query('rollback');console.error(e);res.status(500).json({error:'Não foi possível calcular os royalties'});}finally{client.release();}
 });
 
+app.get('/api/owner/finance/approvals', auth, ownerOnly, async (_req,res) => {
+  try {
+    const [payments,withdrawals,summary]=await Promise.all([
+      pool.query(`select p.id,p.reference,p.amount,p.currency,p.payment_method,p.gateway,p.status,p.created_at,p.release_id,r.title release_title,a.stage_name,u.full_name from payment_transactions p left join releases r on r.id=p.release_id left join artists a on a.id=r.primary_artist_id left join users u on u.id=a.user_id where p.status='PENDING' order by p.created_at asc`),
+      pool.query(`select w.id,w.amount,w.currency,w.method,w.destination,w.status,w.fee,w.net_amount,w.created_at,a.stage_name,u.full_name from withdrawals w join artists a on a.id=w.artist_id left join users u on u.id=a.user_id where w.status='PENDING' order by w.created_at asc`),
+      pool.query(`select (select count(*) from payment_transactions where status='PENDING')::int pending_payment_count, coalesce((select sum(amount) from payment_transactions where status='PENDING'),0) pending_payment_amount, (select count(*) from withdrawals where status='PENDING')::int pending_withdrawal_count, coalesce((select sum(amount) from withdrawals where status='PENDING'),0) pending_withdrawal_amount`)
+    ]);
+    res.json({payments:payments.rows,withdrawals:withdrawals.rows,summary:summary.rows[0]||{}});
+  } catch(e){ console.error(e); res.status(500).json({error:'Não foi possível carregar as aprovações financeiras'}); }
+});
+
 app.get('/api/admin/withdrawals', auth, adminOnly, async (_req,res) => {
   const q=await pool.query(`select w.*,a.stage_name,u.email from withdrawals w join artists a on a.id=w.artist_id left join users u on u.id=a.user_id order by w.created_at desc`);
   res.json({withdrawals:q.rows});
 });
 
-app.post('/api/admin/withdrawals/:id/decision', auth, adminOnly, async (req:AuthedRequest,res) => {
+app.post('/api/admin/withdrawals/:id/decision', auth, ownerOnly, async (req:AuthedRequest,res) => {
   const {decision,reason}=req.body||{};
   if(!['APPROVED','REJECTED'].includes(decision)) return res.status(400).json({error:'Decisão inválida'});
   if(decision==='REJECTED'&&!String(reason||'').trim()) return res.status(400).json({error:'Informe o motivo da rejeição'});
