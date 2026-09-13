@@ -855,6 +855,29 @@ app.get('/api/artists/me/analytics', auth, artistOnly, async (req:AuthedRequest,
   res.json({artist,analytics:await streamAnalytics(artist.id,range.from,range.to)});
 });
 
+app.get('/api/owner/dashboard', auth, adminOnly, async (req:AuthedRequest,res) => {
+  if(req.user?.role!=='OWNER') return res.status(403).json({error:'Apenas o OWNER pode consultar o painel principal.'});
+  try {
+    const counts=(await pool.query(`select
+      count(*)::int as total_users,
+      count(*) filter(where role='ARTIST')::int as total_artists,
+      count(*) filter(where role='LISTENER')::int as total_listeners,
+      count(*) filter(where role='ADMIN')::int as total_admins
+      from users`)).rows[0]||{};
+    const recent=(await pool.query(`select r.id,r.title,r.type,r.status,r.cover_url,r.release_date,r.created_at,a.stage_name
+      from releases r join artists a on a.id=r.primary_artist_id
+      order by r.created_at desc limit 6`)).rows;
+    const topArtists=(await pool.query(`select a.id,a.stage_name,count(se.id)::int streams
+      from artists a
+      left join releases r on r.primary_artist_id=a.id
+      left join tracks t on t.primary_release_id=r.id
+      left join stream_events se on se.track_id=t.id and se.is_valid=true
+      group by a.id,a.stage_name order by streams desc,a.stage_name asc limit 5`)).rows;
+    const pending=(await pool.query(`select count(*)::int as count from releases where status='PENDING_APPROVAL'`)).rows[0]||{};
+    res.json({counts:{totalUsers:Number(counts.total_users||0),totalArtists:Number(counts.total_artists||0),totalListeners:Number(counts.total_listeners||0),totalAdmins:Number(counts.total_admins||0)},recent,recentPending:Number(pending.count||0),topArtists});
+  } catch(e){ console.error(e); res.status(500).json({error:'Não foi possível carregar o painel do OWNER'}); }
+});
+
 app.get('/api/admin/analytics/streams', auth, requireAdminPermission('ANALYTICS'), async (req,res)=>{
   const range=dateRange(req); if(!range) return res.status(400).json({error:'Período inválido'});
   res.json({analytics:await streamAnalytics(null,range.from,range.to)});
