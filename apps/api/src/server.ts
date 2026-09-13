@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -231,7 +231,7 @@ app.post('/api/auth/register', async (req,res) => {
 app.post('/api/auth/login', async (req,res) => {
   const { email, phone, password } = req.body || {};
   if ((!email && !phone) || !password) return res.status(400).json({error:'Informe os dados de acesso'});
-  const q = await pool.query(`select id,email,phone,password_hash,role,status,email_verified,mfa_enabled from users where (email=$1 or phone=$2) limit 1`, [String(email||'').trim().toLowerCase() || null, phone || null]);
+  const q = await pool.query(`select id,email,phone,password_hash,role,status,email_verified,mfa_enabled,full_name,birth_date,admin_title,admin_permissions from users where (email=$1 or phone=$2) limit 1`, [String(email||'').trim().toLowerCase() || null, phone || null]);
   const user = q.rows[0];
   if (!user || user.status !== 'ACTIVE' || !verifyPassword(password,user.password_hash)) return res.status(401).json({error:'Credenciais inválidas'});
   if(!user.email_verified) return res.status(403).json({error:'Verifica primeiro o teu email. Podes pedir um novo link de verificação.',code:'EMAIL_NOT_VERIFIED'});
@@ -243,11 +243,11 @@ app.post('/api/auth/login', async (req,res) => {
 
 app.post('/api/auth/verify-2fa', async (req,res)=>{
   const {challenge,code}=req.body||{}; if(!challenge||!code) return res.status(400).json({error:'Código 2FA obrigatório'});
-  const row=(await pool.query(`select c.id,c.user_id,u.email,u.phone,u.role,u.status,u.mfa_secret_enc from auth_challenges c join users u on u.id=c.user_id where c.challenge_hash=$1 and c.type='LOGIN_2FA' and c.used_at is null and c.expires_at>now() limit 1`,[hashToken(String(challenge))])).rows[0];
+  const row=(await pool.query(`select c.id,c.user_id,u.email,u.phone,u.role,u.status,u.mfa_secret_enc,u.full_name,u.birth_date,u.admin_title,u.admin_permissions from auth_challenges c join users u on u.id=c.user_id where c.challenge_hash=$1 and c.type='LOGIN_2FA' and c.used_at is null and c.expires_at>now() limit 1`,[hashToken(String(challenge))])).rows[0];
   if(!row || row.status!=='ACTIVE') return res.status(401).json({error:'Desafio 2FA inválido ou expirado'});
   if(!verifyTotp(decryptSecret(row.mfa_secret_enc),String(code))) return res.status(401).json({error:'Código 2FA incorreto'});
   await pool.query('update auth_challenges set used_at=now() where id=$1',[row.id]); const sid=crypto.randomUUID(); await pool.query(`insert into auth_sessions(id,user_id,role,last_activity_at,user_agent_hash) values($1,$2,$3,now(),$4)`,[sid,row.user_id,row.role,hashToken(String(req.headers['user-agent']||''))]);
-  res.json({user:{id:row.user_id,email:row.email,phone:row.phone,role:row.role,status:row.status},token:tokenFor({id:row.user_id,role:row.role},sid)});
+  res.json({user:{id:row.user_id,email:row.email,phone:row.phone,role:row.role,status:row.status,full_name:row.full_name,birth_date:row.birth_date,admin_title:row.admin_title,admin_permissions:row.admin_permissions},token:tokenFor({id:row.user_id,role:row.role},sid)});
 });
 
 app.post('/api/auth/resend-verification', async (req,res)=>{
@@ -291,7 +291,7 @@ app.post('/api/auth/2fa/enable', auth, async (req:AuthedRequest,res)=>{ if(!['AD
 app.post('/api/auth/2fa/disable', auth, async (req:AuthedRequest,res)=>{ if(!['ADMIN','OWNER'].includes(req.user!.role)) return res.status(403).json({error:'Acesso reservado à administração'}); const row=(await pool.query('select mfa_secret_enc,mfa_enabled from users where id=$1',[req.user!.id])).rows[0]; if(!row?.mfa_enabled) return res.json({ok:true}); if(!verifyTotp(decryptSecret(row.mfa_secret_enc),String(req.body?.code||''))) return res.status(400).json({error:'Código 2FA incorreto'}); await pool.query('update users set mfa_enabled=false,mfa_pending=false,mfa_secret_enc=null where id=$1',[req.user!.id]); res.json({ok:true,message:'2FA desativado.'}); });
 
 app.get('/api/auth/me', auth, async (req:AuthedRequest,res) => {
-  const q = await pool.query(`select id,email,phone,role,status,email_verified,phone_verified,mfa_enabled,created_at from users where id=$1`, [req.user!.id]);
+  const q = await pool.query(`select id,email,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,admin_title,admin_permissions,created_at,updated_at from users where id=$1`, [req.user!.id]);
   if (!q.rows[0]) return res.status(404).json({error:'Utilizador não encontrado'});
   const artist = (await pool.query(`select id,stage_name,legal_name,bio,country,city,photo_url,verification_status from artists where user_id=$1`, [req.user!.id])).rows[0] || null;
   res.json({user:q.rows[0],artist});
@@ -689,7 +689,7 @@ app.get('/api/admin/users', auth, requireAnyAdminPermission(['USERS','ARTISTS','
 });
 
 app.get('/api/admin/users/:id', auth, requireAnyAdminPermission(['USERS','ARTISTS','TEAM']), async (req:AuthedRequest,res) => {
-  const user=(await pool.query(`select id,email,phone,role,status,email_verified,phone_verified,admin_title,admin_permissions,created_at,updated_at from users where id=$1`,[req.params.id])).rows[0];
+  const user=(await pool.query(`select id,email,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,admin_title,admin_permissions,created_at,updated_at from users where id=$1`,[req.params.id])).rows[0];
   if(!user) return res.status(404).json({error:'Utilizador não encontrado'});
   const artist=(await pool.query(`select id,stage_name,legal_name,bio,country,city,photo_url,verification_status,status,created_at from artists where user_id=$1`,[req.params.id])).rows[0]||null;
   const releases=artist?(await pool.query(`select id,title,type,status,preflight_status,submitted_at,reviewed_at,review_reason,created_at from releases where primary_artist_id=$1 order by created_at desc limit 100`,[artist.id])).rows:[];
@@ -724,18 +724,47 @@ app.post('/api/admin/artists/:id/verification', auth, requireAdminPermission('AR
   res.json({ok:true,artist:q.rows[0]});
 });
 
+app.delete('/api/owner/admins/:id', auth, async (req:AuthedRequest,res:Response) => {
+  if(req.user?.role!=='OWNER') return res.status(403).json({error:'Apenas o OWNER pode apagar contas ADMIN.'});
+  const target=(await pool.query(`select id,email,role,status,admin_title from users where id=$1`,[req.params.id])).rows[0];
+  if(!target) return res.status(404).json({error:'ADMIN não encontrado'});
+  if(target.role!=='ADMIN') return res.status(400).json({error:'Só é possível apagar contas ADMIN por esta operação.'});
+  if(target.id===req.user!.id) return res.status(400).json({error:'Não podes apagar a tua própria conta.'});
+  await audit(req.user!.id,'ADMIN_DELETED','USER',target.id,{email:target.email,adminTitle:target.admin_title,status:target.status});
+  await pool.query("delete from users where id=$1 and role='ADMIN'",[target.id]);
+  res.json({ok:true,message:'Conta ADMIN apagada com sucesso.'});
+});
+
+app.patch('/api/admin/me/profile', auth, async (req:AuthedRequest,res:Response) => {
+  if(req.user?.role!=='ADMIN') return res.status(403).json({error:'Apenas ADMIN pode atualizar o próprio perfil por esta rota.'});
+  const fullName=String(req.body?.fullName||'').trim().slice(0,160)||null;
+  const phone=String(req.body?.phone||'').trim().slice(0,40)||null;
+  const birthDate=String(req.body?.birthDate||'').trim()||null;
+  if(birthDate && !/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) return res.status(400).json({error:'Data de nascimento inválida.'});
+  try{
+    const q=await pool.query(`update users set full_name=$1,phone=$2,birth_date=$3,updated_at=now() where id=$4 and role='ADMIN' returning id,email,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,admin_title,admin_permissions,created_at,updated_at`,[fullName,phone,birthDate,req.user.id]);
+    if(!q.rows[0]) return res.status(404).json({error:'ADMIN não encontrado'});
+    await audit(req.user.id,'ADMIN_PROFILE_UPDATED','USER',req.user.id,{phoneChanged:Boolean(phone),profileFields:['full_name','phone','birth_date']});
+    res.json({ok:true,user:q.rows[0]});
+  }catch(e:any){res.status(e.code==='23505'?409:500).json({error:e.code==='23505'?'Este telefone já está registado.':'Não foi possível atualizar o perfil.'});}
+});
+
 app.post('/api/owner/admins', auth, async (req:AuthedRequest,res:Response) => {
   if(req.user?.role!=='OWNER') return res.status(403).json({error:'Apenas o OWNER pode criar contas ADMIN.'});
   const email=String(req.body?.email||'').trim().toLowerCase();
   const password=String(req.body?.password||'');
   const adminTitle=String(req.body?.adminTitle||'Administrador').trim().slice(0,100)||'Administrador';
+  const fullName=String(req.body?.fullName||'').trim().slice(0,160)||null;
+  const phone=String(req.body?.phone||'').trim().slice(0,40)||null;
+  const birthDate=String(req.body?.birthDate||'').trim()||null;
+  if(birthDate && !/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) return res.status(400).json({error:'Data de nascimento inválida.'});
   const permissions=Array.isArray(req.body?.permissions)?req.body.permissions.filter((p:any)=>ADMIN_PERMISSIONS.includes(String(p))):[];
   if(!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({error:'Informe um email válido.'});
   if(password.length<12) return res.status(400).json({error:'A palavra-passe do ADMIN deve ter pelo menos 12 caracteres.'});
   if(!permissions.length) return res.status(400).json({error:'Selecione pelo menos uma função para o ADMIN.'});
   const duplicate=(await pool.query(`select id from users where lower(email)=lower($1) limit 1`,[email])).rows[0];
   if(duplicate) return res.status(409).json({error:'Este email já está registado.'});
-  const q=await pool.query(`insert into users(email,password_hash,role,status,email_verified,admin_title,admin_permissions) values($1,$2,'ADMIN','ACTIVE',false,$3,$4::jsonb) returning id,email,role,status,admin_title,admin_permissions,created_at`,[email,hashPassword(password),adminTitle,JSON.stringify(permissions)]);
+  const q=await pool.query(`insert into users(email,phone,password_hash,role,status,email_verified,full_name,birth_date,admin_title,admin_permissions) values($1,$2,$3,'ADMIN','ACTIVE',false,$4,$5,$6,$7::jsonb) returning id,email,phone,role,status,full_name,birth_date,admin_title,admin_permissions,created_at`,[email,phone,hashPassword(password),fullName,birthDate,adminTitle,JSON.stringify(permissions)]);
   const raw=randomToken(); await pool.query(`insert into auth_email_tokens(id,user_id,token_hash,type,expires_at) values($1,$2,$3,'VERIFY_EMAIL',now()+interval '24 hours')`,[crypto.randomUUID(),q.rows[0].id,hashToken(raw)]);
   await sendEmail(email,'Ativação da conta ADMIN — BaBuLo Play',`A tua conta de administrador foi criada. Confirma o teu email neste link (válido por 24 horas): ${publicWebUrl('/',raw).replace('?token=','?verify=')}`);
   await audit(req.user!.id,'ADMIN_CREATED','USER',q.rows[0].id,{email,adminTitle,permissions});
