@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql', '024_rights_splits_payouts.sql', '025_rights_matching_scan.sql', '026_existing_artist_email_verification.sql', '027_admin_payroll_attendance.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql', '024_rights_splits_payouts.sql', '025_rights_matching_scan.sql', '026_existing_artist_email_verification.sql', '027_admin_payroll_attendance.sql', '028_admin_attendance_workflow.sql', '029_admin_attendance_notifications.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -960,28 +960,16 @@ app.delete('/api/owner/admins/:id', auth, async (req:AuthedRequest,res:Response)
 });
 
 app.patch('/api/owner/admins/:id', auth, async (req:AuthedRequest,res:Response) => {
-  if(req.user?.role!=='OWNER') return res.status(403).json({error:'Apenas o OWNER pode alterar funções de ADMIN.'});
+  if(req.user?.role!=='OWNER') return res.status(403).json({error:'Apenas o OWNER pode alterar permissões de ADMIN.'});
   const target=(await pool.query(`select id,role,admin_title,admin_permissions from users where id=$1`,[req.params.id])).rows[0];
   if(!target) return res.status(404).json({error:'ADMIN não encontrado'});
-  if(target.role!=='ADMIN') return res.status(400).json({error:'Só é possível alterar funções de contas ADMIN.'});
-  const adminTitle=String(req.body?.adminTitle||'Administrador').trim().slice(0,100)||'Administrador';
-  const fullName=String(req.body?.fullName||'').trim().slice(0,160)||null;
-  const phone=String(req.body?.phone||'').trim().slice(0,40)||null;
-  const birthDate=String(req.body?.birthDate||'').trim()||null;
-  const gender=String(req.body?.gender||'').trim().slice(0,40)||null;
-  const heightCm=req.body?.heightCm===''||req.body?.heightCm==null?null:Number(req.body.heightCm);
-  const education=String(req.body?.education||'').trim().slice(0,240)||null;
-  const address=String(req.body?.address||'').trim().slice(0,500)||null;
-  const maritalStatus=String(req.body?.maritalStatus||'').trim().slice(0,60)||null;
-  const profilePhotoUrl=String(req.body?.profilePhotoUrl||'').trim().slice(0,1000)||null;
-  if(birthDate && !/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) return res.status(400).json({error:'Data de nascimento inválida.'});
-  if(heightCm!==null && (!Number.isFinite(heightCm)||heightCm<110||heightCm>220)) return res.status(400).json({error:'Altura inválida. Deve estar entre 1,10 m e 2,20 m.'});
+  if(target.role!=='ADMIN') return res.status(400).json({error:'Só é possível alterar permissões de contas ADMIN.'});
   const permissions=Array.isArray(req.body?.permissions)?req.body.permissions.filter((p:any)=>ADMIN_PERMISSIONS.includes(String(p))):[];
-  if(!permissions.length) return res.status(400).json({error:'Selecione pelo menos uma função/permissão.'});
-  const q=await pool.query(`update users set admin_title=$1,admin_permissions=$2::jsonb,full_name=$3,phone=$4,birth_date=$5,gender=$6,height_cm=$7,education=$8,address=$9,marital_status=$10,profile_photo_url=$11,updated_at=now() where id=$12 and role='ADMIN' returning id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,gender,height_cm,education,address,marital_status,profile_photo_url,admin_title,admin_permissions,created_at,updated_at`,[adminTitle,JSON.stringify(permissions),fullName,phone,birthDate,gender,heightCm,education,address,maritalStatus,profilePhotoUrl,target.id]);
+  if(!permissions.length) return res.status(400).json({error:'Selecione pelo menos uma permissão.'});
+  const q=await pool.query(`update users set admin_permissions=$1::jsonb,updated_at=now() where id=$2 and role='ADMIN' returning id,phone,role,status,email_verified,phone_verified,mfa_enabled,full_name,birth_date,gender,height_cm,education,address,marital_status,profile_photo_url,admin_title,admin_permissions,created_at,updated_at`,[JSON.stringify(permissions),target.id]);
   await pool.query(`update auth_sessions set revoked_at=now() where user_id=$1 and revoked_at is null`,[target.id]);
-  await audit(req.user!.id,'ADMIN_ROLE_UPDATED','USER',target.id,{fromTitle:target.admin_title,toTitle:adminTitle,fromPermissions:target.admin_permissions,toPermissions:permissions});
-  res.json({ok:true,user:q.rows[0],message:'Função e permissões atualizadas. O ADMIN deverá iniciar uma nova sessão.'});
+  await audit(req.user!.id,'ADMIN_PERMISSIONS_UPDATED','USER',target.id,{fromPermissions:target.admin_permissions,toPermissions:permissions});
+  res.json({ok:true,user:q.rows[0],message:'Permissões atualizadas. O ADMIN deverá iniciar uma nova sessão.'});
 });
 
 app.patch('/api/admin/me/profile', auth, async (req:AuthedRequest,res:Response) => {
@@ -1226,7 +1214,7 @@ app.get('/api/owner/admins/:id/payroll', auth, ownerOnly, async (req:AuthedReque
     const admin=(await pool.query(`select id,full_name,admin_title,status from users where id=$1 and role='ADMIN'`,[req.params.id])).rows[0];
     if(!admin) return res.status(404).json({error:'ADMIN não encontrado'});
     const settings=(await pool.query(`select * from admin_payroll_settings where admin_user_id=$1`,[admin.id])).rows[0]||{admin_user_id:admin.id,daily_rate:0,monthly_salary:0,currency:'AOA',effective_from:new Date().toISOString().slice(0,10)};
-    const attendance=(await pool.query(`select id,attendance_date,status,note,justification_document_name,justification_mime_type,reviewed_at,created_at from admin_attendance where admin_user_id=$1 order by attendance_date desc limit 120`,[admin.id])).rows;
+    const attendance=(await pool.query(`select id,attendance_date,status,note,justification_document_name,justification_mime_type,justification_status,review_reason,submitted_at,reviewed_at,marked_by,marked_at,created_at from admin_attendance where admin_user_id=$1 order by attendance_date desc limit 120`,[admin.id])).rows;
     const adjustments=(await pool.query(`select id,adjustment_type,amount,reference_month,description,created_at from admin_payroll_adjustments where admin_user_id=$1 order by reference_month desc,created_at desc limit 120`,[admin.id])).rows;
     const month=String(req.query.month||new Date().toISOString().slice(0,7)).slice(0,7);
     const monthStart=month+'-01';
@@ -1246,13 +1234,79 @@ app.put('/api/owner/admins/:id/payroll', auth, ownerOnly, async (req:AuthedReque
   await audit(req.user!.id,'OWNER_ADMIN_PAYROLL_UPDATED','ADMIN_PAYROLL',admin.id,{dailyRate,monthlySalary,effectiveFrom}); res.json({settings:q.rows[0]});
 });
 
-app.post('/api/owner/admins/:id/payroll/attendance', auth, ownerOnly, async (req:AuthedRequest,res)=>{
-  const attendanceDate=String(req.body?.attendanceDate||'').trim(),status=String(req.body?.status||'ABSENT').toUpperCase(),note=String(req.body?.note||'').trim().slice(0,1000)||null,documentKey=String(req.body?.documentKey||'').trim().slice(0,500)||null,documentName=String(req.body?.documentName||'').trim().slice(0,255)||null,documentMime=String(req.body?.documentMime||'').trim().slice(0,100)||null;
-  if(!/^\d{4}-\d{2}-\d{2}$/.test(attendanceDate)||!['PRESENT','ABSENT','EXCUSED'].includes(status))return res.status(400).json({error:'Data ou estado da falta inválido.'});
-  const admin=(await pool.query(`select id,role from users where id=$1`,[req.params.id])).rows[0]; if(!admin||admin.role!=='ADMIN')return res.status(404).json({error:'ADMIN não encontrado'});
-  if(status==='EXCUSED'&&!documentKey&&!note)return res.status(400).json({error:'Uma falta justificada deve ter uma observação ou documento.'});
-  const q=await pool.query(`insert into admin_attendance(admin_user_id,attendance_date,status,note,justification_document_key,justification_document_name,justification_mime_type,reviewed_by,reviewed_at) values($1,$2,$3,$4,$5,$6,$7,$8,now()) on conflict(admin_user_id,attendance_date) do update set status=excluded.status,note=excluded.note,justification_document_key=coalesce(excluded.justification_document_key,admin_attendance.justification_document_key),justification_document_name=coalesce(excluded.justification_document_name,admin_attendance.justification_document_name),justification_mime_type=coalesce(excluded.justification_mime_type,admin_attendance.justification_mime_type),reviewed_by=excluded.reviewed_by,reviewed_at=now(),updated_at=now() returning id,attendance_date,status,note,justification_document_name,justification_mime_type,reviewed_at,created_at`,[admin.id,attendanceDate,status,note,documentKey,documentName,documentMime,req.user!.id]);
-  await audit(req.user!.id,'OWNER_ADMIN_ATTENDANCE_UPDATED','ADMIN_PAYROLL',admin.id,{attendanceDate,status}); res.json({attendance:q.rows[0]});
+app.get('/api/admin/me/attendance', auth, async (req:AuthedRequest,res:Response)=>{
+  if(req.user?.role!=='ADMIN') return res.status(403).json({error:'Apenas ADMIN pode consultar a própria assiduidade.'});
+  const rows=(await pool.query(`select id,attendance_date,status,note,justification_document_name,justification_mime_type,justification_status,review_reason,submitted_at,reviewed_at,marked_by,marked_at,created_at from admin_attendance where admin_user_id=$1 order by attendance_date desc limit 120`,[req.user.id])).rows;
+  res.json({attendance:rows});
+});
+
+app.get('/api/admin/me/notifications', auth, async (req:AuthedRequest,res:Response)=>{
+  if(req.user?.role!=='ADMIN') return res.status(403).json({error:'Apenas ADMIN pode consultar notificações.'});
+  const rows=(await pool.query(`select id,type,title,message,reference_id,read_at,created_at from admin_notifications where admin_user_id=$1 order by created_at desc limit 50`,[req.user.id])).rows;
+  res.json({notifications:rows});
+});
+
+app.post('/api/admin/me/notifications/:id/read', auth, async (req:AuthedRequest,res:Response)=>{
+  if(req.user?.role!=='ADMIN') return res.status(403).json({error:'Apenas ADMIN pode atualizar notificações.'});
+  await pool.query(`update admin_notifications set read_at=coalesce(read_at,now()) where id=$1 and admin_user_id=$2`,[req.params.id,req.user.id]);
+  res.json({ok:true});
+});
+
+app.post('/api/owner/admins/:id/payroll/attendance/mark', auth, ownerOnly, async (req:AuthedRequest,res:Response)=>{
+  const attendanceDate=String(req.body?.attendanceDate||'').trim();
+  const note=String(req.body?.note||'').trim().slice(0,1000)||null;
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(attendanceDate)) return res.status(400).json({error:'Data da falta inválida.'});
+  if(attendanceDate>new Date().toISOString().slice(0,10)) return res.status(400).json({error:'Não é possível marcar uma falta futura.'});
+  const admin=(await pool.query(`select id,role,full_name from users where id=$1`,[req.params.id])).rows[0];
+  if(!admin||admin.role!=='ADMIN') return res.status(404).json({error:'ADMIN não encontrado'});
+  const existing=(await pool.query(`select id,status,justification_status from admin_attendance where admin_user_id=$1 and attendance_date=$2`,[admin.id,attendanceDate])).rows[0];
+  if(existing?.justification_status==='APPROVED') return res.status(409).json({error:'Esta falta já foi justificada e confirmada pelo Owner.'});
+  const q=await pool.query(`insert into admin_attendance(admin_user_id,attendance_date,status,note,justification_status,marked_by,marked_at,created_at,updated_at) values($1,$2,'ABSENT',$3,'NONE',$4,now(),now(),now()) on conflict(admin_user_id,attendance_date) do update set status='ABSENT',note=coalesce(excluded.note,admin_attendance.note),justification_status=case when admin_attendance.justification_status='PENDING' then 'PENDING' else 'NONE' end,marked_by=excluded.marked_by,marked_at=now(),updated_at=now() returning id,attendance_date,status,note,justification_status,marked_by,marked_at`,[admin.id,attendanceDate,note,req.user!.id]);
+  const row=q.rows[0];
+  await pool.query(`insert into admin_notifications(admin_user_id,type,title,message,reference_id) values($1,'ATTENDANCE_MARKED','Falta registada pelo Owner',$2,$3)`,[admin.id,`Foi registada uma falta no dia ${attendanceDate}. Abra o dia para enviar a sua justificação.`,row.id]);
+  await audit(req.user!.id,'OWNER_ADMIN_ATTENDANCE_MARKED','ADMIN_PAYROLL',admin.id,{attendanceId:row.id,attendanceDate,note});
+  res.status(201).json({attendance:row,message:'Falta marcada e ADMIN notificado.'});
+});
+
+app.post('/api/admin/me/attendance/justification/upload', auth, upload.single('file'), async (req:AuthedRequest,res:Response)=>{
+  if(req.user?.role!=='ADMIN') return res.status(403).json({error:'Apenas ADMIN pode carregar documentos de justificação.'});
+  if(!req.file) return res.status(400).json({error:'Nenhum documento enviado.'});
+  const ext=path.extname(req.file.originalname).toLowerCase(); const allowed=['.pdf','.jpg','.jpeg','.png','.doc','.docx'];
+  if(!allowed.includes(ext)){try{fs.unlinkSync(req.file.path)}catch{};return res.status(400).json({error:'Documento inválido. Use PDF, JPG, PNG, DOC ou DOCX.'});}
+  const finalName=`${req.user.id}-${Date.now()}-${crypto.randomUUID()}${ext}`,finalPath=path.join(uploadDir,finalName); fs.renameSync(req.file.path,finalPath);
+  res.status(201).json({file:{storageKey:finalName,name:req.file.originalname,mimeType:req.file.mimetype,size:req.file.size,url:`/media/${finalName}`}});
+});
+
+app.post('/api/admin/me/attendance/justification', auth, async (req:AuthedRequest,res:Response)=>{
+  if(req.user?.role!=='ADMIN') return res.status(403).json({error:'Apenas ADMIN pode enviar uma justificação.'});
+  const attendanceId=String(req.body?.attendanceId||'').trim();
+  const note=String(req.body?.note||'').trim().slice(0,1000)||null,documentKey=String(req.body?.documentKey||'').trim().slice(0,500)||null,documentName=String(req.body?.documentName||'').trim().slice(0,255)||null,documentMime=String(req.body?.documentMime||'').trim().slice(0,100)||null;
+  if(!attendanceId) return res.status(400).json({error:'Selecione a falta marcada pelo Owner.'});
+  if(!note && !documentKey) return res.status(400).json({error:'Indica o motivo ou carrega um documento de justificação.'});
+  if(documentKey && !documentKey.startsWith(String(req.user.id)+'-')) return res.status(403).json({error:'Documento não pertence à tua conta.'});
+  const existing=(await pool.query(`select id,attendance_date,status,marked_by,justification_status from admin_attendance where id=$1 and admin_user_id=$2`,[attendanceId,req.user.id])).rows[0];
+  if(!existing) return res.status(404).json({error:'Falta marcada pelo Owner não encontrada.'});
+  if(!existing.marked_by || existing.status!=='ABSENT') return res.status(400).json({error:'Só podes justificar uma falta marcada pelo Owner.'});
+  if(existing.justification_status==='PENDING') return res.status(409).json({error:'Já existe uma justificação pendente para esta falta.'});
+  const q=await pool.query(`update admin_attendance set note=$1,justification_document_key=coalesce($2,justification_document_key),justification_document_name=coalesce($3,justification_document_name),justification_mime_type=coalesce($4,justification_mime_type),justification_status='PENDING',submitted_by=$5,submitted_at=now(),reviewed_by=null,reviewed_at=null,review_reason=null,updated_at=now() where id=$6 and admin_user_id=$5 returning id,attendance_date,status,note,justification_document_name,justification_mime_type,justification_status,submitted_at`,[note,documentKey,documentName,documentMime,req.user.id,attendanceId]);
+  await pool.query(`insert into admin_notifications(admin_user_id,type,title,message,reference_id) values($1,'ATTENDANCE_SUBMITTED','Justificação enviada','A tua justificação foi enviada ao Owner para análise.', $2)`,[req.user.id,attendanceId]);
+  await audit(req.user.id,'ADMIN_ATTENDANCE_JUSTIFICATION_SUBMITTED','ADMIN_PAYROLL',req.user.id,{attendanceId,attendanceDate:existing.attendance_date});
+  res.status(201).json({attendance:q.rows[0],message:'Justificação enviada ao Owner para confirmação.'});
+});
+
+app.post('/api/owner/admins/:id/payroll/attendance/:attendanceId/decision', auth, ownerOnly, async (req:AuthedRequest,res:Response)=>{
+  const decision=String(req.body?.decision||'').toUpperCase(),reason=String(req.body?.reason||'').trim().slice(0,1000)||null;
+  if(!['APPROVE','REJECT'].includes(decision)) return res.status(400).json({error:'Decisão inválida.'});
+  if(decision==='REJECT'&&!reason) return res.status(400).json({error:'Informe o motivo da rejeição.'});
+  const admin=(await pool.query(`select id,role from users where id=$1`,[req.params.id])).rows[0];
+  if(!admin||admin.role!=='ADMIN') return res.status(404).json({error:'ADMIN não encontrado'});
+  const q=await pool.query(`update admin_attendance set status=$1,justification_status=$2,reviewed_by=$3,reviewed_at=now(),review_reason=$4,updated_at=now() where id=$5 and admin_user_id=$6 and marked_by is not null and justification_status='PENDING' returning id,attendance_date,status,note,justification_document_name,justification_mime_type,justification_status,review_reason,reviewed_at`,[decision==='APPROVE'?'EXCUSED':'ABSENT',decision==='APPROVE'?'APPROVED':'REJECTED',req.user!.id,reason,req.params.attendanceId,admin.id]);
+  if(!q.rows[0]) return res.status(404).json({error:'Justificação pendente não encontrada.'});
+  const title=decision==='APPROVE'?'Falta justificada':'Justificação rejeitada';
+  const message=decision==='APPROVE'?`A tua falta do dia ${q.rows[0].attendance_date} foi justificada pelo Owner.`:`A tua justificação da falta do dia ${q.rows[0].attendance_date} foi rejeitada.${reason?` Motivo: ${reason}`:''}`;
+  await pool.query(`insert into admin_notifications(admin_user_id,type,title,message,reference_id) values($1,$2,$3,$4,$5)`,[admin.id,decision==='APPROVE'?'ATTENDANCE_APPROVED':'ATTENDANCE_REJECTED',title,message,q.rows[0].id]);
+  await audit(req.user!.id,decision==='APPROVE'?'OWNER_ADMIN_ATTENDANCE_APPROVED':'OWNER_ADMIN_ATTENDANCE_REJECTED','ADMIN_PAYROLL',admin.id,{attendanceId:req.params.attendanceId,reason});
+  res.json({ok:true,attendance:q.rows[0]});
 });
 
 app.post('/api/owner/admins/:id/payroll/discount', auth, ownerOnly, async (req:AuthedRequest,res)=>{
@@ -1274,6 +1328,15 @@ app.post('/api/owner/admins/:id/payroll/justification', auth, ownerOnly, upload.
   const admin=(await pool.query(`select id,role from users where id=$1`,[req.params.id])).rows[0]; if(!admin||admin.role!=='ADMIN'){try{fs.unlinkSync(req.file.path)}catch{};return res.status(404).json({error:'ADMIN não encontrado'});}
   const finalName=`owner-${req.user!.id}-payroll-${crypto.randomUUID()}${ext}`,finalPath=path.join(uploadDir,finalName); fs.renameSync(req.file.path,finalPath);
   res.status(201).json({file:{storageKey:finalName,name:req.file.originalname,mimeType:req.file.mimetype,size:req.file.size}});
+});
+
+app.post('/api/admin/me/attendance/justification/upload', auth, upload.single('file'), async (req:AuthedRequest,res:Response)=>{
+  if(req.user?.role!=='ADMIN') return res.status(403).json({error:'Apenas ADMIN pode carregar documentos de justificação.'});
+  if(!req.file) return res.status(400).json({error:'Nenhum documento enviado.'});
+  const ext=path.extname(req.file.originalname).toLowerCase(); const allowed=['.pdf','.jpg','.jpeg','.png','.doc','.docx'];
+  if(!allowed.includes(ext)){try{fs.unlinkSync(req.file.path)}catch{};return res.status(400).json({error:'Documento inválido. Use PDF, JPG, PNG, DOC ou DOCX.'});}
+  const finalName=`${req.user.id}-${Date.now()}-${crypto.randomUUID()}${ext}`,finalPath=path.join(uploadDir,finalName); fs.renameSync(req.file.path,finalPath);
+  res.status(201).json({file:{storageKey:finalName,name:req.file.originalname,mimeType:req.file.mimetype,size:req.file.size,url:`/media/${finalName}`}});
 });
 
 app.get('/api/owner/admins/:id/payroll/justification/:attendanceId', auth, ownerOnly, async (req:AuthedRequest,res)=>{

@@ -396,3 +396,28 @@ create table if not exists admin_payroll_adjustments(
  created_at timestamptz not null default now()
 );
 create index if not exists idx_admin_payroll_adjustments_admin_month on admin_payroll_adjustments(admin_user_id,reference_month,created_at desc);
+
+
+-- BaBuLo Play V10.4.11: workflow de faltas/justificações dos ADMINs
+alter table admin_attendance add column if not exists justification_status text not null default 'NONE' check(justification_status in ('NONE','PENDING','APPROVED','REJECTED'));
+alter table admin_attendance add column if not exists submitted_by uuid references users(id) on delete set null;
+alter table admin_attendance add column if not exists submitted_at timestamptz;
+alter table admin_attendance add column if not exists review_reason text;
+update admin_attendance set justification_status=case when status='EXCUSED' then 'APPROVED' else 'NONE' end where justification_status='NONE';
+create index if not exists idx_admin_attendance_pending on admin_attendance(justification_status,attendance_date desc) where justification_status='PENDING';
+-- V10.4.12: faltas marcadas pelo Owner + notificações ao ADMIN
+alter table admin_attendance add column if not exists marked_by uuid references users(id) on delete set null;
+alter table admin_attendance add column if not exists marked_at timestamptz;
+create index if not exists idx_admin_attendance_marked_by on admin_attendance(marked_by,attendance_date desc);
+
+create table if not exists admin_notifications(
+ id uuid primary key default gen_random_uuid(),
+ admin_user_id uuid not null references users(id) on delete cascade,
+ type text not null,
+ title text not null,
+ message text not null,
+ reference_id uuid,
+ read_at timestamptz,
+ created_at timestamptz not null default now()
+);
+create index if not exists idx_admin_notifications_admin_created on admin_notifications(admin_user_id,created_at desc);
