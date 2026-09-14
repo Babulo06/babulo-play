@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql', '024_rights_splits_payouts.sql', '025_rights_matching_scan.sql', '026_existing_artist_email_verification.sql', '027_admin_payroll_attendance.sql', '028_admin_attendance_workflow.sql', '029_admin_attendance_notifications.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql', '024_rights_splits_payouts.sql', '025_rights_matching_scan.sql', '026_existing_artist_email_verification.sql', '027_admin_payroll_attendance.sql', '028_admin_attendance_workflow.sql', '029_admin_attendance_notifications.sql', '030_admin_advertising_workflow.sql', '031_account_management_approvals.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -193,6 +193,18 @@ function requireAdminPermission(permission:string){
   return async (req:AuthedRequest,res:Response,next:NextFunction)=>{
     if(req.user?.role==='OWNER') return next();
     if(req.user?.role!=='ADMIN') return res.status(403).json({error:'Acesso reservado à administração'});
+    try{
+      const row=(await pool.query("select admin_permissions from users where id=$1 and role='ADMIN'", [req.user.id])).rows[0];
+      const permissions=Array.isArray(row?.admin_permissions)?row.admin_permissions:ADMIN_PERMISSIONS;
+      if(!permissions.includes(permission)) return res.status(403).json({error:`Este ADMIN não tem a função/permissão: ${permission}.`});
+      next();
+    }catch(e){console.error(e);res.status(500).json({error:'Não foi possível validar as permissões do ADMIN'});}
+  };
+}
+
+function requireAdminOnlyPermission(permission:string){
+  return async (req:AuthedRequest,res:Response,next:NextFunction)=>{
+    if(req.user?.role!=='ADMIN') return res.status(403).json({error:'Esta operação é exclusiva do ADMIN responsável pela Publicidade.'});
     try{
       const row=(await pool.query("select admin_permissions from users where id=$1 and role='ADMIN'", [req.user.id])).rows[0];
       const permissions=Array.isArray(row?.admin_permissions)?row.admin_permissions:ADMIN_PERMISSIONS;
@@ -929,13 +941,24 @@ app.post('/api/admin/users/:id/status', auth, requireAnyAdminPermission(['USERS'
   const status=String(req.body?.status||'').toUpperCase();
   if(!ACCOUNT_STATUSES.includes(status)) return res.status(400).json({error:'Estado de conta inválido'});
   if(req.params.id===req.user!.id) return res.status(400).json({error:'Não podes alterar o estado da tua própria conta.'});
-  const target=(await pool.query(`select id,role,status from users where id=$1`,[req.params.id])).rows[0];
+  const target=(await pool.query(`select id,role,status,full_name,email from users where id=$1`,[req.params.id])).rows[0];
   if(!target) return res.status(404).json({error:'Utilizador não encontrado'});
-  if(target.role==='OWNER') return res.status(403).json({error:'A conta OWNER é protegida e não pode ser bloqueada por este painel.'});
-  if(target.role==='ADMIN' && req.user!.role!=='OWNER') return res.status(403).json({error:'Apenas o OWNER pode alterar o estado de uma conta ADMIN.'});
-  const q=await pool.query(`update users set status=$1,updated_at=now() where id=$2 returning id,email,phone,role,status`,[status,target.id]);
-  await audit(req.user!.id,`USER_STATUS_${status}`,'USER',target.id,{from:target.status,to:status});
-  res.json({ok:true,user:q.rows[0]});
+  if(target.role==='OWNER') return res.status(403).json({error:'A conta OWNER é protegida.'});
+  if(req.user!.role==='OWNER'){
+    const q=await pool.query(`update users set status=$1,updated_at=now() where id=$2 returning id,email,phone,role,status`,[status,target.id]);
+    await audit(req.user!.id,`USER_STATUS_${status}`,'USER',target.id,{from:target.status,to:status});
+    res.json({ok:true,user:q.rows[0],mode:'EXECUTED'}); return;
+  }
+  if(target.role==='ADMIN') return res.status(403).json({error:'O Gestor de Contas não pode gerir contas ADMIN.'});
+  const perm=target.role==='ARTIST'?'ARTISTS':'USERS';
+  const rowPerm=(await pool.query(`select admin_permissions from users where id=$1 and role='ADMIN'`,[req.user!.id])).rows[0];
+  if(!Array.isArray(rowPerm?.admin_permissions)||!rowPerm.admin_permissions.includes(perm)) return res.status(403).json({error:'Não tens permissão para gerir este tipo de conta.'});
+  const pending=(await pool.query(`select id from account_action_requests where target_user_id=$1 and action_type='STATUS_CHANGE' and requested_status=$2 and status='PENDING' limit 1`,[target.id,status])).rows[0];
+  if(pending) return res.status(409).json({error:'Já existe um pedido pendente para esta alteração.'});
+  const q=await pool.query(`insert into account_action_requests(target_user_id,requested_by,action_type,requested_status,reason,status) values($1,$2,'STATUS_CHANGE',$3,$4,'PENDING') returning *`,[target.id,req.user!.id,status,String(req.body?.reason||'').trim().slice(0,1000)||null]);
+  await pool.query(`insert into admin_notifications(admin_user_id,type,title,message,reference_id) values($1,'ACCOUNT_ACTION_REQUESTED','Pedido de conta enviado', $2,$3)`,[req.user!.id,`O pedido para alterar ${target.full_name||target.email||'a conta'} para ${status} foi enviado ao Owner.`,q.rows[0].id]);
+  await audit(req.user!.id,'ACCOUNT_STATUS_CHANGE_REQUESTED','USER',target.id,{to:status,permission:perm,requestId:q.rows[0].id});
+  res.status(202).json({ok:true,pending:true,request:q.rows[0],message:'Pedido enviado ao Owner para aprovação.'});
 });
 
 app.post('/api/admin/artists/:id/verification', auth, requireAdminPermission('ARTISTS'), async (req:AuthedRequest,res) => {
@@ -943,9 +966,43 @@ app.post('/api/admin/artists/:id/verification', auth, requireAdminPermission('AR
   if(!VERIFICATION_STATUSES.includes(verificationStatus)) return res.status(400).json({error:'Estado de verificação inválido'});
   const artist=(await pool.query(`select id,user_id,stage_name,verification_status from artists where id=$1`,[req.params.id])).rows[0];
   if(!artist) return res.status(404).json({error:'Artista não encontrado'});
-  const q=await pool.query(`update artists set verification_status=$1 where id=$2 returning id,stage_name,verification_status`,[verificationStatus,artist.id]);
-  await audit(req.user!.id,'ARTIST_VERIFICATION_UPDATED','ARTIST',artist.id,{from:artist.verification_status,to:verificationStatus});
-  res.json({ok:true,artist:q.rows[0]});
+  if(req.user!.role==='OWNER'){
+    const q=await pool.query(`update artists set verification_status=$1 where id=$2 returning id,stage_name,verification_status`,[verificationStatus,artist.id]);
+    await audit(req.user!.id,'ARTIST_VERIFICATION_UPDATED','ARTIST',artist.id,{from:artist.verification_status,to:verificationStatus});
+    res.json({ok:true,artist:q.rows[0],mode:'EXECUTED'}); return;
+  }
+  const pending=(await pool.query(`select id from account_action_requests where target_artist_id=$1 and action_type='ARTIST_VERIFICATION' and requested_status=$2 and status='PENDING' limit 1`,[artist.id,verificationStatus])).rows[0];
+  if(pending) return res.status(409).json({error:'Já existe um pedido pendente para esta verificação.'});
+  const q=await pool.query(`insert into account_action_requests(target_artist_id,target_user_id,requested_by,action_type,requested_status,reason,status) values($1,$2,$3,'ARTIST_VERIFICATION',$4,$5,'PENDING') returning *`,[artist.id,artist.user_id,req.user!.id,verificationStatus,String(req.body?.reason||'').trim().slice(0,1000)||null]);
+  await pool.query(`insert into admin_notifications(admin_user_id,type,title,message,reference_id) values($1,'ACCOUNT_ACTION_REQUESTED','Verificação de artista enviada',$2,$3)`,[req.user!.id,`O pedido de verificação de ${artist.stage_name||'artista'} foi enviado ao Owner.`,q.rows[0].id]);
+  await audit(req.user!.id,'ARTIST_VERIFICATION_REQUESTED','ARTIST',artist.id,{to:verificationStatus,requestId:q.rows[0].id});
+  res.status(202).json({ok:true,pending:true,request:q.rows[0],message:'Pedido de verificação enviado ao Owner.'});
+});
+
+app.get('/api/owner/account-action-requests', auth, ownerOnly, async (_req,res)=>{
+  const q=await pool.query(`select r.*,tu.full_name target_name,tu.email target_email,a.stage_name target_stage_name,ru.full_name requester_name,ru.admin_title requester_title from account_action_requests r left join users tu on tu.id=r.target_user_id left join artists a on a.id=r.target_artist_id left join users ru on ru.id=r.requested_by where r.status='PENDING' order by r.created_at asc`);
+  res.json({requests:q.rows});
+});
+
+app.post('/api/owner/account-action-requests/:id/decision', auth, ownerOnly, async (req:AuthedRequest,res)=>{
+  const decision=String(req.body?.decision||'').toUpperCase(), reason=String(req.body?.reason||'').trim().slice(0,1000)||null;
+  if(!['APPROVED','REJECTED'].includes(decision)) return res.status(400).json({error:'Decisão inválida.'});
+  if(decision==='REJECTED'&&!reason) return res.status(400).json({error:'Informe o motivo da rejeição.'});
+  const client=await pool.connect();
+  try{
+    await client.query('begin');
+    const r=(await client.query(`select * from account_action_requests where id=$1 and status='PENDING' for update`,[req.params.id])).rows[0];
+    if(!r){await client.query('rollback');return res.status(404).json({error:'Pedido pendente não encontrado.'});}
+    if(decision==='APPROVED'){
+      if(r.action_type==='STATUS_CHANGE') await client.query(`update users set status=$1,updated_at=now() where id=$2 and role<>'OWNER'`,[r.requested_status,r.target_user_id]);
+      if(r.action_type==='ARTIST_VERIFICATION') await client.query(`update artists set verification_status=$1 where id=$2`,[r.requested_status,r.target_artist_id]);
+    }
+    const u=(await client.query(`update account_action_requests set status=$1,reviewed_by=$2,reviewed_at=now(),review_reason=$3,updated_at=now() where id=$4 returning *`,[decision,req.user!.id,reason,r.id])).rows[0];
+    await client.query(`insert into admin_notifications(admin_user_id,type,title,message,reference_id) values($1,$2,$3,$4,$5)`,[r.requested_by,decision==='APPROVED'?'ACCOUNT_ACTION_APPROVED':'ACCOUNT_ACTION_REJECTED',decision==='APPROVED'?'Pedido de conta aprovado':'Pedido de conta rejeitado',decision==='APPROVED'?'O Owner aprovou o pedido de gestão de conta.':`O Owner rejeitou o pedido de gestão de conta.${reason?' Motivo: '+reason:''}`,r.id]);
+    await client.query('commit');
+    await audit(req.user!.id,`ACCOUNT_ACTION_${decision}`,'ACCOUNT_ACTION_REQUEST',r.id,{actionType:r.action_type,targetUserId:r.target_user_id,targetArtistId:r.target_artist_id,reason});
+    res.json({ok:true,request:u});
+  }catch(e){await client.query('rollback');console.error(e);res.status(500).json({error:'Não foi possível guardar a decisão.'});}finally{client.release();}
 });
 
 app.delete('/api/owner/admins/:id', auth, async (req:AuthedRequest,res:Response) => {
@@ -1254,24 +1311,68 @@ app.get('/api/admin/finance/overview', auth, requireAdminPermission('FINANCE'), 
   }catch(e){console.error(e);res.status(500).json({error:'Não foi possível carregar o centro financeiro administrativo'});}
 });
 
-// ===== V10.4.7 ADMIN — PUBLICIDADE OPERACIONAL (SEM PODER DE PAGAMENTO/ATIVAÇÃO) =====
+// ===== V10.4.14 ADMIN — PUBLICIDADE OPERACIONAL =====
 app.get('/api/admin/ads/overview', auth, requireAdminPermission('ADS'), async (_req,res)=>{
   try{
     const [campaigns,placements,pricing]=await Promise.all([
-      pool.query(`select id,name,advertiser_name,format,pricing_model,budget,spend,currency,status,payment_status,start_at,end_at,target_country,target_city,impressions,clicks,video_views from ad_campaigns order by created_at desc`),
+      pool.query(`select c.id,c.name,c.advertiser_name,c.contact_email,c.format,c.pricing_model,c.budget,c.spend,c.currency,c.status,c.payment_status,c.payment_reference,c.paid_at,c.start_at,c.end_at,c.target_country,c.target_city,c.target_audience,c.destination_url,c.impressions,c.clicks,c.video_views,c.rejection_reason,
+        coalesce((select json_agg(json_build_object('id',p.id,'code',p.code,'name',p.name,'active',p.active) order by p.sort_order) from ad_campaign_placements cp join ad_placements p on p.id=cp.placement_id where cp.campaign_id=c.id),'[]'::json) placements,
+        coalesce((select row_to_json(cr) from (select id,name,format,asset_url,headline,body_text,cta,destination_url from ad_creatives where campaign_id=c.id order by created_at desc limit 1) cr),null) creative
+        from ad_campaigns c order by c.created_at desc`),
       pool.query(`select id,code,name,description,active,sort_order from ad_placements order by sort_order asc`),
-      pool.query(`select id,name,format,pricing_model,price,currency,unit,active from ad_pricing order by created_at desc`)
+      pool.query(`select id,name,format,pricing_model,price,currency,unit,active,sort_order from ad_pricing order by active desc,sort_order,name`)
     ]);
     res.json({campaigns:campaigns.rows,placements:placements.rows,pricing:pricing.rows});
   }catch(e){console.error(e);res.status(500).json({error:'Não foi possível carregar a publicidade'});}
 });
 app.get('/api/admin/ads/reports', auth, requireAdminPermission('ADS'), async (_req,res)=>{
   try{
-    const q=await pool.query(`select c.id,c.name,c.advertiser_name,c.format,c.status,c.impressions,c.clicks,c.video_views,c.spend,c.budget,
+    const q=await pool.query(`select c.id,c.name,c.advertiser_name,c.format,c.status,c.payment_status,c.impressions,c.clicks,c.video_views,c.spend,c.budget,
       case when c.impressions>0 then round((c.clicks::numeric/c.impressions::numeric)*100,2) else 0 end ctr
       from ad_campaigns c order by c.created_at desc`);
     res.json({reports:q.rows});
   }catch(e){console.error(e);res.status(500).json({error:'Não foi possível carregar os relatórios de publicidade'});}
+});
+
+app.post('/api/admin/ads/campaigns', auth, requireAdminOnlyPermission('ADS'), async (req:AuthedRequest,res)=>{
+  const {id,name,advertiserName,contactEmail,format,pricingModel='FIXED',budget,currency='AOA',startAt,endAt,targetCountry='',targetCity='',targetAudience='FREE_USERS',destinationUrl='',creativeUrl='',creativeName='',headline='',bodyText='',cta='Saiba mais',paymentReference='',placementIds=[]}=req.body||{};
+  if(!name||!advertiserName||!format||Number(budget)<=0||!startAt||!endAt)return res.status(400).json({error:'Nome, anunciante, formato, orçamento e período são obrigatórios.'});
+  if(new Date(endAt)<=new Date(startAt))return res.status(400).json({error:'A data final deve ser posterior à inicial.'});
+  const placements=Array.isArray(placementIds)?[...new Set(placementIds.map(String).filter(Boolean))]:[];
+  if(!placements.length)return res.status(400).json({error:'Escolha pelo menos um espaço onde a publicidade será exibida.'});
+  const client=await pool.connect(); try{await client.query('begin');
+    let campaign;
+    if(id){campaign=(await client.query(`update ad_campaigns set name=$1,advertiser_name=$2,contact_email=$3,format=$4,pricing_model=$5,budget=$6,currency=$7,start_at=$8,end_at=$9,target_country=$10,target_city=$11,target_audience=$12,destination_url=$13,payment_reference=$14,status='DRAFT',rejection_reason=null,updated_at=now() where id=$15 returning *`,[String(name).trim(),String(advertiserName).trim(),contactEmail||null,format,pricingModel,Number(budget),currency,startAt,endAt,targetCountry||null,targetCity||null,targetAudience,destinationUrl||null,paymentReference||null,id])).rows[0];if(!campaign)throw Error('Campanha não encontrada');
+      await client.query('delete from ad_campaign_placements where campaign_id=$1',[id]);
+    }else campaign=(await client.query(`insert into ad_campaigns(name,advertiser_name,contact_email,format,pricing_model,budget,currency,start_at,end_at,target_country,target_city,target_audience,destination_url,payment_reference,created_by) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) returning *`,[String(name).trim(),String(advertiserName).trim(),contactEmail||null,format,pricingModel,Number(budget),currency,startAt,endAt,targetCountry||null,targetCity||null,targetAudience,destinationUrl||null,paymentReference||null,req.user!.id])).rows[0];
+    for(const pid of placements){const ok=(await client.query('select id from ad_placements where id=$1',[pid])).rows[0];if(!ok)throw Error('Espaço publicitário inválido.');await client.query('insert into ad_campaign_placements(campaign_id,placement_id) values($1,$2) on conflict do nothing',[campaign.id,pid]);}
+    if(creativeUrl){await client.query(`insert into ad_creatives(campaign_id,name,format,asset_url,headline,body_text,cta,destination_url) values($1,$2,$3,$4,$5,$6,$7,$8)`,[campaign.id,creativeName||`${name} — criativo`,format,creativeUrl,headline||null,bodyText||null,cta||null,destinationUrl||null]);}
+    await client.query('commit');await audit(req.user!.id,id?'ADMIN_AD_CAMPAIGN_UPDATED':'ADMIN_AD_CAMPAIGN_CREATED','AD_CAMPAIGN',campaign.id,{advertiserName,format,budget,placementIds:placements});res.status(201).json({campaign});
+  }catch(e:any){await client.query('rollback');res.status(400).json({error:e.message||'Não foi possível guardar a campanha'});}finally{client.release()}
+});
+
+app.post('/api/admin/ads/campaigns/:id/payment', auth, requireAdminOnlyPermission('ADS'), async(req:AuthedRequest,res)=>{
+  const {reference=''}=req.body||{};
+  const q=await pool.query(`update ad_campaigns set payment_status='PAID',payment_reference=coalesce(nullif($1,''),payment_reference),paid_at=coalesce(paid_at,now()),status='PENDING_APPROVAL',updated_at=now() where id=$2 and status in ('DRAFT','PENDING_PAYMENT','REJECTED') returning *`,[reference,req.params.id]);
+  if(!q.rows[0])return res.status(404).json({error:'Campanha não encontrada ou não está pronta para pagamento.'});
+  await audit(req.user!.id,'ADMIN_AD_PAYMENT_RECORDED','AD_CAMPAIGN',req.params.id,{reference});res.json({campaign:q.rows[0],message:'Pagamento registado. A campanha foi enviada ao Owner para aprovação.'});
+});
+
+app.post('/api/admin/ads/campaigns/:id/submit', auth, requireAdminOnlyPermission('ADS'), async(req:AuthedRequest,res)=>{
+  const q=await pool.query(`update ad_campaigns set status=case when payment_status='PAID' then 'PENDING_APPROVAL' else 'PENDING_PAYMENT' end,updated_at=now() where id=$1 returning *`,[req.params.id]);
+  if(!q.rows[0])return res.status(404).json({error:'Campanha não encontrada'});await audit(req.user!.id,'ADMIN_AD_CAMPAIGN_SUBMITTED','AD_CAMPAIGN',req.params.id,{});res.json({campaign:q.rows[0]});
+});
+
+app.post('/api/admin/ads/pricing', auth, requireAdminOnlyPermission('ADS'), async(req:AuthedRequest,res)=>{
+  const {id,name,format,pricingModel,price,currency='AOA',unit='CAMPAIGN',active=true}=req.body||{};
+  if(!name||!format||!['FIXED','CPM','CPC','CPV'].includes(pricingModel)||Number(price)<=0)return res.status(400).json({error:'Preencha nome, formato, modelo e preço válido.'});
+  const q=id?await pool.query(`update ad_pricing set name=$1,format=$2,pricing_model=$3,price=$4,currency=$5,unit=$6,active=$7,updated_at=now() where id=$8 returning *`,[String(name).trim(),format,pricingModel,Number(price),currency,unit,Boolean(active),id]):await pool.query(`insert into ad_pricing(name,format,pricing_model,price,currency,unit,active) values($1,$2,$3,$4,$5,$6,$7) returning *`,[String(name).trim(),format,pricingModel,Number(price),currency,unit,Boolean(active)]);
+  await audit(req.user!.id,id?'ADMIN_AD_PRICING_UPDATED':'ADMIN_AD_PRICING_CREATED','AD_PRICING',q.rows[0].id,{name,format,pricingModel,price});res.status(201).json({pricing:q.rows[0]});
+});
+
+app.post('/api/admin/ads/campaigns/:id/status', auth, requireAdminOnlyPermission('ADS'), async(req:AuthedRequest,res)=>{
+  const {status,reason=''}=req.body||{};if(!['DRAFT','PENDING_PAYMENT'].includes(status))return res.status(400).json({error:'O ADMIN só pode editar a campanha. A aprovação/ativação é do Owner.'});
+  const q=await pool.query(`update ad_campaigns set status=$1,rejection_reason=$2,updated_at=now() where id=$3 returning *`,[status,reason||null,req.params.id]);if(!q.rows[0])return res.status(404).json({error:'Campanha não encontrada'});await audit(req.user!.id,'ADMIN_AD_CAMPAIGN_STATUS','AD_CAMPAIGN',req.params.id,{status,reason});res.json({campaign:q.rows[0]});
 });
 
 // ===== V10.4.7 OWNER — CONTROLO FINANCEIRO CENTRAL =====
@@ -1574,28 +1675,19 @@ app.get('/api/owner/ads/overview', auth, ownerOnly, async (_req,res)=>{
   res.json({summary:summary.rows[0],campaigns:campaigns.rows,placements:placements.rows});
 });
 app.get('/api/owner/ads/pricing', auth, ownerOnly, async (_req,res)=>res.json({pricing:(await pool.query('select * from ad_pricing order by active desc,sort_order,name')).rows}));
-app.post('/api/owner/ads/placements/:id/toggle', auth, ownerOnly, async(req:AuthedRequest,res)=>{const q=await pool.query(`update ad_placements set active=not active where id=$1 returning *`,[req.params.id]);if(!q.rows[0])return res.status(404).json({error:'Espaço publicitário não encontrado'});await audit(req.user!.id,'AD_PLACEMENT_TOGGLE','AD_PLACEMENT',req.params.id,{active:q.rows[0].active});res.json({placement:q.rows[0]})});
-app.post('/api/owner/ads/pricing', auth, ownerOnly, async (req:AuthedRequest,res)=>{
-  const {id,name,format,pricingModel,price,currency='AOA',unit='CAMPAIGN',active=true}=req.body||{};
-  if(!name||!format||!['FIXED','CPM','CPC','CPV'].includes(pricingModel)||Number(price)<=0)return res.status(400).json({error:'Preencha nome, formato, modelo e preço válido.'});
-  const q=id?await pool.query(`update ad_pricing set name=$1,format=$2,pricing_model=$3,price=$4,currency=$5,unit=$6,active=$7,updated_at=now() where id=$8 returning *`,[String(name).trim(),format,pricingModel,Number(price),currency,unit,Boolean(active),id]):await pool.query(`insert into ad_pricing(name,format,pricing_model,price,currency,unit,active) values($1,$2,$3,$4,$5,$6,$7) returning *`,[String(name).trim(),format,pricingModel,Number(price),currency,unit,Boolean(active)]);
-  await audit(req.user!.id,id?'AD_PRICING_UPDATED':'AD_PRICING_CREATED','AD_PRICING',q.rows[0].id,{name,format,pricingModel,price}); res.status(201).json({pricing:q.rows[0]});
+app.post('/api/owner/ads/campaigns/:id/approval', auth, ownerOnly, async(req:AuthedRequest,res)=>{
+  const {decision,reason=''}=req.body||{};
+  if(!['APPROVE','REJECT'].includes(decision))return res.status(400).json({error:'Decisão inválida.'});
+  const status=decision==='APPROVE'?'ACTIVE':'REJECTED';
+  const q=await pool.query(`update ad_campaigns set status=$1,rejection_reason=$2,updated_at=now() where id=$3 and status='PENDING_APPROVAL' and payment_status='PAID' returning *`,[status,reason||null,req.params.id]);
+  if(!q.rows[0])return res.status(404).json({error:'Campanha não encontrada ou ainda não está pendente de aprovação.'});
+  const ownerMessage=decision==='APPROVE'?'A tua publicidade foi aprovada pelo Owner e já está liberada.':'A tua publicidade foi rejeitada pelo Owner. Abre a campanha, corrige e envia novamente.';
+  if(q.rows[0].created_by){await pool.query(`insert into admin_notifications(admin_user_id,type,title,message,reference_id) values($1,$2,$3,$4,$5)`,[q.rows[0].created_by,decision==='APPROVE'?'AD_APPROVED':'AD_REJECTED',decision==='APPROVE'?'Publicidade aprovada':'Publicidade rejeitada',ownerMessage,q.rows[0].id]);}
+  await audit(req.user!.id,decision==='APPROVE'?'OWNER_AD_CAMPAIGN_APPROVED':'OWNER_AD_CAMPAIGN_REJECTED','AD_CAMPAIGN',req.params.id,{reason});res.json({campaign:q.rows[0],message:decision==='APPROVE'?'Campanha aprovada e liberada automaticamente.':'Campanha rejeitada. O ADMIN responsável pode corrigir e reenviar.'});
 });
-app.post('/api/owner/ads/campaigns', auth, ownerOnly, async (req:AuthedRequest,res)=>{
-  const {id,name,advertiserName,contactEmail,format,pricingModel='FIXED',budget,currency='AOA',startAt,endAt,targetCountry='',targetCity='',targetAudience='FREE_USERS',destinationUrl='',creativeUrl='',creativeName='',headline='',bodyText='',cta='Saiba mais',paymentReference=''}=req.body||{};
-  if(!name||!advertiserName||!format||Number(budget)<=0||!startAt||!endAt)return res.status(400).json({error:'Nome, anunciante, formato, orçamento e período são obrigatórios.'});
-  if(new Date(endAt)<=new Date(startAt))return res.status(400).json({error:'A data final deve ser posterior à inicial.'});
-  const client=await pool.connect(); try{await client.query('begin');
-    let campaign;
-    if(id){campaign=(await client.query(`update ad_campaigns set name=$1,advertiser_name=$2,contact_email=$3,format=$4,pricing_model=$5,budget=$6,currency=$7,start_at=$8,end_at=$9,target_country=$10,target_city=$11,target_audience=$12,destination_url=$13,payment_reference=$14,updated_at=now() where id=$15 returning *`,[String(name).trim(),String(advertiserName).trim(),contactEmail||null,format,pricingModel,Number(budget),currency,startAt,endAt,targetCountry||null,targetCity||null,targetAudience,destinationUrl||null,paymentReference||null,id])).rows[0]; if(!campaign)throw Error('Campanha não encontrada');}
-    else campaign=(await client.query(`insert into ad_campaigns(name,advertiser_name,contact_email,format,pricing_model,budget,currency,start_at,end_at,target_country,target_city,target_audience,destination_url,payment_reference,created_by) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) returning *`,[String(name).trim(),String(advertiserName).trim(),contactEmail||null,format,pricingModel,Number(budget),currency,startAt,endAt,targetCountry||null,targetCity||null,targetAudience,destinationUrl||null,paymentReference||null,req.user!.id])).rows[0];
-    if(creativeUrl){await client.query(`insert into ad_creatives(campaign_id,name,format,asset_url,headline,body_text,cta,destination_url) values($1,$2,$3,$4,$5,$6,$7,$8)`,[campaign.id,creativeName||`${name} — criativo`,format,creativeUrl,headline||null,bodyText||null,cta||null,destinationUrl||null]);}
-    await client.query('commit'); await audit(req.user!.id,id?'AD_CAMPAIGN_UPDATED':'AD_CAMPAIGN_CREATED','AD_CAMPAIGN',campaign.id,{advertiserName,format,budget}); res.status(201).json({campaign});
-  }catch(e:any){await client.query('rollback');res.status(400).json({error:e.message||'Não foi possível guardar a campanha'});}finally{client.release()}
-});
-app.post('/api/owner/ads/campaigns/:id/payment', auth, ownerOnly, async(req:AuthedRequest,res)=>{const {status='PAID',reference=''}=req.body||{}; if(!['PENDING','PAID','REFUNDED'].includes(status))return res.status(400).json({error:'Estado de pagamento inválido'}); const q=await pool.query(`update ad_campaigns set payment_status=$1,payment_reference=coalesce(nullif($2,''),payment_reference),paid_at=case when $1='PAID' then coalesce(paid_at,now()) else paid_at end,updated_at=now() where id=$3 returning *`,[status,reference,req.params.id]); if(!q.rows[0])return res.status(404).json({error:'Campanha não encontrada'}); await audit(req.user!.id,'AD_CAMPAIGN_PAYMENT','AD_CAMPAIGN',req.params.id,{status,reference});res.json({campaign:q.rows[0]})});
-app.post('/api/owner/ads/campaigns/:id/status', auth, ownerOnly, async(req:AuthedRequest,res)=>{const {status,reason=''}=req.body||{}; if(!['DRAFT','PENDING_PAYMENT','PENDING_APPROVAL','ACTIVE','PAUSED','COMPLETED','REJECTED','CANCELLED'].includes(status))return res.status(400).json({error:'Estado inválido'}); const q=await pool.query(`update ad_campaigns set status=$1,rejection_reason=$2,updated_at=now() where id=$3 returning *`,[status,reason||null,req.params.id]);if(!q.rows[0])return res.status(404).json({error:'Campanha não encontrada'});await audit(req.user!.id,'AD_CAMPAIGN_STATUS','AD_CAMPAIGN',req.params.id,{status,reason});res.json({campaign:q.rows[0]})});
-app.post('/api/owner/ads/campaigns/:id/creative', auth, ownerOnly, async(req:AuthedRequest,res)=>{const {name,format,assetUrl,headline='',bodyText='',cta='Saiba mais',destinationUrl=''}=req.body||{};if(!name||!format||!assetUrl)return res.status(400).json({error:'Nome, formato e URL do criativo são obrigatórios'});const q=await pool.query(`insert into ad_creatives(campaign_id,name,format,asset_url,headline,body_text,cta,destination_url) values($1,$2,$3,$4,$5,$6,$7,$8) returning *`,[req.params.id,name,format,assetUrl,headline||null,bodyText||null,cta||null,destinationUrl||null]);res.status(201).json({creative:q.rows[0]})});
+
+app.post('/api/owner/ads/campaigns/:id/status', auth, ownerOnly, async(req:AuthedRequest,res)=>{const {status,reason=''}=req.body||{};if(!['ACTIVE','PAUSED','COMPLETED','CANCELLED'].includes(status))return res.status(400).json({error:'O Owner aprova ou monitoriza a campanha; edição fica com o ADMIN de Publicidade.'});const q=await pool.query(`update ad_campaigns set status=$1,rejection_reason=$2,updated_at=now() where id=$3 and status in ('ACTIVE','PAUSED') returning *`,[status,reason||null,req.params.id]);if(!q.rows[0])return res.status(404).json({error:'Campanha não encontrada'});await audit(req.user!.id,'OWNER_AD_CAMPAIGN_MONITOR_STATUS','AD_CAMPAIGN',req.params.id,{status,reason});res.json({campaign:q.rows[0]})});
+
 app.get('/api/owner/ads/reports', auth, ownerOnly, async(req,res)=>{const from=req.query.from||new Date(Date.now()-29*86400000).toISOString().slice(0,10),to=req.query.to||new Date().toISOString().slice(0,10);const q=await pool.query(`select c.id,c.name,c.advertiser_name,c.format,c.status,c.budget,c.spend,c.impressions,c.clicks,c.video_views,case when c.impressions>0 then round(c.clicks::numeric*100/c.impressions,2) else 0 end ctr,coalesce(sum(e.value),0) event_value from ad_campaigns c left join ad_events e on e.campaign_id=c.id and e.created_at>=($1::date) and e.created_at<($2::date+interval '1 day') where c.created_at<($2::date+interval '1 day') group by c.id order by c.created_at desc`,[from,to]);res.json({from,to,reports:q.rows})});
 
 // API de entrega de anúncios — mesma API para Web, Android e iPhone.
@@ -1604,7 +1696,7 @@ app.get('/api/ads/serve', async(req,res)=>{
   const token=String(req.headers.authorization||'').startsWith('Bearer ')?String(req.headers.authorization).slice(7):''; let userId=null; let premium=false;
   if(token){try{const d=decodeToken(token);if(d?.sid){const u=(await pool.query(`select id from users where id=$1 and status='ACTIVE'`,[d.sub])).rows[0];if(u){userId=u.id;premium=Boolean((await pool.query(`select 1 from subscriptions where user_id=$1 and status='ACTIVE' and ends_at>now() limit 1`,[u.id])).rows[0]);}}}catch{}}
   if(premium)return res.json({ad:null,premium:true});
-  const q=await pool.query(`select c.id,c.name,c.advertiser_name,c.format,c.pricing_model,c.destination_url,c.target_country,c.target_city,c.target_audience,cr.id creative_id,cr.name creative_name,cr.asset_url,cr.headline,cr.body_text,cr.cta,cr.destination_url creative_destination from ad_campaigns c join lateral (select * from ad_creatives where campaign_id=c.id order by created_at desc limit 1) cr on true where c.status='ACTIVE' and c.payment_status='PAID' and now() between c.start_at and c.end_at and c.format=$1 and (c.target_country is null or c.target_country='' or upper(c.target_country)=$2) and (c.target_city is null or c.target_city='' or lower(c.target_city)=lower($3)) and (c.target_audience='ALL' or c.target_audience='FREE_USERS') order by random() limit 1`,[placement,country,city]);
+  const q=await pool.query(`select c.id,c.name,c.advertiser_name,c.format,c.pricing_model,c.destination_url,c.target_country,c.target_city,c.target_audience,cr.id creative_id,cr.name creative_name,cr.asset_url,cr.headline,cr.body_text,cr.cta,cr.destination_url creative_destination from ad_campaigns c join ad_campaign_placements cp on cp.campaign_id=c.id join ad_placements ap on ap.id=cp.placement_id join lateral (select * from ad_creatives where campaign_id=c.id order by created_at desc limit 1) cr on true where c.status='ACTIVE' and ap.code=$1 and c.payment_status='PAID' and now() between c.start_at and c.end_at and (c.target_country is null or c.target_country='' or upper(c.target_country)=$2) and (c.target_city is null or c.target_city='' or lower(c.target_city)=lower($3)) and (c.target_audience='ALL' or c.target_audience='FREE_USERS') order by random() limit 1`,[placement,country,city]);
   if(!q.rows[0])return res.json({ad:null,premium:false}); const a=q.rows[0]; await pool.query(`update ad_campaigns set impressions=impressions+1,updated_at=now() where id=$1`,[a.id]); await pool.query(`insert into ad_events(campaign_id,creative_id,event_type,user_id,country,city,visitor_key) values($1,$2,'IMPRESSION',$3,$4,$5,$6)`,[a.id,a.creative_id,userId,country||null,city||null,hashToken(userId||`${req.headers['user-agent']||''}|${country}|${city}`)]); res.json({ad:{id:a.id,creativeId:a.creative_id,format:a.format,assetUrl:a.asset_url,headline:a.headline,bodyText:a.body_text,cta:a.cta,destinationUrl:a.creative_destination||a.destination_url,advertiserName:a.advertiser_name},premium:false});
 });
 app.post('/api/ads/event', async(req,res)=>{const {campaignId,creativeId,eventType,value=0,country='',city='',visitorKey=''}=req.body||{};if(!campaignId||!['CLICK','VIDEO_VIEW','INTERACTION'].includes(eventType))return res.status(400).json({error:'Evento publicitário inválido'});const key=String(visitorKey||`${req.headers['user-agent']||''}|${country}|${city}`).slice(0,500);const q=await pool.query(`select id,pricing_model from ad_campaigns where id=$1 and status='ACTIVE'`,[campaignId]);if(!q.rows[0])return res.status(404).json({error:'Campanha não encontrada'});const c=q.rows[0];await pool.query(`insert into ad_events(campaign_id,creative_id,event_type,value,country,city,visitor_key) values($1,$2,$3,$4,$5,$6,$7)`,[campaignId,creativeId||null,eventType,Number(value)||0,country||null,city||null,hashToken(key)]);const field=eventType==='CLICK'?'clicks':eventType==='VIDEO_VIEW'?'video_views':null;if(field)await pool.query(`update ad_campaigns set ${field}=${field}+1,updated_at=now() where id=$1`,[campaignId]);res.json({ok:true})});
