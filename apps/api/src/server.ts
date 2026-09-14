@@ -1172,6 +1172,73 @@ app.get('/api/admin/finance/summary', auth, requireAdminPermission('FINANCE'), a
   },updatedAt:new Date().toISOString()});
 });
 
+
+// ===== V10.4.13 ADMIN FINANCE — PAGAMENTOS A ARTISTAS =====
+// O Gestor Financeiro cria e executa a ordem. O dinheiro só fica liberado
+// depois de o Owner aprovar a ordem em /api/owner/finance/:id/decision.
+app.get('/api/admin/finance/artist-payouts', auth, requireAdminPermission('FINANCE'), async (_req,res)=>{
+  try{
+    const q=await pool.query(`select t.id,t.amount,t.currency,t.payment_method,t.status,t.destination,t.reference,t.description,t.created_at,t.approved_at,t.executed_at,t.rejection_reason,
+      coalesce(a.stage_name,u.full_name,'Artista') recipient_name
+      from owner_finance_transactions t
+      left join artists a on a.id=t.recipient_artist_id
+      left join users u on u.id=t.recipient_user_id
+      where t.transaction_type='ARTIST_PAYOUT'
+      order by t.created_at desc limit 200`);
+    res.json({payouts:q.rows});
+  }catch(e){console.error(e);res.status(500).json({error:'Não foi possível carregar os pagamentos a artistas'});}
+});
+
+app.post('/api/admin/finance/artist-payout', auth, requireAdminPermission('FINANCE'), async (req:AuthedRequest,res)=>{
+  const {artistId,amount,paymentMethod='BANK',destination,description='Pagamento de royalties ao artista'}=req.body||{};
+  const value=Number(amount);
+  if(!artistId||!Number.isFinite(value)||value<=0) return res.status(400).json({error:'Informe artista e valor válidos'});
+  if(!destination) return res.status(400).json({error:'Informe o destino bancário ou método de pagamento'});
+  if(!['BANK','MULTICAIXA_EXPRESS'].includes(String(paymentMethod))) return res.status(400).json({error:'Método de pagamento inválido'});
+  const client=await pool.connect();
+  try{
+    await client.query('begin');
+    const artist=(await client.query(`select a.id,a.stage_name,a.user_id,
+      coalesce((select sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount end) from financial_ledger where artist_id=a.id),0) balance
+      from artists a where a.id=$1 for update`,[artistId])).rows[0];
+    if(!artist){await client.query('rollback');return res.status(404).json({error:'Artista não encontrado'});}
+    const bal=Number(artist.balance||0);
+    if(value>bal){await client.query('rollback');return res.status(400).json({error:`Saldo insuficiente do artista. Disponível: ${bal.toFixed(2)} Kz.`});}
+    const reference='BP-ART-'+crypto.randomBytes(6).toString('hex').toUpperCase();
+    const tx=(await client.query(`insert into owner_finance_transactions(transaction_type,status,amount,payment_method,recipient_user_id,recipient_artist_id,destination,reference,description,created_by)
+      values('ARTIST_PAYOUT','PENDING_APPROVAL',$1,$2,$3,$4,$5,$6,$7,$8) returning *`,[value,String(paymentMethod),artist.user_id,artist.id,String(destination),reference,String(description),req.user!.id])).rows[0];
+    const after=bal-value;
+    await client.query(`insert into financial_ledger(artist_id,entry_type,reference_type,reference_id,amount,currency,balance_after,description)
+      values($1,'DEBIT','OWNER_PAYOUT',$2,$3,'AOA',$4,'Reserva para pagamento de royalties criada pelo Gestor Financeiro')`,[artist.id,tx.id,value,after]);
+    await client.query('commit');
+    await audit(req.user!.id,'ADMIN_ARTIST_PAYOUT_CREATED','OWNER_FINANCE',tx.id,{artistId,amount:value,reference});
+    res.status(201).json({transaction:tx,artistBalance:after,message:'Ordem criada e enviada ao Owner para aprovação.'});
+  }catch(e){await client.query('rollback');console.error(e);res.status(500).json({error:'Não foi possível criar o pagamento do artista'});}finally{client.release();}
+});
+
+app.post('/api/admin/finance/artist-payout/:id/execute', auth, requireAdminPermission('FINANCE'), async (req:AuthedRequest,res)=>{
+  const client=await pool.connect();
+  try{
+    await client.query('begin');
+    const tx=(await client.query(`update owner_finance_transactions set status='SENT_TO_BANK',executed_at=now(),updated_at=now()
+      where id=$1 and transaction_type='ARTIST_PAYOUT' and status='APPROVED' returning *`,[req.params.id])).rows[0];
+    if(!tx){await client.query('rollback');return res.status(404).json({error:'Pagamento não encontrado ou ainda não aprovado pelo Owner'});}
+    await client.query(`insert into owner_finance_ledger(account_code,entry_type,amount,reference_type,reference_id,description,created_by)
+      values('BANK','DEBIT',$1,'OWNER_FINANCE',$2,$3,$4)`,[tx.amount,tx.id,`Ordem bancária ${tx.reference} executada pelo Gestor Financeiro`,req.user!.id]);
+    await client.query('commit');
+    await audit(req.user!.id,'ADMIN_ARTIST_PAYOUT_SENT_TO_BANK','OWNER_FINANCE',tx.id,{reference:tx.reference});
+    res.json({ok:true,transaction:tx,message:'Pagamento liberado pelo Owner e registado para execução bancária. A transferência real depende da integração com o banco/gateway.'});
+  }catch(e){await client.query('rollback');console.error(e);res.status(500).json({error:'Não foi possível executar o pagamento do artista'});}finally{client.release();}
+});
+
+app.post('/api/admin/finance/artist-payout/:id/mark-paid', auth, requireAdminPermission('FINANCE'), async (req:AuthedRequest,res)=>{
+  const q=await pool.query(`update owner_finance_transactions set status='PAID',updated_at=now()
+    where id=$1 and transaction_type='ARTIST_PAYOUT' and status='SENT_TO_BANK' returning *`,[req.params.id]);
+  if(!q.rows[0]) return res.status(404).json({error:'Pagamento enviado ao banco não encontrado'});
+  await audit(req.user!.id,'ADMIN_ARTIST_PAYOUT_MARKED_PAID','OWNER_FINANCE',req.params.id,{reference:q.rows[0].reference});
+  res.json({ok:true,transaction:q.rows[0]});
+});
+
 // ===== V10.4.7 ADMIN — CENTRO FINANCEIRO OPERACIONAL =====
 app.get('/api/admin/finance/overview', auth, requireAdminPermission('FINANCE'), async (_req,res)=>{
   try{
