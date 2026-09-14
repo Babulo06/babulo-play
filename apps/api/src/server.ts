@@ -38,7 +38,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql', '024_rights_splits_payouts.sql', '025_rights_matching_scan.sql', '026_existing_artist_email_verification.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql', '024_rights_splits_payouts.sql', '025_rights_matching_scan.sql', '026_existing_artist_email_verification.sql', '027_admin_payroll_attendance.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -1171,7 +1171,6 @@ app.get('/api/admin/finance/summary', auth, requireAdminPermission('FINANCE'), a
     coalesce((select sum(w.amount) from withdrawals w where w.status='PENDING'),0) as artist_payments_pending,
     coalesce((select sum(case when entry_type='CREDIT' then amount when entry_type='DEBIT' then -amount end) from owner_finance_ledger where account_code='ADVERTISING'),0) as advertising_balance,
     coalesce((select sum(amount) from owner_finance_transactions where transaction_type='AD_REVENUE' and status='PAID'),0) as advertising_revenue,
-    coalesce((select sum(amount) from owner_finance_transactions where transaction_type='ADMIN_SALARY' and status in ('APPROVED','SENT_TO_BANK','PAID')),0) as payroll_total,
     coalesce((select sum(amount) from owner_finance_transactions where transaction_type='ARTIST_PAYOUT' and status in ('APPROVED','SENT_TO_BANK','PAID')),0) as owner_artist_payouts,
     coalesce((select sum(amount) from owner_finance_transactions where status='PENDING_APPROVAL'),0) as owner_pending_approvals`);
   const row=q.rows[0];
@@ -1180,24 +1179,23 @@ app.get('/api/admin/finance/summary', auth, requireAdminPermission('FINANCE'), a
     streamBalance:{validStreams:Number(row.valid_streams||0)},
     artistPayments:{paid:Number(row.artist_payments_paid||0),pending:Number(row.artist_payments_pending||0)},
     artistRoyalties:royalty,pendingPayments:Number(row.pending_payments||0),refunds:Number(row.refunds||0),babuloRevenue:externalNet,
-    advertisingRevenue:Number(row.advertising_revenue||0),advertisingBalance:advertising,payrollTotal:Number(row.payroll_total||0),ownerArtistPayouts:Number(row.owner_artist_payouts||0),ownerPendingApprovals:Number(row.owner_pending_approvals||0),
-    netAfterArtistPayments:externalNet-Number(row.artist_payments_paid||0)-Number(row.payroll_total||0)
+    advertisingRevenue:Number(row.advertising_revenue||0),advertisingBalance:advertising,ownerArtistPayouts:Number(row.owner_artist_payouts||0),ownerPendingApprovals:Number(row.owner_pending_approvals||0),
+    netAfterArtistPayments:externalNet-Number(row.artist_payments_paid||0)
   },updatedAt:new Date().toISOString()});
 });
 
 // ===== V10.4.7 ADMIN — CENTRO FINANCEIRO OPERACIONAL =====
 app.get('/api/admin/finance/overview', auth, requireAdminPermission('FINANCE'), async (_req,res)=>{
   try{
-    const [artists,admins,pendingPayments,pendingWithdrawals]=await Promise.all([
+    const [artists,pendingPayments,pendingWithdrawals]=await Promise.all([
       pool.query(`select a.id,a.stage_name,u.full_name,u.phone,
         coalesce((select sum(case when fl.entry_type='CREDIT' then fl.amount when fl.entry_type='DEBIT' then -fl.amount end) from financial_ledger fl where fl.artist_id=a.id),0) balance,
         coalesce((select count(*) from stream_events se join tracks t on t.id=se.track_id join releases r on r.id=t.primary_release_id where r.primary_artist_id=a.id and se.is_valid=true),0) valid_streams
         from artists a left join users u on u.id=a.user_id order by balance desc,a.stage_name asc`),
-      pool.query(`select id,full_name,admin_title,salary_amount,salary_currency,status from users where role='ADMIN' order by full_name asc`),
       pool.query(`select p.id,p.reference,p.amount,p.currency,p.payment_method,p.status,p.created_at,p.release_id,r.title release_title,a.stage_name from payment_transactions p left join releases r on r.id=p.release_id left join artists a on a.id=r.primary_artist_id where p.service_type='DISTRIBUTION' and p.status='PENDING' order by p.created_at asc`),
       pool.query(`select w.id,w.amount,w.currency,w.method,w.status,w.created_at,a.stage_name,u.full_name from withdrawals w join artists a on a.id=w.artist_id left join users u on u.id=a.user_id where w.status='PENDING' order by w.created_at asc`)
     ]);
-    res.json({artists:artists.rows,admins:admins.rows,pendingPayments:pendingPayments.rows,pendingWithdrawals:pendingWithdrawals.rows});
+    res.json({artists:artists.rows,pendingPayments:pendingPayments.rows,pendingWithdrawals:pendingWithdrawals.rows});
   }catch(e){console.error(e);res.status(500).json({error:'Não foi possível carregar o centro financeiro administrativo'});}
 });
 
@@ -1222,6 +1220,67 @@ app.get('/api/admin/ads/reports', auth, requireAdminPermission('ADS'), async (_r
 });
 
 // ===== V10.4.7 OWNER — CONTROLO FINANCEIRO CENTRAL =====
+
+app.get('/api/owner/admins/:id/payroll', auth, ownerOnly, async (req:AuthedRequest,res)=>{
+  try{
+    const admin=(await pool.query(`select id,full_name,admin_title,status from users where id=$1 and role='ADMIN'`,[req.params.id])).rows[0];
+    if(!admin) return res.status(404).json({error:'ADMIN não encontrado'});
+    const settings=(await pool.query(`select * from admin_payroll_settings where admin_user_id=$1`,[admin.id])).rows[0]||{admin_user_id:admin.id,daily_rate:0,monthly_salary:0,currency:'AOA',effective_from:new Date().toISOString().slice(0,10)};
+    const attendance=(await pool.query(`select id,attendance_date,status,note,justification_document_name,justification_mime_type,reviewed_at,created_at from admin_attendance where admin_user_id=$1 order by attendance_date desc limit 120`,[admin.id])).rows;
+    const adjustments=(await pool.query(`select id,adjustment_type,amount,reference_month,description,created_at from admin_payroll_adjustments where admin_user_id=$1 order by reference_month desc,created_at desc limit 120`,[admin.id])).rows;
+    const month=String(req.query.month||new Date().toISOString().slice(0,7)).slice(0,7);
+    const monthStart=month+'-01';
+    const monthEnd=new Date(Number(month.slice(0,4)),Number(month.slice(5,7)),0).toISOString().slice(0,10);
+    const summary=(await pool.query(`select count(*) filter(where status='PRESENT')::int present_days,count(*) filter(where status='ABSENT')::int absent_days,count(*) filter(where status='EXCUSED')::int excused_days from admin_attendance where admin_user_id=$1 and attendance_date between $2 and $3`,[admin.id,monthStart,monthEnd])).rows[0];
+    const adj=(await pool.query(`select coalesce(sum(amount) filter(where adjustment_type='DISCOUNT'),0) discounts,coalesce(sum(amount) filter(where adjustment_type='BONUS'),0) bonuses from admin_payroll_adjustments where admin_user_id=$1 and reference_month=$2`,[admin.id,month])).rows[0];
+    res.json({admin,settings,attendance,adjustments,month,summary:{...summary,discounts:Number(adj.discounts||0),bonuses:Number(adj.bonuses||0)}});
+  }catch(e){console.error(e);res.status(500).json({error:'Não foi possível carregar a folha do ADMIN'});}
+});
+
+app.put('/api/owner/admins/:id/payroll', auth, ownerOnly, async (req:AuthedRequest,res)=>{
+  const dailyRate=Number(req.body?.dailyRate),monthlySalary=Number(req.body?.monthlySalary); const effectiveFrom=String(req.body?.effectiveFrom||new Date().toISOString().slice(0,10));
+  if(!Number.isFinite(dailyRate)||dailyRate<0||!Number.isFinite(monthlySalary)||monthlySalary<0)return res.status(400).json({error:'Valores de remuneração inválidos.'});
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(effectiveFrom))return res.status(400).json({error:'Data de início inválida.'});
+  const admin=(await pool.query(`select id,role from users where id=$1`,[req.params.id])).rows[0]; if(!admin||admin.role!=='ADMIN')return res.status(404).json({error:'ADMIN não encontrado'});
+  const q=await pool.query(`insert into admin_payroll_settings(admin_user_id,daily_rate,monthly_salary,effective_from,updated_by) values($1,$2,$3,$4,$5) on conflict(admin_user_id) do update set daily_rate=excluded.daily_rate,monthly_salary=excluded.monthly_salary,effective_from=excluded.effective_from,updated_by=excluded.updated_by,updated_at=now() returning *`,[admin.id,dailyRate,monthlySalary,effectiveFrom,req.user!.id]);
+  await audit(req.user!.id,'OWNER_ADMIN_PAYROLL_UPDATED','ADMIN_PAYROLL',admin.id,{dailyRate,monthlySalary,effectiveFrom}); res.json({settings:q.rows[0]});
+});
+
+app.post('/api/owner/admins/:id/payroll/attendance', auth, ownerOnly, async (req:AuthedRequest,res)=>{
+  const attendanceDate=String(req.body?.attendanceDate||'').trim(),status=String(req.body?.status||'ABSENT').toUpperCase(),note=String(req.body?.note||'').trim().slice(0,1000)||null,documentKey=String(req.body?.documentKey||'').trim().slice(0,500)||null,documentName=String(req.body?.documentName||'').trim().slice(0,255)||null,documentMime=String(req.body?.documentMime||'').trim().slice(0,100)||null;
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(attendanceDate)||!['PRESENT','ABSENT','EXCUSED'].includes(status))return res.status(400).json({error:'Data ou estado da falta inválido.'});
+  const admin=(await pool.query(`select id,role from users where id=$1`,[req.params.id])).rows[0]; if(!admin||admin.role!=='ADMIN')return res.status(404).json({error:'ADMIN não encontrado'});
+  if(status==='EXCUSED'&&!documentKey&&!note)return res.status(400).json({error:'Uma falta justificada deve ter uma observação ou documento.'});
+  const q=await pool.query(`insert into admin_attendance(admin_user_id,attendance_date,status,note,justification_document_key,justification_document_name,justification_mime_type,reviewed_by,reviewed_at) values($1,$2,$3,$4,$5,$6,$7,$8,now()) on conflict(admin_user_id,attendance_date) do update set status=excluded.status,note=excluded.note,justification_document_key=coalesce(excluded.justification_document_key,admin_attendance.justification_document_key),justification_document_name=coalesce(excluded.justification_document_name,admin_attendance.justification_document_name),justification_mime_type=coalesce(excluded.justification_mime_type,admin_attendance.justification_mime_type),reviewed_by=excluded.reviewed_by,reviewed_at=now(),updated_at=now() returning id,attendance_date,status,note,justification_document_name,justification_mime_type,reviewed_at,created_at`,[admin.id,attendanceDate,status,note,documentKey,documentName,documentMime,req.user!.id]);
+  await audit(req.user!.id,'OWNER_ADMIN_ATTENDANCE_UPDATED','ADMIN_PAYROLL',admin.id,{attendanceDate,status}); res.json({attendance:q.rows[0]});
+});
+
+app.post('/api/owner/admins/:id/payroll/discount', auth, ownerOnly, async (req:AuthedRequest,res)=>{
+  const amount=Number(req.body?.amount),referenceMonth=String(req.body?.referenceMonth||'').trim(),description=String(req.body?.description||'').trim().slice(0,500);
+  if(!Number.isFinite(amount)||amount<=0||!/^\d{4}-\d{2}$/.test(referenceMonth)||!description)return res.status(400).json({error:'Informe valor, mês e motivo do desconto.'});
+  const admin=(await pool.query(`select id,role from users where id=$1`,[req.params.id])).rows[0]; if(!admin||admin.role!=='ADMIN')return res.status(404).json({error:'ADMIN não encontrado'});
+  const q=await pool.query(`insert into admin_payroll_adjustments(admin_user_id,adjustment_type,amount,reference_month,description,created_by) values($1,'DISCOUNT',$2,$3,$4,$5) returning *`,[admin.id,amount,referenceMonth,description,req.user!.id]);
+  await audit(req.user!.id,'OWNER_ADMIN_PAYROLL_DISCOUNT_CREATED','ADMIN_PAYROLL',admin.id,{amount,referenceMonth,description}); res.status(201).json({adjustment:q.rows[0]});
+});
+
+app.delete('/api/owner/admins/:id/payroll/discount/:adjustmentId', auth, ownerOnly, async (req:AuthedRequest,res)=>{
+  const q=await pool.query(`delete from admin_payroll_adjustments where id=$1 and admin_user_id=$2 and adjustment_type='DISCOUNT' returning id,amount,reference_month`,[req.params.adjustmentId,req.params.id]); if(!q.rows[0])return res.status(404).json({error:'Desconto não encontrado'}); await audit(req.user!.id,'OWNER_ADMIN_PAYROLL_DISCOUNT_DELETED','ADMIN_PAYROLL',req.params.id,{adjustmentId:req.params.adjustmentId}); res.json({ok:true});
+});
+
+app.post('/api/owner/admins/:id/payroll/justification', auth, ownerOnly, upload.single('file'), async (req:AuthedRequest,res)=>{
+  if(!req.file)return res.status(400).json({error:'Nenhum documento enviado.'});
+  const ext=path.extname(req.file.originalname).toLowerCase(); const allowed=['.pdf','.jpg','.jpeg','.png','.doc','.docx'];
+  if(!allowed.includes(ext)){try{fs.unlinkSync(req.file.path)}catch{};return res.status(400).json({error:'Documento inválido. Use PDF, JPG, PNG, DOC ou DOCX.'});}
+  const admin=(await pool.query(`select id,role from users where id=$1`,[req.params.id])).rows[0]; if(!admin||admin.role!=='ADMIN'){try{fs.unlinkSync(req.file.path)}catch{};return res.status(404).json({error:'ADMIN não encontrado'});}
+  const finalName=`owner-${req.user!.id}-payroll-${crypto.randomUUID()}${ext}`,finalPath=path.join(uploadDir,finalName); fs.renameSync(req.file.path,finalPath);
+  res.status(201).json({file:{storageKey:finalName,name:req.file.originalname,mimeType:req.file.mimetype,size:req.file.size}});
+});
+
+app.get('/api/owner/admins/:id/payroll/justification/:attendanceId', auth, ownerOnly, async (req:AuthedRequest,res)=>{
+  const row=(await pool.query(`select a.justification_document_key,a.justification_document_name,a.justification_mime_type from admin_attendance a where a.id=$1 and a.admin_user_id=$2`,[req.params.attendanceId,req.params.id])).rows[0]; if(!row?.justification_document_key)return res.status(404).json({error:'Documento não encontrado'});
+  const fp=path.join(uploadDir,path.basename(String(row.justification_document_key))); if(!fs.existsSync(fp))return res.status(404).json({error:'Ficheiro não encontrado no armazenamento'}); res.setHeader('Content-Type',row.justification_mime_type||'application/octet-stream'); res.setHeader('Content-Disposition',`inline; filename="${String(row.justification_document_name||'documento').replace(/"/g,'')}"`); fs.createReadStream(fp).pipe(res);
+});
+
 app.get('/api/owner/finance/overview', auth, ownerOnly, async (_req,res)=>{
   try{
     const [artists,admins,pending,ledger]=await Promise.all([
