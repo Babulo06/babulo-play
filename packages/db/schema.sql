@@ -352,3 +352,4 @@ create table if not exists royalty_reservations(
 );
 create index if not exists idx_royalty_reservations_track on royalty_reservations(track_id,status);
 create index if not exists idx_royalty_reservations_period on royalty_reservations(monthly_period,status);
+
