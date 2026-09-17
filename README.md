@@ -111,3 +111,9 @@ Faça um deploy/redeploy. Na primeira inicialização, se ainda não existir nen
 Depois de confirmar que consegue entrar como OWNER, altere `BOOTSTRAP_OWNER_ENABLED` para `false` e, por segurança, remova/limpe `BOOTSTRAP_OWNER_PASSWORD` das variáveis do Render.
 
 Nunca coloque estas credenciais no GitHub, `.env` versionado, código-fonte ou screenshots.
+
+## V10.4.21 — Partner Connectors
+Owner can configure an authorized distribution partner per platform. Endpoint URL and credential variable name are stored in configuration; the actual secret stays in Render environment variables. DDEX is the default protocol.
+
+## V10.4.22 — Cloudflare R2
+The API supports Cloudflare R2 as the permanent media store. Configure `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and `R2_BUCKET` in the Render API service. Keep the R2 bucket private; BaBuLo serves media through `/media/:key`. The R2 token should be limited to Object Read & Write for the `babulo-play-media` bucket.

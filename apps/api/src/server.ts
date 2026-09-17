@@ -7,6 +7,7 @@ import crypto from 'node:crypto';
 import multer from 'multer';
 import fs from 'node:fs';
 import path from 'node:path';
+import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 
 const app = express();
 const port = Number(process.env.PORT || 4000);
@@ -15,6 +16,67 @@ const JWT_SECRET = process.env.JWT_SECRET || 'change-this-secret-in-production';
 const uploadDir = process.env.UPLOAD_DIR || path.resolve(process.cwd(), 'storage');
 fs.mkdirSync(uploadDir, { recursive: true });
 const upload = multer({ dest: uploadDir, limits: { fileSize: 200 * 1024 * 1024 } });
+
+// ===== V10.4.22 Cloudflare R2 — armazenamento permanente =====
+const R2_ENDPOINT = String(process.env.R2_ENDPOINT || '').trim().replace(/\/$/, '');
+const R2_ACCESS_KEY_ID = String(process.env.R2_ACCESS_KEY_ID || '').trim();
+const R2_SECRET_ACCESS_KEY = String(process.env.R2_SECRET_ACCESS_KEY || '').trim();
+const R2_BUCKET = String(process.env.R2_BUCKET || 'babulo-play-media').trim();
+const R2_ENABLED = Boolean(R2_ENDPOINT && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY && R2_BUCKET);
+const r2 = R2_ENABLED ? new S3Client({ region: 'auto', endpoint: R2_ENDPOINT, credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY } }) : null;
+if (R2_ENABLED) console.log(`Cloudflare R2 ativo: bucket=${R2_BUCKET}`);
+else console.warn('Cloudflare R2 não configurado completamente; armazenamento local será usado como fallback.');
+
+function storageKeyFromValue(value:string){
+  const raw=String(value||'').split('?')[0];
+  const marker='/media/';
+  const i=raw.indexOf(marker);
+  const key=i>=0?raw.slice(i+marker.length):raw.replace(/^\/+/, '');
+  if(!key || key.includes('..') || key.includes('\\')) return '';
+  return key;
+}
+async function putR2File(key:string,filePath:string,contentType?:string){
+  if(!r2) return false;
+  const stat=await fs.promises.stat(filePath);
+  await r2.send(new PutObjectCommand({Bucket:R2_BUCKET,Key:key,Body:fs.createReadStream(filePath),ContentLength:stat.size,ContentType:contentType||'application/octet-stream'}));
+  return true;
+}
+async function putR2Text(key:string,text:string,contentType='text/plain; charset=utf-8'){
+  if(!r2) return false;
+  await r2.send(new PutObjectCommand({Bucket:R2_BUCKET,Key:key,Body:text,ContentType:contentType}));
+  return true;
+}
+async function deleteStorageObject(key:string){
+  const safe=storageKeyFromValue(key);
+  if(!safe) return;
+  if(r2){ try{ await r2.send(new DeleteObjectCommand({Bucket:R2_BUCKET,Key:safe})); }catch(e){ console.warn('Falha ao apagar objeto R2:',e); } }
+  const fp=path.join(uploadDir,path.basename(safe));
+  try{ if(fs.existsSync(fp)) await fs.promises.unlink(fp); }catch{}
+}
+async function storageObjectExists(key:string){
+  const safe=storageKeyFromValue(key); if(!safe) return false;
+  if(r2){ try{ await r2.send(new HeadObjectCommand({Bucket:R2_BUCKET,Key:safe})); return true; }catch{} }
+  return fs.existsSync(path.join(uploadDir,path.basename(safe)));
+}
+async function storageObjectBuffer(key:string){
+  const safe=storageKeyFromValue(key); if(!safe) throw new Error('Ficheiro inválido.');
+  if(r2){
+    const out:any=await r2.send(new GetObjectCommand({Bucket:R2_BUCKET,Key:safe}));
+    const body:any=out.Body;
+    if(!body) throw new Error('Ficheiro vazio no R2.');
+    if(typeof body.transformToByteArray==='function') return Buffer.from(await body.transformToByteArray());
+    const chunks:Buffer[]=[]; for await(const chunk of body as any) chunks.push(Buffer.from(chunk)); return Buffer.concat(chunks);
+  }
+  const fp=path.join(uploadDir,path.basename(safe));
+  if(!fs.existsSync(fp)) throw new Error('Ficheiro não encontrado no armazenamento.');
+  return fs.promises.readFile(fp);
+}
+async function storageObjectPathForProcessing(key:string){
+  const safe=storageKeyFromValue(key); if(!safe) throw new Error('Ficheiro inválido.');
+  const local=path.join(uploadDir,`r2-process-${crypto.randomUUID()}-${path.basename(safe)}`);
+  if(r2){ const b=await storageObjectBuffer(safe); await fs.promises.writeFile(local,b); return {path:local,temporary:true}; }
+  const fp=path.join(uploadDir,path.basename(safe)); if(!fs.existsSync(fp)) throw new Error('Ficheiro não encontrado no armazenamento.'); return {path:fp,temporary:false};
+}
 
 async function ensureDatabaseSchema() {
   if (!process.env.DATABASE_URL) {
@@ -38,7 +100,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql', '024_rights_splits_payouts.sql', '025_rights_matching_scan.sql', '026_existing_artist_email_verification.sql', '027_admin_payroll_attendance.sql', '028_admin_attendance_workflow.sql', '029_admin_attendance_notifications.sql', '030_admin_advertising_workflow.sql', '031_account_management_approvals.sql', '032_admin_internal_email_verification.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql', '024_rights_splits_payouts.sql', '025_rights_matching_scan.sql', '026_existing_artist_email_verification.sql', '027_admin_payroll_attendance.sql', '028_admin_attendance_workflow.sql', '029_admin_attendance_notifications.sql', '030_admin_advertising_workflow.sql', '031_account_management_approvals.sql', '032_admin_internal_email_verification.sql', '033_artist_mapping_distribution.sql', '034_distribution_engine_jobs.sql', '035_ddex_delivery.sql', '036_distribution_partner_connectors.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -96,6 +158,27 @@ async function bootstrapFirstOwner() {
 app.use(cors({ origin: process.env.WEB_ORIGIN || 'http://localhost:3000' }));
 app.use(express.json({ limit: '2mb' }));
 app.use('/media', express.static(uploadDir));
+app.get('/media/:key', async (req,res)=>{
+  const key=storageKeyFromValue(req.params.key);
+  if(!key) return res.status(400).send('Ficheiro inválido.');
+  const local=path.join(uploadDir,path.basename(key));
+  try{
+    if(!r2 && fs.existsSync(local)) return fs.createReadStream(local).pipe(res);
+    if(!r2) return res.status(404).send('Ficheiro não encontrado.');
+    const range=String(req.headers.range||'').match(/bytes=(\d*)-(\d*)/);
+    let start:number|undefined, end:number|undefined;
+    if(range){ if(range[1]) start=Number(range[1]); if(range[2]) end=Number(range[2]); }
+    const head:any=await r2.send(new HeadObjectCommand({Bucket:R2_BUCKET,Key:key}));
+    const size=Number(head.ContentLength||0);
+    if(start!==undefined && start>=size) return res.status(416).setHeader('Content-Range',`bytes */${size}`).end();
+    if(start!==undefined){ end=end===undefined?size-1:Math.min(end,size-1); res.status(206).setHeader('Content-Range',`bytes ${start}-${end}/${size}`).setHeader('Accept-Ranges','bytes').setHeader('Content-Length',end-start+1); }
+    else res.setHeader('Content-Length',size);
+    res.setHeader('Accept-Ranges','bytes'); res.setHeader('Content-Type',head.ContentType||'application/octet-stream');
+    const out:any=await r2.send(new GetObjectCommand({Bucket:R2_BUCKET,Key:key,Range:start!==undefined?`bytes=${start}-${end}`:undefined}));
+    const body:any=out.Body; if(!body) return res.status(404).end();
+    body.pipe(res);
+  }catch(e){ console.error('Media storage error:',e); if(!res.headersSent)res.status(404).send('Ficheiro não encontrado.'); }
+});
 
 function hashPassword(password: string) {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -370,8 +453,8 @@ app.delete('/api/releases/:id', auth, artistOnly, async (req:AuthedRequest,res) 
   const files=(await pool.query(`select tf.storage_key from track_files tf join tracks t on t.id=tf.track_id where t.primary_release_id=$1`,[release.id])).rows;
   const coverKey=release.cover_url?String(release.cover_url).split('/').pop():'';
   await pool.query('delete from releases where id=$1',[release.id]);
-  for(const f of files){const key=String(f.storage_key||'').replace(/^.*[\/]/,''); if(key){try{const fp=path.join(uploadDir,key);if(fs.existsSync(fp))fs.unlinkSync(fp);}catch{}}}
-  if(coverKey&&coverKey.startsWith(String(req.user!.id)+'-')){try{const fp=path.join(uploadDir,coverKey);if(fs.existsSync(fp))fs.unlinkSync(fp);}catch{}}
+  for(const f of files){const key=storageKeyFromValue(String(f.storage_key||'')); if(key) await deleteStorageObject(key);}
+  if(coverKey&&coverKey.startsWith(String(req.user!.id)+'-')) await deleteStorageObject(coverKey);
   await audit(req.user!.id,'RELEASE_DELETED','RELEASE',release.id,{title:release.title});
   res.json({ok:true,id:release.id});
 });
@@ -430,7 +513,13 @@ app.post('/api/uploads', auth, upload.single('file'), async (req:AuthedRequest,r
   if(kind==='cover' && !imageExts.includes(ext)){fs.unlinkSync(req.file.path);return res.status(400).json({error:'Capa inválida. Use JPG ou PNG.'});}
   if(kind==='cover'){ const d=imageDimensions(req.file.path); if(!d || d.width!==600 || d.height!==600){ fs.unlinkSync(req.file.path); return res.status(400).json({error:d?`Capa inválida: ${d.width}×${d.height}px. A BaBuLo Play exige exatamente 600×600px.`:'Não foi possível ler as dimensões da capa.'}); } }
   const finalName=`${req.user!.id}-${Date.now()}-${crypto.randomUUID()}${ext}`;
-  const finalPath=path.join(uploadDir,finalName); fs.renameSync(req.file.path,finalPath);
+  const finalPath=path.join(uploadDir,finalName);
+  try{
+    if(r2){
+      await putR2File(finalName,req.file.path,req.file.mimetype);
+      await fs.promises.unlink(req.file.path).catch(()=>{});
+    }else fs.renameSync(req.file.path,finalPath);
+  }catch(e){ await fs.promises.unlink(req.file.path).catch(()=>{}); console.error('R2 upload failed:',e); return res.status(502).json({error:'Não foi possível guardar o ficheiro no armazenamento permanente.'}); }
   res.status(201).json({file:{name:req.file.originalname,size:req.file.size,mimeType:req.file.mimetype,storageKey:finalName,url:`/media/${finalName}`,kind}});
 });
 
@@ -438,8 +527,7 @@ app.post('/api/uploads', auth, upload.single('file'), async (req:AuthedRequest,r
 app.delete('/api/uploads', auth, artistOnly, async (req:AuthedRequest,res) => {
   const key=String(req.query.key||'').split('/').pop()||'';
   if(!key || !key.startsWith(String(req.user!.id)+'-')) return res.status(403).json({error:'Ficheiro não pertence à tua conta.'});
-  const fp=path.join(uploadDir,key);
-  try { if(fs.existsSync(fp)) fs.unlinkSync(fp); } catch {}
+  await deleteStorageObject(key);
   await pool.query(`delete from track_files where storage_key=$1`,[key]);
   res.json({ok:true});
 });
@@ -448,8 +536,7 @@ app.delete('/api/tracks/:trackId/audio', auth, artistOnly, async (req:AuthedRequ
   const q=await pool.query(`select tf.id,tf.storage_key,t.primary_release_id from track_files tf join tracks t on t.id=tf.track_id join releases r on r.id=t.primary_release_id join artists a on a.id=r.primary_artist_id where tf.track_id=$1 and tf.file_type='AUDIO' and a.user_id=$2 order by tf.created_at desc limit 1`,[req.params.trackId,req.user!.id]);
   const f=q.rows[0];
   if(!f) return res.status(404).json({error:'Áudio não encontrado.'});
-  const fp=path.join(uploadDir,String(f.storage_key).replace(/^.*[\/]/,''));
-  try { if(fs.existsSync(fp)) fs.unlinkSync(fp); } catch {}
+  await deleteStorageObject(String(f.storage_key||''));
   await pool.query(`delete from track_files where id=$1`,[f.id]);
   await audit(req.user!.id,'TRACK_AUDIO_DELETED','TRACK',req.params.trackId);
   res.json({ok:true});
@@ -474,7 +561,7 @@ app.post('/api/releases/:id/preflight', auth, artistOnly, async (req:AuthedReque
   if(!release.cover_url) errors.push('Capa não enviada.');
   if(!tracks.length) errors.push('O lançamento precisa de pelo menos uma faixa.');
   for(const t of tracks){ if(!t.title) errors.push('Uma faixa está sem título.'); if(!t.storage_key) errors.push(`A faixa “${t.title}” não tem áudio enviado.`); if(Number(t.promo_end_ms)-Number(t.promo_start_ms)!==59000) errors.push(`O trecho promocional da faixa “${t.title||'Sem título'}” deve ter exatamente 59 segundos.`); }
-  if(release.cover_url){ const key=String(release.cover_url).split('/').pop(); const fp=path.join(uploadDir,key||''); if(!fs.existsSync(fp)) errors.push('Ficheiro da capa não encontrado no armazenamento.'); else { const d=imageDimensions(fp); if(!d) errors.push('Não foi possível validar as dimensões da capa.'); else if(d.width!==600||d.height!==600) errors.push(`A capa tem ${d.width}×${d.height}px. A BaBuLo Play exige exatamente 600×600px.`); } }
+  if(release.cover_url){ const key=storageKeyFromValue(String(release.cover_url)); if(!await storageObjectExists(key)) errors.push('Ficheiro da capa não encontrado no armazenamento.'); else { let temp:any=null; try{temp=await storageObjectPathForProcessing(key); const d=imageDimensions(temp.path); if(!d) errors.push('Não foi possível validar as dimensões da capa.'); else if(d.width!==600||d.height!==600) errors.push(`A capa tem ${d.width}×${d.height}px. A BaBuLo Play exige exatamente 600×600px.`);}catch{errors.push('Não foi possível validar a capa no armazenamento.');}finally{if(temp?.temporary)await fs.promises.unlink(temp.path).catch(()=>{});} } }
   const status=errors.length?'FAILED':'PASSED';
   await pool.query(`update releases set preflight_status=$1,preflight_reason=$2,status=$3,submitted_at=case when $1='PASSED' then now() else submitted_at end where id=$4`,[status,errors.length?errors.join(' '):null,'DRAFT',release.id]);
   res.json({preflight:{status,errors},releaseId:release.id});
@@ -604,9 +691,10 @@ function normalizeStorageKey(value:string){
 async function runRightsScan(opts:{storageKey:string,trackId?:string|null,userId:string}){
   const key=normalizeStorageKey(opts.storageKey);
   if(!key) throw new Error('Ficheiro de áudio inválido.');
-  const fp=path.join(uploadDir,key);
-  if(!fs.existsSync(fp)) throw new Error('Ficheiro de áudio não encontrado no armazenamento.');
-  const sha256=crypto.createHash('sha256').update(fs.readFileSync(fp)).digest('hex');
+  const file=await storageObjectPathForProcessing(key);
+  const fp=file.path;
+  try{
+  const sha256=crypto.createHash('sha256').update(await fs.promises.readFile(fp)).digest('hex');
   const providerUrl=String(process.env.RIGHTS_MATCH_PROVIDER_URL||'').trim();
   let provider='INTERNAL', result:any={status:'NO_MATCH',confidence:0,matches:[],reference:null};
 
@@ -631,6 +719,7 @@ async function runRightsScan(opts:{storageKey:string,trackId?:string|null,userId
     await pool.query(`insert into rights_matches(scan_id,holder_name,holder_email,country,right_category,isrc,iswc,ipi,catalog_code,match_type,confidence,confirmed,royalty_percentage,source,source_reference) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,[scan.id,m.holderName||m.holder_name||null,m.holderEmail||m.holder_email||null,m.country||null,m.rightCategory||m.right_category||null,m.isrc||null,m.iswc||null,m.ipi||null,m.catalogCode||m.catalog_code||null,m.matchType||m.match_type||'POSSIBLE',Number(m.confidence||0),Boolean(m.confirmed),m.royaltyPercentage==null?null:Number(m.royaltyPercentage),m.source||provider,m.sourceReference||result.reference||null]);
   }
   return {scanId:scan.id,sha256,provider,status:result.status,confidence:Number(result.confidence||0),matches:result.matches||[],reference:result.reference||null,disclaimer:'Uma correspondência automática identifica uma possível relação; não determina sozinha a titularidade jurídica nem a percentagem de royalties.'};
+  } finally { if(file.temporary) await fs.promises.unlink(fp).catch(()=>{}); }
 }
 
 app.post('/api/rights/scan-upload', auth, artistOnly, async (req:AuthedRequest,res) => {
@@ -1441,7 +1530,7 @@ app.post('/api/admin/me/attendance/justification/upload', auth, upload.single('f
   if(!req.file) return res.status(400).json({error:'Nenhum documento enviado.'});
   const ext=path.extname(req.file.originalname).toLowerCase(); const allowed=['.pdf','.jpg','.jpeg','.png','.doc','.docx'];
   if(!allowed.includes(ext)){try{fs.unlinkSync(req.file.path)}catch{};return res.status(400).json({error:'Documento inválido. Use PDF, JPG, PNG, DOC ou DOCX.'});}
-  const finalName=`${req.user.id}-${Date.now()}-${crypto.randomUUID()}${ext}`,finalPath=path.join(uploadDir,finalName); fs.renameSync(req.file.path,finalPath);
+  const finalName=`${req.user.id}-${Date.now()}-${crypto.randomUUID()}${ext}`; if(r2) await putR2File(finalName,req.file.path,req.file.mimetype); else await fs.promises.rename(req.file.path,path.join(uploadDir,finalName)); await fs.promises.unlink(req.file.path).catch(()=>{});
   res.status(201).json({file:{storageKey:finalName,name:req.file.originalname,mimeType:req.file.mimetype,size:req.file.size,url:`/media/${finalName}`}});
 });
 
@@ -1494,8 +1583,8 @@ app.post('/api/owner/admins/:id/payroll/justification', auth, ownerOnly, upload.
   const ext=path.extname(req.file.originalname).toLowerCase(); const allowed=['.pdf','.jpg','.jpeg','.png','.doc','.docx'];
   if(!allowed.includes(ext)){try{fs.unlinkSync(req.file.path)}catch{};return res.status(400).json({error:'Documento inválido. Use PDF, JPG, PNG, DOC ou DOCX.'});}
   const admin=(await pool.query(`select id,role from users where id=$1`,[req.params.id])).rows[0]; if(!admin||admin.role!=='ADMIN'){try{fs.unlinkSync(req.file.path)}catch{};return res.status(404).json({error:'ADMIN não encontrado'});}
-  const finalName=`owner-${req.user!.id}-payroll-${crypto.randomUUID()}${ext}`,finalPath=path.join(uploadDir,finalName); fs.renameSync(req.file.path,finalPath);
-  res.status(201).json({file:{storageKey:finalName,name:req.file.originalname,mimeType:req.file.mimetype,size:req.file.size}});
+  const finalName=`owner-${req.user!.id}-payroll-${crypto.randomUUID()}${ext}`; if(r2) await putR2File(finalName,req.file.path,req.file.mimetype); else await fs.promises.rename(req.file.path,path.join(uploadDir,finalName)); await fs.promises.unlink(req.file.path).catch(()=>{});
+  res.status(201).json({file:{storageKey:finalName,name:req.file.originalname,mimeType:req.file.mimetype,size:req.file.size,url:`/media/${finalName}`}});
 });
 
 app.post('/api/admin/me/attendance/justification/upload', auth, upload.single('file'), async (req:AuthedRequest,res:Response)=>{
@@ -1503,13 +1592,13 @@ app.post('/api/admin/me/attendance/justification/upload', auth, upload.single('f
   if(!req.file) return res.status(400).json({error:'Nenhum documento enviado.'});
   const ext=path.extname(req.file.originalname).toLowerCase(); const allowed=['.pdf','.jpg','.jpeg','.png','.doc','.docx'];
   if(!allowed.includes(ext)){try{fs.unlinkSync(req.file.path)}catch{};return res.status(400).json({error:'Documento inválido. Use PDF, JPG, PNG, DOC ou DOCX.'});}
-  const finalName=`${req.user.id}-${Date.now()}-${crypto.randomUUID()}${ext}`,finalPath=path.join(uploadDir,finalName); fs.renameSync(req.file.path,finalPath);
+  const finalName=`${req.user.id}-${Date.now()}-${crypto.randomUUID()}${ext}`; if(r2) await putR2File(finalName,req.file.path,req.file.mimetype); else await fs.promises.rename(req.file.path,path.join(uploadDir,finalName)); await fs.promises.unlink(req.file.path).catch(()=>{});
   res.status(201).json({file:{storageKey:finalName,name:req.file.originalname,mimeType:req.file.mimetype,size:req.file.size,url:`/media/${finalName}`}});
 });
 
 app.get('/api/owner/admins/:id/payroll/justification/:attendanceId', auth, ownerOnly, async (req:AuthedRequest,res)=>{
   const row=(await pool.query(`select a.justification_document_key,a.justification_document_name,a.justification_mime_type from admin_attendance a where a.id=$1 and a.admin_user_id=$2`,[req.params.attendanceId,req.params.id])).rows[0]; if(!row?.justification_document_key)return res.status(404).json({error:'Documento não encontrado'});
-  const fp=path.join(uploadDir,path.basename(String(row.justification_document_key))); if(!fs.existsSync(fp))return res.status(404).json({error:'Ficheiro não encontrado no armazenamento'}); res.setHeader('Content-Type',row.justification_mime_type||'application/octet-stream'); res.setHeader('Content-Disposition',`inline; filename="${String(row.justification_document_name||'documento').replace(/"/g,'')}"`); fs.createReadStream(fp).pipe(res);
+  const key=storageKeyFromValue(String(row.justification_document_key||'')); if(!await storageObjectExists(key))return res.status(404).json({error:'Ficheiro não encontrado no armazenamento'}); res.setHeader('Content-Type',row.justification_mime_type||'application/octet-stream'); res.setHeader('Content-Disposition',`inline; filename="${String(row.justification_document_name||'documento').replace(/"/g,'')}"`); if(r2){const out:any=await r2.send(new GetObjectCommand({Bucket:R2_BUCKET,Key:key})); if(out.Body)out.Body.pipe(res); else res.status(404).end();} else fs.createReadStream(path.join(uploadDir,path.basename(key))).pipe(res);
 });
 
 app.get('/api/owner/finance/overview', auth, ownerOnly, async (_req,res)=>{
@@ -1650,15 +1739,247 @@ app.post('/api/admin/withdrawals/:id/decision', auth, ownerOnly, async (req:Auth
 // ===== V10 Distribution Engine =====
 const DIST_PRODUCTS=['DIST_SINGLE','DIST_EP','DIST_ALBUM','DIST_ALBUM_PRO'];
 const DIST_STATUSES=['READY','SUBMITTED','PROCESSING','DELIVERED','PUBLISHED','FAILED','CANCELLED'];
+
+function connectorEnv(code:string,name:string){return process.env[`DIST_CONNECTOR_${code}_${name}`]||'';}
+async function resolveDistributionConnector(platformId:string,platformCode:string){
+  const q=await pool.query(`select pc.endpoint_url,pc.protocol,pc.auth_env_key,pc.callback_url,pc.active,pc.partner_name from distribution_platform_connectors pc where pc.platform_id=$1 and pc.active=true limit 1`,[platformId]);
+  if(q.rows[0]){
+    const x=q.rows[0];
+    return {url:String(x.endpoint_url||''),protocol:String(x.protocol||'DDEX').toUpperCase(),token:x.auth_env_key?String(process.env[x.auth_env_key]||''): '',callbackUrl:String(x.callback_url||''),partnerName:String(x.partner_name||'')};
+  }
+  return {url:connectorEnv(platformCode,'URL'),protocol:String(connectorEnv(platformCode,'PROTOCOL')||'JSON').toUpperCase(),token:connectorEnv(platformCode,'TOKEN'),callbackUrl:'',partnerName:''};
+}
+async function createDistributionJob(deliveryId:string,jobType:'DELIVER_RELEASE'|'RETRY'='DELIVER_RELEASE'){
+  const d=(await pool.query(`select d.*,o.release_id,o.artist_id,p.code,p.name from distribution_deliveries d join distribution_orders o on o.id=d.order_id join distribution_platforms p on p.id=d.platform_id where d.id=$1`,[deliveryId])).rows[0];
+  if(!d) throw new Error('Entrega não encontrada');
+  const key=`${d.id}:${d.order_id}:${d.platform_id}:${jobType}`;
+  const q=await pool.query(`insert into distribution_jobs(delivery_id,order_id,platform_id,job_type,idempotency_key,status,next_attempt_at) values($1,$2,$3,$4,$5,'QUEUED',now()) on conflict(idempotency_key) do update set updated_at=now() returning *`,[d.id,d.order_id,d.platform_id,jobType,key]);
+  return q.rows[0];
+}
+async function dispatchDistributionJob(jobId:string,actorUserId?:string){
+  const c=await pool.connect();
+  try{
+    await c.query('begin');
+    const job=(await c.query(`select j.*,d.external_artist_id,d.artist_profile_url,d.mapping_status,d.status delivery_status,p.code platform_code,p.name platform_name,o.release_id,o.artist_id,r.title,r.release_date,r.upc,r.ean,a.stage_name from distribution_jobs j join distribution_deliveries d on d.id=j.delivery_id join distribution_platforms p on p.id=j.platform_id join distribution_orders o on o.id=j.order_id join releases r on r.id=o.release_id join artists a on a.id=o.artist_id where j.id=$1 for update`,[jobId])).rows[0];
+    if(!job) throw new Error('Job não encontrado');
+    if(job.status==='SUCCEEDED') return {ok:true,status:'SUCCEEDED',message:'Job já concluído.'};
+    if(job.delivery_status==='MAPPING_REQUIRED') throw new Error('Artist Mapping ainda não confirmado.');
+    const connector=await resolveDistributionConnector(job.platform_id,job.platform_code);
+    const url=connector.url;
+    const token=connector.token;
+    if(!url){await c.query(`update distribution_jobs set status='QUEUED',last_error=$1,updated_at=now() where id=$2`,['Conector/parceiro de distribuição não configurado para '+job.platform_code,job.id]);await c.query('commit');return {ok:false,status:'QUEUED',message:'Conector/parceiro não configurado.'};}
+    const attempt=Number(job.attempt_count||0)+1; const requestId=crypto.randomUUID();
+    await c.query(`update distribution_jobs set status='RUNNING',attempt_count=$1,request_id=$2,started_at=now(),updated_at=now() where id=$3`,[attempt,requestId,job.id]);
+    await c.query(`update distribution_deliveries set status='PROCESSING',updated_at=now() where id=$1`,[job.delivery_id]);
+    await c.query('commit');
+    const protocol=connector.protocol;
+    let requestBody:string; let contentType='application/json'; let ddex:any=null;
+    if(protocol==='DDEX'){
+      ddex=await createDDEXPackage(job.release_id,job.delivery_id);
+      requestBody=ddex.xml; contentType='application/xml';
+      await c.query(`update distribution_jobs set request_id=$1,updated_at=now() where id=$2`,[requestId,job.id]);
+    } else {
+      const payload={schemaVersion:'1.0',requestId,idempotencyKey:job.idempotency_key,jobId:job.id,deliveryId:job.delivery_id,orderId:job.order_id,platform:{code:job.platform_code,name:job.platform_name},release:{id:job.release_id,title:job.title,releaseDate:job.release_date,upc:job.upc,ean:job.ean,artist:job.stage_name},artistMapping:{externalArtistId:job.external_artist_id||null,profileUrl:job.artist_profile_url||null,mappingStatus:job.mapping_status||null},callbackUrl:`${connector.callbackUrl||`${process.env.PUBLIC_API_URL||''}/api/connectors/distribution/callback`}`,callbackAuth:{type:'Bearer',tokenRequired:Boolean(process.env.DIST_CONNECTOR_CALLBACK_TOKEN)}};
+      requestBody=JSON.stringify(payload);
+    }
+    let response:any; let body=''; let httpStatus=0;
+    try{response=await fetch(url,{method:'POST',headers:{'Content-Type':contentType,'X-BaBuLo-Request-Id':requestId,'X-BaBuLo-Idempotency-Key':job.idempotency_key,...(token?{Authorization:`Bearer ${token}`}:{})},body:requestBody});httpStatus=response.status;body=(await response.text()).slice(0,12000);}catch(e:any){throw Object.assign(new Error(e?.message||'Falha de rede no conector'),{httpStatus:0,responseBody:''});}
+    const ok=response.ok;
+    if(ok){await pool.query(`update distribution_jobs set status='SUCCEEDED',last_http_status=$1,last_error=null,finished_at=now(),updated_at=now() where id=$2`,[httpStatus,job.id]);await pool.query(`update distribution_deliveries set status='DELIVERED',delivered_at=now(),error_code=null,error_message=null,updated_at=now() where id=$1`,[job.delivery_id]);await pool.query(`insert into distribution_connector_logs(job_id,platform_id,direction,http_status,response_body) values($1,$2,'OUTBOUND',$3,$4)`,[job.id,job.platform_id,httpStatus,body]);await distHistory(job.order_id,job.delivery_id,'PROCESSING','DELIVERED',`Conector ${job.platform_code} aceitou a entrega`,actorUserId);await audit(actorUserId||null,'DISTRIBUTION_CONNECTOR_DELIVERED','DISTRIBUTION_DELIVERY',job.delivery_id,{platform:job.platform_code,httpStatus});return {ok:true,status:'DELIVERED',httpStatus};}
+    await pool.query(`update distribution_jobs set status='FAILED',last_http_status=$1,last_error=$2,finished_at=now(),updated_at=now() where id=$3`,[httpStatus,body||`HTTP ${httpStatus}`,job.id]);await pool.query(`update distribution_deliveries set status='FAILED',error_code='CONNECTOR_HTTP_ERROR',error_message=$1,updated_at=now() where id=$2`,[body||`Conector respondeu HTTP ${httpStatus}`,job.delivery_id]);await pool.query(`insert into distribution_connector_logs(job_id,platform_id,direction,http_status,response_body,error_message) values($1,$2,'OUTBOUND',$3,$4,$5)`,[job.id,job.platform_id,httpStatus,body,body||`HTTP ${httpStatus}`]);await distHistory(job.order_id,job.delivery_id,'PROCESSING','FAILED',`Falha no conector ${job.platform_code}: HTTP ${httpStatus}`,actorUserId);return {ok:false,status:'FAILED',httpStatus,message:body||`HTTP ${httpStatus}`};
+  }catch(e:any){await c.query('rollback').catch(()=>{});const msg=e?.message||'Falha no job';await pool.query(`update distribution_jobs set status='FAILED',last_error=$1,finished_at=now(),updated_at=now() where id=$2`,[msg,jobId]).catch(()=>{});await pool.query(`update distribution_deliveries set status='FAILED',error_code='CONNECTOR_ERROR',error_message=$1,updated_at=now() where id=(select delivery_id from distribution_jobs where id=$2)`,[msg,jobId]).catch(()=>{});return {ok:false,status:'FAILED',message:msg};}
+  finally{c.release();}
+}
+
+function xmlEsc(v:any){return String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');}
+async function buildDDEXMessage(releaseId:string, deliveryId:string){
+  const r=(await pool.query(`select r.*,a.stage_name artist_name,g.name genre_name from releases r join artists a on a.id=r.primary_artist_id left join genres g on g.id=r.genre_id where r.id=$1`,[releaseId])).rows[0];
+  if(!r) throw new Error('Lançamento não encontrado para DDEX.');
+  const tracks=(await pool.query(`select t.*,g.name genre_name,(select tf.storage_key from track_files tf where tf.track_id=t.id and tf.status='UPLOADED' order by tf.created_at desc limit 1) storage_key,(select tf.checksum from track_files tf where tf.track_id=t.id and tf.status='UPLOADED' order by tf.created_at desc limit 1) checksum from tracks t left join genres g on g.id=t.genre_id where t.primary_release_id=$1 order by t.track_number,t.created_at`,[releaseId])).rows;
+  if(!tracks.length) throw new Error('O lançamento não possui faixas.');
+  const now=new Date().toISOString();
+  const messageId=`BABULO-${releaseId}-${Date.now()}`;
+  const resourceList=tracks.map((t:any,i:number)=>`\n      <SoundRecording>
+        <ResourceReference>SR${i+1}</ResourceReference>
+        <ReferenceTitle><TitleText>${xmlEsc(t.title)}</TitleText></ReferenceTitle>
+        <DisplayArtist><PartyName><FullName>${xmlEsc(t.performer||r.artist_name)}</FullName></PartyName></DisplayArtist>
+        <ResourceContentType>Audio</ResourceContentType>
+        <File><FileName>${xmlEsc(path.basename(t.storage_key||`track-${i+1}.audio`))}</FileName>${t.checksum?`<HashSum>${xmlEsc(t.checksum)}</HashSum>`:''}</File>
+        ${t.isrc?`<SoundRecordingId><ISRC>${xmlEsc(t.isrc)}</ISRC></SoundRecordingId>`:''}
+        ${t.duration_ms?`<Duration>PT${(Number(t.duration_ms)/1000).toFixed(3)}S</Duration>`:''}
+      </SoundRecording>`).join('');
+  const releaseIdXml=r.upc||r.ean||releaseId;
+  const dealDate=r.release_date||new Date().toISOString().slice(0,10);
+  const xml=`<?xml version="1.0" encoding="UTF-8"?>
+<NewReleaseMessage xmlns="http://ddex.net/xml/ern/43" MessageSchemaVersionId="ern/43" LanguageAndScriptCode="${xmlEsc(r.language||'pt')}-Latn">
+  <MessageHeader>
+    <MessageThreadId>${xmlEsc(messageId)}</MessageThreadId>
+    <MessageId>${xmlEsc(messageId)}</MessageId>
+    <MessageSender><PartyId>PAD-BA-BULO</PartyId><PartyName><FullName>BaBuLo Play</FullName></PartyName></MessageSender>
+    <MessageRecipient><PartyId>${xmlEsc(process.env.DDEX_RECIPIENT_PARTY_ID||'RECIPIENT')}</PartyId></MessageRecipient>
+    <MessageCreatedDateTime>${now}</MessageCreatedDateTime>
+  </MessageHeader>
+  <ResourceList>${resourceList}
+  </ResourceList>
+  <ReleaseList>
+    <Release>
+      <ReleaseReference>R1</ReleaseReference>
+      <ReferenceTitle><TitleText>${xmlEsc(r.title)}</TitleText></ReferenceTitle>
+      <ReleaseType>${r.type==='SINGLE'?'Single':r.type==='EP'?'EP':'Album'}</ReleaseType>
+      <DisplayArtist><PartyName><FullName>${xmlEsc(r.artist_name)}</FullName></PartyName></DisplayArtist>
+      ${r.label_name?`<LabelName>${xmlEsc(r.label_name)}</LabelName>`:''}
+      ${r.upc?`<ReleaseId><GRid>${xmlEsc(r.upc)}</GRid></ReleaseId>`:''}
+      <ReleaseDate>${xmlEsc(dealDate)}</ReleaseDate>
+      <ReleaseResourceReferenceList>${tracks.map((_:any,i:number)=>`<ReleaseResourceReference ReleaseResourceType="PrimaryResource">SR${i+1}</ReleaseResourceReference>`).join('')}</ReleaseResourceReferenceList>
+      ${r.cover_url?`<ReleaseArtwork><ResourceReference>Artwork1</ResourceReference></ReleaseArtwork>`:''}
+    </Release>
+  </ReleaseList>
+  <DealList><ReleaseDeal><DealReleaseReference>R1</DealReleaseReference><Deal><CommercialModelType>SubscriptionModel</CommercialModelType><UseType>OnDemandStream</UseType><ValidityPeriod><StartDate>${xmlEsc(dealDate)}</StartDate></ValidityPeriod></Deal></ReleaseDeal></DealList>
+</NewReleaseMessage>`;
+  return {xml,messageId,trackCount:tracks.length,release:r,tracks,deliveryId};
+}
+async function createDDEXPackage(releaseId:string,deliveryId:string){
+  const built=await buildDDEXMessage(releaseId,deliveryId);
+  const dir=path.join(uploadDir,'ddex',releaseId); fs.mkdirSync(dir,{recursive:true});
+  const fileName=`${built.messageId}.xml`; const filePath=path.join(dir,fileName);
+  fs.writeFileSync(filePath,built.xml,'utf8');
+  if(r2){ await putR2Text(`ddex/${releaseId}/${fileName}`,built.xml,'application/xml'); }
+  const sha=crypto.createHash('sha256').update(built.xml).digest('hex');
+  await pool.query(`insert into ddex_packages(delivery_id,release_id,message_id,file_path,sha256,status,created_at,updated_at) values($1,$2,$3,$4,$5,'GENERATED',now(),now()) on conflict(delivery_id) do update set message_id=excluded.message_id,file_path=excluded.file_path,sha256=excluded.sha256,status='GENERATED',updated_at=now()`,[deliveryId,releaseId,built.messageId,filePath,sha]);
+  return {...built,filePath,sha256:sha};
+}
+
 const distHistory=async(o:string,d:string|null,old:string|null,nw:string,msg:string,u?:string)=>pool.query(`insert into distribution_history(order_id,delivery_id,old_status,new_status,message,actor_user_id) values($1,$2,$3,$4,$5,$6)`,[o,d,old,nw,msg,u||null]);
+// ===== V10.4.19 Spotify Artist Mapping =====
+let spotifyAccessToken:string|null=null;
+let spotifyAccessTokenExpiresAt=0;
+async function spotifyToken(){
+  const id=String(process.env.SPOTIFY_CLIENT_ID||'');
+  const secret=String(process.env.SPOTIFY_CLIENT_SECRET||'');
+  if(!id||!secret) return null;
+  if(spotifyAccessToken && Date.now()<spotifyAccessTokenExpiresAt-30000) return spotifyAccessToken;
+  const basic=Buffer.from(`${id}:${secret}`).toString('base64');
+  const r=await fetch('https://accounts.spotify.com/api/token',{method:'POST',headers:{Authorization:`Basic ${basic}`,'Content-Type':'application/x-www-form-urlencoded'},body:'grant_type=client_credentials'});
+  if(!r.ok) throw new Error(`Spotify token HTTP ${r.status}`);
+  const d:any=await r.json();
+  spotifyAccessToken=String(d.access_token||'');
+  spotifyAccessTokenExpiresAt=Date.now()+Number(d.expires_in||3600)*1000;
+  return spotifyAccessToken;
+}
+app.get('/api/artists/me/spotify/search',auth,artistOnly,async(req:AuthedRequest,res)=>{
+  try{
+    const q=String(req.query.q||'').trim();
+    if(q.length<2) return res.status(400).json({error:'Informe pelo menos 2 caracteres para pesquisar no Spotify.'});
+    const token=await spotifyToken();
+    if(!token) return res.status(503).json({error:'Spotify Artist Mapping ainda não está configurado no servidor. Adicione SPOTIFY_CLIENT_ID e SPOTIFY_CLIENT_SECRET no Render.'});
+    const url=`https://api.spotify.com/v1/search?type=artist&limit=10&q=${encodeURIComponent(q)}`;
+    const r=await fetch(url,{headers:{Authorization:`Bearer ${token}`}});
+    if(!r.ok){spotifyAccessToken=null;return res.status(502).json({error:`Spotify respondeu HTTP ${r.status}.`});}
+    const d:any=await r.json();
+    res.json({artists:(d.artists?.items||[]).map((a:any)=>({id:a.id,name:a.name,url:a.external_urls?.spotify||'',image:a.images?.[0]?.url||'',followers:a.followers?.total||0,genres:a.genres||[]}))});
+  }catch(e:any){console.error('Spotify search:',e);res.status(502).json({error:e?.message||'Não foi possível pesquisar no Spotify.'});}
+});
+app.get('/api/artists/me/spotify/artist/:artistId',auth,artistOnly,async(req:AuthedRequest,res)=>{
+  try{
+    const id=String(req.params.artistId||'').trim();
+    if(!/^[A-Za-z0-9]{10,}$/.test(id)) return res.status(400).json({error:'Spotify Artist ID inválido.'});
+    const token=await spotifyToken();
+    if(!token) return res.status(503).json({error:'Spotify Artist Mapping não configurado.'});
+    const r=await fetch(`https://api.spotify.com/v1/artists/${encodeURIComponent(id)}`,{headers:{Authorization:`Bearer ${token}`}});
+    if(!r.ok) return res.status(r.status===404?404:502).json({error:`Não foi possível validar o artista no Spotify (HTTP ${r.status}).`});
+    const a:any=await r.json();
+    res.json({artist:{id:a.id,name:a.name,url:a.external_urls?.spotify||'',image:a.images?.[0]?.url||'',followers:a.followers?.total||0,genres:a.genres||[]}});
+  }catch(e:any){console.error('Spotify artist:',e);res.status(502).json({error:e?.message||'Não foi possível validar o artista no Spotify.'});}
+});
+// ===== V10.4.17 Artist Mapping =====
+app.get('/api/artists/me/platform-profiles',auth,artistOnly,async(req:AuthedRequest,res)=>{
+  const artist=(await pool.query('select id,stage_name from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];
+  if(!artist) return res.status(404).json({error:'Perfil de artista não encontrado'});
+  const platforms=(await pool.query(`select id,code,name,active from distribution_platforms where active=true order by name`)).rows;
+  const profiles=(await pool.query(`select app.*,p.code,p.name from artist_platform_profiles app join distribution_platforms p on p.id=app.platform_id where app.artist_id=$1 order by p.name`,[artist.id])).rows;
+  res.json({artist,platforms,profiles});
+});
+app.put('/api/artists/me/platform-profiles/:platformId',auth,artistOnly,async(req:AuthedRequest,res)=>{
+  const {profileMode='NEW',profileUrl='',externalArtistId='',notes=''}=req.body||{};
+  if(!['NEW','EXISTING'].includes(String(profileMode))) return res.status(400).json({error:'Modo de perfil inválido'});
+  const artist=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];
+  const platform=(await pool.query('select id,code,name from distribution_platforms where id=$1 and active=true',[req.params.platformId])).rows[0];
+  if(!artist||!platform) return res.status(404).json({error:'Artista ou plataforma não encontrada'});
+  if(String(profileMode)==='EXISTING'&&!String(profileUrl||'').trim()&&!String(externalArtistId||'').trim()) return res.status(400).json({error:'Para um perfil existente, informe o link do perfil ou o ID oficial do artista.'});
+  const status=String(profileMode)==='NEW'?'PENDING':'PENDING';
+  const q=await pool.query(`insert into artist_platform_profiles(artist_id,platform_id,profile_mode,profile_url,external_artist_id,mapping_status,notes) values($1,$2,$3,$4,$5,$6,$7) on conflict(artist_id,platform_id) do update set profile_mode=excluded.profile_mode,profile_url=excluded.profile_url,external_artist_id=excluded.external_artist_id,mapping_status=excluded.mapping_status,verified_by=null,verified_at=null,notes=excluded.notes,updated_at=now() returning *`,[artist.id,platform.id,String(profileMode),String(profileUrl||'').trim()||null,String(externalArtistId||'').trim()||null,status,String(notes||'').trim()||null]);
+  await audit(req.user!.id,'ARTIST_PLATFORM_PROFILE_SAVED','ARTIST_PLATFORM_PROFILE',q.rows[0].id,{platform:platform.code,profileMode});
+  res.json({profile:q.rows[0],message:String(profileMode)==='EXISTING'?'Perfil guardado e enviado para validação de Artist Mapping.':'A BaBuLo criará/mappingeará um novo perfil quando o conector oficial estiver disponível.'});
+});
+app.delete('/api/artists/me/platform-profiles/:platformId',auth,artistOnly,async(req:AuthedRequest,res)=>{
+  const artist=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];
+  await pool.query('delete from artist_platform_profiles where artist_id=$1 and platform_id=$2',[artist?.id,req.params.platformId]);
+  res.json({ok:true});
+});
+
+// Monitorização operacional do motor de distribuição (ADMIN com RELEASES; OWNER pode consultar).
+app.get('/api/admin/distribution/orders',auth,requireAdminPermission('RELEASES'),async(req:AuthedRequest,res)=>{
+  const status=String(req.query.status||'');
+  const params:any[]=[]; let where='';
+  if(status){params.push(status);where=`where o.status=$${params.length}`;}
+  const orders=(await pool.query(`select o.*,r.title release_title,a.stage_name,(select count(*) from distribution_deliveries d where d.order_id=o.id)::int platform_count,(select count(*) from distribution_deliveries d where d.order_id=o.id and d.status='PUBLISHED')::int published_count from distribution_orders o join releases r on r.id=o.release_id join artists a on a.id=o.artist_id ${where} order by o.created_at desc limit 200`,params)).rows;
+  res.json({orders});
+});
+app.get('/api/admin/distribution/orders/:id',auth,requireAdminPermission('RELEASES'),async(req:AuthedRequest,res)=>{
+  const o=(await pool.query(`select o.*,r.title release_title,r.type release_type,r.upc,r.ean,r.release_date,a.stage_name from distribution_orders o join releases r on r.id=o.release_id join artists a on a.id=o.artist_id where o.id=$1`,[req.params.id])).rows[0];
+  if(!o) return res.status(404).json({error:'Pedido de distribuição não encontrado'});
+  const deliveries=(await pool.query(`select d.*,p.code,p.name,app.profile_mode,app.mapping_status profile_mapping_status,app.external_artist_id profile_external_artist_id,app.profile_url profile_url from distribution_deliveries d join distribution_platforms p on p.id=d.platform_id left join artist_platform_profiles app on app.id=d.artist_profile_id where d.order_id=$1 order by p.name`,[o.id])).rows;
+  res.json({order:o,deliveries});
+});
+app.post('/api/admin/distribution/deliveries/:id/mapping-decision',auth,requireAdminPermission('RELEASES'),async(req:AuthedRequest,res)=>{
+  const {decision,reason=''}=req.body||{};
+  if(!['VERIFIED','REJECTED'].includes(String(decision))) return res.status(400).json({error:'Decisão de mapping inválida'});
+  const d=(await pool.query(`select d.id,d.order_id,d.platform_id,d.artist_profile_id,o.artist_id,p.code,p.name from distribution_deliveries d join distribution_orders o on o.id=d.order_id join distribution_platforms p on p.id=d.platform_id where d.id=$1`,[req.params.id])).rows[0];
+  if(!d) return res.status(404).json({error:'Entrega não encontrada'});
+  if(!d.artist_profile_id) return res.status(400).json({error:'Esta entrega não tem um perfil externo indicado.'});
+  await pool.query(`update artist_platform_profiles set mapping_status=$1,verified_by=$2,verified_at=now(),notes=$3,updated_at=now() where id=$4`,[decision,req.user!.id,String(reason||'').trim()||null,d.artist_profile_id]);
+  const next=decision==='VERIFIED'?'READY':'MAPPING_REQUIRED';
+  await pool.query(`update distribution_deliveries set mapping_status=$1,status=$2,error_code=case when $2='MAPPING_REQUIRED' then 'ARTIST_MAPPING_REJECTED' else null end,error_message=case when $2='MAPPING_REQUIRED' then $3 else null end,updated_at=now() where id=$4`,[decision,next,String(reason||'Mapping rejeitado'),d.id]);
+  await distHistory(d.order_id,d.id,'MAPPING_REQUIRED',next,decision==='VERIFIED'?`Artist Mapping confirmado para ${d.name}`:`Artist Mapping rejeitado para ${d.name}`,req.user!.id);
+  await audit(req.user!.id,'ARTIST_MAPPING_DECISION','DISTRIBUTION_DELIVERY',d.id,{decision,reason:reason||null,platform:d.code});
+  res.json({ok:true,status:next});
+});
+
 app.get('/api/distribution/platforms',async(_q,res)=>res.json({platforms:(await pool.query(`select id,code,name,active,requires_isrc,requires_upc,status from distribution_platforms where active=true order by name`)).rows}));
-app.post('/api/distribution/orders',auth,artistOnly,async(req:AuthedRequest,res)=>{const {releaseId,productCode,platformIds=[]}=req.body||{};if(!releaseId||!DIST_PRODUCTS.includes(productCode)||!Array.isArray(platformIds)||!platformIds.length)return res.status(400).json({error:'releaseId, pacote e plataformas são obrigatórios'});const a=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];if(!a)return res.status(404).json({error:'Perfil de artista não encontrado'});const r=(await pool.query(`select r.*,a.id artist_id from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`,[releaseId,req.user!.id])).rows[0];if(!r)return res.status(404).json({error:'Lançamento não encontrado'});if(r.status!=='APPROVED'||r.preflight_status!=='PASSED')return res.status(400).json({error:'O lançamento precisa estar aprovado e com preflight aprovado.'});const prod=(await pool.query(`select code,amount,currency from payment_products where code=$1 and service_type='DISTRIBUTION' and active=true`,[productCode])).rows[0];if(!prod)return res.status(400).json({error:'Pacote inválido'});const ps=(await pool.query(`select * from distribution_platforms where id=any($1::uuid[]) and active=true`,[platformIds])).rows;if(ps.length!==platformIds.length)return res.status(400).json({error:'Plataforma inválida'});const tracks=(await pool.query(`select isrc,isrc_status from tracks where primary_release_id=$1`,[r.id])).rows;if(!tracks.length)return res.status(400).json({error:'O lançamento precisa ter faixas'});if(ps.some((x:any)=>x.requires_isrc)&&tracks.some((x:any)=>!x.isrc&&x.isrc_status!=='ASSIGNED'))return res.status(400).json({error:'As plataformas selecionadas exigem ISRC.'});const c=await pool.connect();try{await c.query('begin');const o=(await c.query(`insert into distribution_orders(release_id,artist_id,product_code,amount,currency) values($1,$2,$3,$4,$5) returning *`,[r.id,a.id,prod.code,prod.amount,prod.currency])).rows[0];for(const x of ps){const d=(await c.query(`insert into distribution_deliveries(order_id,platform_id) values($1,$2) returning id`,[o.id,x.id])).rows[0];await c.query(`insert into distribution_history(order_id,delivery_id,new_status,message,actor_user_id) values($1,$2,'READY','Entrega criada para a plataforma',$3)`,[o.id,d.id,req.user!.id])}await c.query('commit');await audit(req.user!.id,'DISTRIBUTION_ORDER_CREATED','DISTRIBUTION_ORDER',o.id,{releaseId,productCode});res.status(201).json({order:o,platforms:ps})}catch(e){await c.query('rollback');res.status(500).json({error:'Não foi possível criar a distribuição'})}finally{c.release()}});
+app.post('/api/distribution/orders',auth,artistOnly,async(req:AuthedRequest,res)=>{const {releaseId,productCode,platformIds=[]}=req.body||{};if(!releaseId||!DIST_PRODUCTS.includes(productCode)||!Array.isArray(platformIds)||!platformIds.length)return res.status(400).json({error:'releaseId, pacote e plataformas são obrigatórios'});const a=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];if(!a)return res.status(404).json({error:'Perfil de artista não encontrado'});const r=(await pool.query(`select r.*,a.id artist_id from releases r join artists a on a.id=r.primary_artist_id where r.id=$1 and a.user_id=$2`,[releaseId,req.user!.id])).rows[0];if(!r)return res.status(404).json({error:'Lançamento não encontrado'});if(r.status!=='APPROVED'||r.preflight_status!=='PASSED')return res.status(400).json({error:'O lançamento precisa estar aprovado e com preflight aprovado.'});const prod=(await pool.query(`select code,amount,currency from payment_products where code=$1 and service_type='DISTRIBUTION' and active=true`,[productCode])).rows[0];if(!prod)return res.status(400).json({error:'Pacote inválido'});const ps=(await pool.query(`select * from distribution_platforms where id=any($1::uuid[]) and active=true`,[platformIds])).rows;if(ps.length!==platformIds.length)return res.status(400).json({error:'Plataforma inválida'});const tracks=(await pool.query(`select isrc,isrc_status from tracks where primary_release_id=$1`,[r.id])).rows;if(!tracks.length)return res.status(400).json({error:'O lançamento precisa ter faixas'});if(ps.some((x:any)=>x.requires_isrc)&&tracks.some((x:any)=>!x.isrc&&x.isrc_status!=='ASSIGNED'))return res.status(400).json({error:'As plataformas selecionadas exigem ISRC.'});const c=await pool.connect();try{await c.query('begin');const o=(await c.query(`insert into distribution_orders(release_id,artist_id,product_code,amount,currency) values($1,$2,$3,$4,$5) returning *`,[r.id,a.id,prod.code,prod.amount,prod.currency])).rows[0];let mappingRequired=false;for(const x of ps){const profile=(await c.query(`select * from artist_platform_profiles where artist_id=$1 and platform_id=$2 limit 1`,[a.id,x.id])).rows[0]||null;const mappingStatus=profile?.profile_mode==='EXISTING'?(profile.mapping_status||'PENDING'):'NOT_REQUIRED';const deliveryStatus=profile?.profile_mode==='EXISTING'&&mappingStatus!=='VERIFIED'?'MAPPING_REQUIRED':'READY';if(deliveryStatus==='MAPPING_REQUIRED') mappingRequired=true;const d=(await c.query(`insert into distribution_deliveries(order_id,platform_id,artist_profile_id,mapping_status,external_artist_id,artist_profile_url,status) values($1,$2,$3,$4,$5,$6,$7) returning id`,[o.id,x.id,profile?.id||null,mappingStatus,profile?.external_artist_id||null,profile?.profile_url||null,deliveryStatus])).rows[0];await c.query(`insert into distribution_history(order_id,delivery_id,new_status,message,actor_user_id) values($1,$2,$3,$4,$5)`,[o.id,d.id,deliveryStatus,deliveryStatus==='MAPPING_REQUIRED'?`Artist Mapping pendente para ${x.name}`:`Entrega criada para ${x.name}`,req.user!.id])}if(mappingRequired) await c.query(`update distribution_orders set status='MAPPING_REQUIRED',updated_at=now() where id=$1`,[o.id])await c.query('commit');await audit(req.user!.id,'DISTRIBUTION_ORDER_CREATED','DISTRIBUTION_ORDER',o.id,{releaseId,productCode});res.status(201).json({order:o,platforms:ps})}catch(e){await c.query('rollback');res.status(500).json({error:'Não foi possível criar a distribuição'})}finally{c.release()}});
 app.get('/api/distribution/orders',auth,artistOnly,async(req:AuthedRequest,res)=>{const a=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];if(!a)return res.status(404).json({error:'Perfil não encontrado'});res.json({orders:(await pool.query(`select o.*,r.title release_title,r.type release_type,(select count(*) from distribution_deliveries d where d.order_id=o.id)::int platform_count,(select count(*) from distribution_deliveries d where d.order_id=o.id and d.status='PUBLISHED')::int published_count from distribution_orders o join releases r on r.id=o.release_id where o.artist_id=$1 order by o.created_at desc`,[a.id])).rows})});
 app.get('/api/distribution/orders/:id',auth,artistOnly,async(req:AuthedRequest,res)=>{const o=(await pool.query(`select o.*,r.title release_title,r.type release_type,r.upc,r.ean,r.release_date,a.stage_name from distribution_orders o join releases r on r.id=o.release_id join artists a on a.id=o.artist_id where o.id=$1 and a.user_id=$2`,[req.params.id,req.user!.id])).rows[0];if(!o)return res.status(404).json({error:'Pedido não encontrado'});res.json({order:o,deliveries:(await pool.query(`select d.*,p.code,p.name,p.status platform_status from distribution_deliveries d join distribution_platforms p on p.id=d.platform_id where d.order_id=$1 order by p.name`,[o.id])).rows,history:(await pool.query(`select h.*,u.email actor_email from distribution_history h left join users u on u.id=h.actor_user_id where h.order_id=$1 order by h.created_at desc`,[o.id])).rows})});
-app.post('/api/distribution/orders/:id/submit',auth,artistOnly,async(req:AuthedRequest,res)=>{const o=(await pool.query(`select o.* from distribution_orders o join artists a on a.id=o.artist_id where o.id=$1 and a.user_id=$2`,[req.params.id,req.user!.id])).rows[0];if(!o)return res.status(404).json({error:'Pedido não encontrado'});if(!['READY','FAILED'].includes(o.status))return res.status(400).json({error:'Estado atual não permite submissão'});const ds=(await pool.query(`select d.*,p.name from distribution_deliveries d join distribution_platforms p on p.id=d.platform_id where d.order_id=$1`,[o.id])).rows;await pool.query(`update distribution_orders set status='SUBMITTED',submitted_at=now(),error=null,updated_at=now() where id=$1`,[o.id]);for(const d of ds){await pool.query(`update distribution_deliveries set status='SUBMITTED',submitted_at=now(),error_code=null,error_message=null,updated_at=now() where id=$1`,[d.id]);await distHistory(o.id,d.id,d.status,'SUBMITTED',`Entrega enviada para ${d.name}`,req.user!.id)}await audit(req.user!.id,'DISTRIBUTION_ORDER_SUBMITTED','DISTRIBUTION_ORDER',o.id);res.json({ok:true,status:'SUBMITTED',message:'Submetido. A publicação só avança quando o conector oficial da plataforma estiver configurado.'})});
+app.post('/api/distribution/orders/:id/submit',auth,artistOnly,async(req:AuthedRequest,res)=>{const o=(await pool.query(`select o.* from distribution_orders o join artists a on a.id=o.artist_id where o.id=$1 and a.user_id=$2`,[req.params.id,req.user!.id])).rows[0];if(!o)return res.status(404).json({error:'Pedido não encontrado'});if(!['READY','FAILED'].includes(o.status))return res.status(400).json({error:o.status==='MAPPING_REQUIRED'?'Existem plataformas sem Artist Mapping confirmado.':'Estado atual não permite submissão'});const ds=(await pool.query(`select d.*,p.name from distribution_deliveries d join distribution_platforms p on p.id=d.platform_id where d.order_id=$1 and d.status in ('READY','FAILED')`,[o.id])).rows;if(!ds.length)return res.status(400).json({error:'Nenhuma entrega está pronta para submissão.'});await pool.query(`update distribution_orders set status='SUBMITTED',submitted_at=now(),error=null,updated_at=now() where id=$1`,[o.id]);for(const d of ds){await pool.query(`update distribution_deliveries set status='SUBMITTED',submitted_at=now(),error_code=null,error_message=null,updated_at=now() where id=$1`,[d.id]);await distHistory(o.id,d.id,d.status,'SUBMITTED',`Entrega enviada para ${d.name}`,req.user!.id);await createDistributionJob(d.id)}const configured=ds.filter((d:any)=>Boolean(connectorEnv(d.code,'URL')));const results=[];for(const d of configured){const j=(await pool.query(`select id from distribution_jobs where delivery_id=$1 order by created_at desc limit 1`,[d.id])).rows[0];if(j)results.push(await dispatchDistributionJob(j.id,req.user!.id));}const failed=results.filter((x:any)=>x.status==='FAILED').length;await audit(req.user!.id,'DISTRIBUTION_ORDER_SUBMITTED','DISTRIBUTION_ORDER',o.id,{configuredConnectors:configured.length,failed});res.json({ok:true,status:failed?'FAILED':configured.length?'PROCESSING':'SUBMITTED',message:configured.length?'Entregas enviadas aos conectores configurados.':'Pedidos colocados na fila. Configure os conectores oficiais para envio automático.',connectorResults:results})});
 app.post('/api/distribution/orders/:id/retry/:platformId',auth,artistOnly,async(req:AuthedRequest,res)=>{const d=(await pool.query(`select d.*,o.id order_id,p.name,a.user_id from distribution_deliveries d join distribution_platforms p on p.id=d.platform_id join distribution_orders o on o.id=d.order_id join artists a on a.id=o.artist_id where d.id=$1 and p.id=$2 and a.user_id=$3`,[req.params.id,req.params.platformId,req.user!.id])).rows[0];if(!d)return res.status(404).json({error:'Entrega não encontrada'});if(d.status!=='FAILED')return res.status(400).json({error:'A entrega não está em falha'});await pool.query(`update distribution_deliveries set status='READY',error_code=null,error_message=null,updated_at=now() where id=$1`,[d.id]);await distHistory(d.order_id,d.id,'FAILED','READY',`Reenvio solicitado para ${d.name}`,req.user!.id);res.json({ok:true,status:'READY'})});
 app.post('/api/distribution/catalog-migrations',auth,artistOnly,async(req:AuthedRequest,res)=>{const {releaseId,previousDistributor,oldIsrc,oldUpc,originalReleaseDate,platformLinks={},oldStatus}=req.body||{};if(!releaseId||!previousDistributor)return res.status(400).json({error:'releaseId e distribuidor anterior são obrigatórios'});const a=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];const r=(await pool.query('select id from releases where id=$1 and primary_artist_id=$2',[releaseId,a?.id])).rows[0];if(!r)return res.status(404).json({error:'Lançamento não encontrado'});const q=await pool.query(`insert into catalog_migrations(release_id,artist_id,previous_distributor,old_isrc,old_upc,original_release_date,platform_links,old_status) values($1,$2,$3,$4,$5,$6,$7,$8) returning *`,[releaseId,a.id,previousDistributor,oldIsrc||null,oldUpc||null,originalReleaseDate||null,JSON.stringify(platformLinks),oldStatus||null]);await audit(req.user!.id,'CATALOG_MIGRATION_CREATED','CATALOG_MIGRATION',q.rows[0].id,{preserveIdentity:true});res.status(201).json({migration:q.rows[0]})});
 app.get('/api/distribution/catalog-migrations',auth,artistOnly,async(req:AuthedRequest,res)=>{const a=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];res.json({migrations:(await pool.query(`select cm.*,r.title release_title from catalog_migrations cm join releases r on r.id=cm.release_id where cm.artist_id=$1 order by cm.created_at desc`,[a?.id])).rows})});
+app.get('/api/owner/distribution/connectors',auth,ownerOnly,async(_q,res)=>{
+  const rows=(await pool.query(`select pc.*,p.code platform_code,p.name platform_name from distribution_platform_connectors pc join distribution_platforms p on p.id=pc.platform_id order by p.name`)).rows;
+  res.json({connectors:rows.map((x:any)=>({...x,auth_env_key:x.auth_env_key||null,configured:Boolean(x.auth_env_key&&process.env[x.auth_env_key])}))});
+});
+app.post('/api/owner/distribution/connectors',auth,ownerOnly,async(req:AuthedRequest,res)=>{
+  const {platformId,partnerName,endpointUrl,protocol='DDEX',authEnvKey,callbackUrl='',active=true}=req.body||{};
+  if(!platformId||!partnerName||!endpointUrl||!authEnvKey)return res.status(400).json({error:'platformId, parceiro, endpointUrl e authEnvKey são obrigatórios'});
+  const p=(await pool.query('select id,code,name from distribution_platforms where id=$1',[platformId])).rows[0];if(!p)return res.status(404).json({error:'Plataforma não encontrada'});
+  const q=await pool.query(`insert into distribution_platform_connectors(platform_id,partner_name,endpoint_url,protocol,auth_env_key,callback_url,active) values($1,$2,$3,$4,$5,$6,$7) on conflict(platform_id) do update set partner_name=excluded.partner_name,endpoint_url=excluded.endpoint_url,protocol=excluded.protocol,auth_env_key=excluded.auth_env_key,callback_url=excluded.callback_url,active=excluded.active,updated_at=now() returning *`,[platformId,partnerName,endpointUrl,String(protocol).toUpperCase(),authEnvKey,callbackUrl||null,Boolean(active)]);
+  await audit(req.user!.id,'DISTRIBUTION_CONNECTOR_CONFIGURED','DISTRIBUTION_CONNECTOR',q.rows[0].id,{platform:p.code,partnerName,protocol:String(protocol).toUpperCase(),authEnvKey});res.status(201).json({connector:q.rows[0]});
+});
+app.post('/api/owner/distribution/connectors/:id/status',auth,ownerOnly,async(req:AuthedRequest,res)=>{const {active}=req.body||{};const q=await pool.query('update distribution_platform_connectors set active=$1,updated_at=now() where id=$2 returning *',[Boolean(active),req.params.id]);if(!q.rows[0])return res.status(404).json({error:'Conector não encontrado'});await audit(req.user!.id,'DISTRIBUTION_CONNECTOR_STATUS','DISTRIBUTION_CONNECTOR',req.params.id,{active:Boolean(active)});res.json({connector:q.rows[0]})});
+app.post('/api/owner/distribution/connectors/:id/test',auth,ownerOnly,async(req:AuthedRequest,res)=>{try{const x=(await pool.query(`select pc.*,p.code platform_code,p.name platform_name from distribution_platform_connectors pc join distribution_platforms p on p.id=pc.platform_id where pc.id=$1`,[req.params.id])).rows[0];if(!x)return res.status(404).json({error:'Conector não encontrado'});const token=x.auth_env_key?String(process.env[x.auth_env_key]||''):'';if(!token)return res.status(400).json({error:`A variável ${x.auth_env_key} não está configurada no servidor.`});const r=await fetch(x.endpoint_url,{method:'HEAD',headers:{Authorization:`Bearer ${token}`}});res.json({ok:r.ok,status:r.status,message:r.ok?'Endpoint respondeu corretamente.':'Endpoint respondeu, mas não confirmou OK.'});}catch(e:any){res.status(502).json({error:e?.message||'Falha ao testar endpoint'});}});
+app.get('/api/admin/distribution/jobs',auth,requireAdminPermission('RELEASES'),async(_q,res)=>{
+  const jobs=(await pool.query(`select j.*,p.code platform_code,p.name platform_name,r.title release_title,a.stage_name,d.status delivery_status from distribution_jobs j join distribution_platforms p on p.id=j.platform_id join distribution_deliveries d on d.id=j.delivery_id join distribution_orders o on o.id=j.order_id join releases r on r.id=o.release_id join artists a on a.id=o.artist_id order by j.created_at desc limit 200`)).rows;
+  res.json({jobs,connectors:jobs.map((j:any)=>j.platform_code).filter((v:string,i:number,a:string[])=>a.indexOf(v)===i).map((code:string)=>({code,configured:Boolean(connectorEnv(code,'URL'))}))});
+});
+app.post('/api/admin/distribution/deliveries/:id/dispatch',auth,requireAdminPermission('RELEASES'),async(req:AuthedRequest,res)=>{
+  try{const d=(await pool.query(`select id,status from distribution_deliveries where id=$1`,[req.params.id])).rows[0];if(!d)return res.status(404).json({error:'Entrega não encontrada'});if(!['READY','SUBMITTED','FAILED'].includes(d.status))return res.status(400).json({error:'A entrega não está pronta para envio/reenvio.'});const j=await createDistributionJob(d.id,d.status==='FAILED'?'RETRY':'DELIVER_RELEASE');const result=await dispatchDistributionJob(j.id,req.user!.id);res.status(result.ok?200:202).json({job:j,...result});}catch(e:any){res.status(400).json({error:e.message||'Não foi possível enviar a entrega.'});}
+});
+app.post('/api/admin/distribution/jobs/:id/retry',auth,requireAdminPermission('RELEASES'),async(req:AuthedRequest,res)=>{const j=(await pool.query(`select id,delivery_id,status from distribution_jobs where id=$1`,[req.params.id])).rows[0];if(!j)return res.status(404).json({error:'Job não encontrado'});if(j.status!=='FAILED')return res.status(400).json({error:'Só é possível repetir jobs em falha.'});const nj=await createDistributionJob(j.delivery_id,'RETRY');const result=await dispatchDistributionJob(nj.id,req.user!.id);res.status(result.ok?200:202).json({job:nj,...result});});
+app.get('/api/admin/distribution/deliveries/:id/ddex',auth,requireAdminPermission('RELEASES'),async(req:AuthedRequest,res)=>{
+  try{const d=(await pool.query(`select d.id,o.release_id from distribution_deliveries d join distribution_orders o on o.id=d.order_id where d.id=$1`,[req.params.id])).rows[0];if(!d)return res.status(404).json({error:'Entrega não encontrada'});const pkg=await createDDEXPackage(d.release_id,d.id);res.type('application/xml').send(pkg.xml);}catch(e:any){res.status(400).json({error:e.message||'Não foi possível gerar DDEX'});}
+});
+app.get('/api/admin/distribution/deliveries/:id/ddex-package',auth,requireAdminPermission('RELEASES'),async(req:AuthedRequest,res)=>{const p=(await pool.query(`select dp.*,d.order_id,p.code platform_code from ddex_packages dp join distribution_deliveries d on d.id=dp.delivery_id join distribution_platforms p on p.id=d.platform_id where dp.delivery_id=$1 order by dp.created_at desc limit 1`,[req.params.id])).rows[0];if(!p)return res.status(404).json({error:'Pacote DDEX ainda não gerado'});res.json({package:p,downloadUrl:`/api/admin/distribution/deliveries/${req.params.id}/ddex`});});
+app.post('/api/connectors/distribution/callback',async(req,res)=>{const expected=String(process.env.DIST_CONNECTOR_CALLBACK_TOKEN||'');if(expected){const auth=String(req.headers.authorization||'');if(auth!==`Bearer ${expected}`)return res.status(401).json({error:'Callback não autorizado'});}const {jobId,status,externalReleaseId,externalUrl,errorCode,errorMessage}=req.body||{};if(!jobId||!['DELIVERED','PUBLISHED','FAILED'].includes(status))return res.status(400).json({error:'Callback inválido'});const j=(await pool.query(`select id,delivery_id,order_id,platform_id from distribution_jobs where id=$1`,[jobId])).rows[0];if(!j)return res.status(404).json({error:'Job não encontrado'});await pool.query(`update distribution_jobs set status=$1,last_error=$2,finished_at=now(),updated_at=now() where id=$3`,[status==='FAILED'?'FAILED':'SUCCEEDED',errorMessage||null,j.id]);await pool.query(`update distribution_deliveries set status=$1,external_release_id=coalesce($2,external_release_id),external_url=coalesce($3,external_url),error_code=$4,error_message=$5,delivered_at=case when $1 in ('DELIVERED','PUBLISHED') then coalesce(delivered_at,now()) else delivered_at end,published_at=case when $1='PUBLISHED' then now() else published_at end,updated_at=now() where id=$6`,[status,externalReleaseId||null,externalUrl||null,errorCode||null,errorMessage||null,j.delivery_id]);await pool.query(`insert into distribution_connector_logs(job_id,platform_id,direction,http_status,response_body,error_message) values($1,$2,'INBOUND',200,$3,$4)`,[j.id,j.platform_id,JSON.stringify(req.body).slice(0,12000),errorMessage||null]);await distHistory(j.order_id,j.delivery_id,null,status,`Callback do conector: ${status}`,undefined);const oc=(await pool.query(`select count(*)::int total,count(*) filter(where status='PUBLISHED')::int published,count(*) filter(where status='FAILED')::int failed from distribution_deliveries where order_id=$1`,[j.order_id])).rows[0];const orderStatus=Number(oc.published)===Number(oc.total)?'PUBLISHED':Number(oc.failed)+Number(oc.published)===Number(oc.total)&&Number(oc.failed)>0?'FAILED':'PROCESSING';await pool.query(`update distribution_orders set status=$1,error=$2,completed_at=case when $1 in ('PUBLISHED','FAILED') then coalesce(completed_at,now()) else completed_at end,updated_at=now() where id=$3`,[orderStatus,errorMessage||null,j.order_id]);res.json({ok:true,status,orderStatus});});
+
 app.get('/api/admin/distribution/orders',auth,requireAdminPermission('RELEASES'),async(_q,res)=>res.json({orders:(await pool.query(`select o.*,r.title release_title,a.stage_name from distribution_orders o join releases r on r.id=o.release_id join artists a on a.id=o.artist_id order by o.created_at desc`)).rows}));
 app.post('/api/admin/distribution/deliveries/:id/status',auth,requireAdminPermission('RELEASES'),async(req:AuthedRequest,res)=>{const {status,externalReleaseId,externalUrl,errorCode,errorMessage}=req.body||{};if(!DIST_STATUSES.includes(status))return res.status(400).json({error:'Estado inválido'});const d=(await pool.query(`select d.*,o.id order_id,p.name platform_name from distribution_deliveries d join distribution_orders o on o.id=d.order_id join distribution_platforms p on p.id=d.platform_id where d.id=$1`,[req.params.id])).rows[0];if(!d)return res.status(404).json({error:'Entrega não encontrada'});await pool.query(`update distribution_deliveries set status=$1,external_release_id=coalesce($2,external_release_id),external_url=coalesce($3,external_url),error_code=$4,error_message=$5,delivered_at=case when $1='DELIVERED' then now() else delivered_at end,published_at=case when $1='PUBLISHED' then now() else published_at end,updated_at=now() where id=$6`,[status,externalReleaseId||null,externalUrl||null,errorCode||null,errorMessage||null,d.id]);const c=(await pool.query(`select count(*)::int total,count(*) filter(where status='PUBLISHED')::int published,count(*) filter(where status='FAILED')::int failed from distribution_deliveries where order_id=$1`,[d.order_id])).rows[0];const os=Number(c.published)===Number(c.total)?'PUBLISHED':Number(c.failed)+Number(c.published)===Number(c.total)&&Number(c.failed)>0?'FAILED':'PROCESSING';await pool.query(`update distribution_orders set status=$1,error=$2,completed_at=case when $1 in ('PUBLISHED','FAILED') then now() else completed_at end,updated_at=now() where id=$3`,[os,errorMessage||null,d.order_id]);await distHistory(d.order_id,d.id,d.status,status,`Estado ${d.platform_name}: ${status}`,req.user!.id);await audit(req.user!.id,'DISTRIBUTION_DELIVERY_STATUS','DISTRIBUTION_DELIVERY',d.id,{status});res.json({ok:true,status,orderStatus:os})});
 
