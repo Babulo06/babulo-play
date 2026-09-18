@@ -6,3 +6,9 @@
 - A BaBuLo não cria perfis sociais de TikTok, Instagram, Facebook ou YouTube.
 - Distribuição não usa um perfil externo não verificado: destinos musicais não sociais ficam em MAPPING_REQUIRED até existir associação VERIFIED.
 - Mantido Cloudflare R2 e restante arquitetura de distribuição.
+
+
+## Correção adicional — ArtistProfileHub
+- Corrigida a função de associação automática de perfis para permanecer dentro do `ArtistProfileHub`.
+- Removida referência indevida a `setAssociating` no `AdminPersonalWorkspace`.
+- Corrigido o fluxo de associação automática usado pelo perfil central do artista.

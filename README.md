@@ -117,3 +117,7 @@ Owner can configure an authorized distribution partner per platform. Endpoint UR
 
 ## V10.4.22 — Cloudflare R2
 The API supports Cloudflare R2 as the permanent media store. Configure `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and `R2_BUCKET` in the Render API service. Keep the R2 bucket private; BaBuLo serves media through `/media/:key`. The R2 token should be limited to Object Read & Write for the `babulo-play-media` bucket.
+
+
+## V10.4.26 — Perfil central e associação de plataformas
+O cadastro ARTIST cria o perfil central BaBuLo. Perfis externos são associados a esse perfil e só associações verificadas são usadas para entrega a DSPs musicais.
