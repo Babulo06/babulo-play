@@ -100,7 +100,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql', '024_rights_splits_payouts.sql', '025_rights_matching_scan.sql', '026_existing_artist_email_verification.sql', '027_admin_payroll_attendance.sql', '028_admin_attendance_workflow.sql', '029_admin_attendance_notifications.sql', '030_admin_advertising_workflow.sql', '031_account_management_approvals.sql', '032_admin_internal_email_verification.sql', '033_artist_mapping_distribution.sql', '034_distribution_engine_jobs.sql', '035_ddex_delivery.sql', '036_distribution_partner_connectors.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql', '024_rights_splits_payouts.sql', '025_rights_matching_scan.sql', '026_existing_artist_email_verification.sql', '027_admin_payroll_attendance.sql', '028_admin_attendance_workflow.sql', '029_admin_attendance_notifications.sql', '030_admin_advertising_workflow.sql', '031_account_management_approvals.sql', '032_admin_internal_email_verification.sql', '033_artist_mapping_distribution.sql', '034_distribution_engine_jobs.sql', '035_ddex_delivery.sql', '036_distribution_partner_connectors.sql','037_artist_profile_sync.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -498,6 +498,27 @@ app.put('/api/tracks/:trackId', auth, artistOnly, async (req:AuthedRequest,res) 
   res.json({track:q.rows[0]});
 });
 
+app.get('/api/artists/me/profile',auth,artistOnly,async(req:AuthedRequest,res)=>{
+  const artist=(await pool.query(`select id,stage_name,legal_name,bio,country,city,photo_url,verification_status from artists where user_id=$1 limit 1`,[req.user!.id])).rows[0];
+  if(!artist) return res.status(404).json({error:'Perfil de artista não encontrado'});
+  const profiles=(await pool.query(`select app.*,p.code,p.name from artist_platform_profiles app join distribution_platforms p on p.id=app.platform_id where app.artist_id=$1 order by p.name`,[artist.id])).rows;
+  res.json({artist,profiles});
+});
+app.put('/api/artists/me/profile',auth,artistOnly,async(req:AuthedRequest,res)=>{
+  const {stageName,legalName,bio,country,city,photoUrl}=req.body||{};
+  if(!String(stageName||'').trim()) return res.status(400).json({error:'O nome artístico é obrigatório.'});
+  const q=await pool.query(`update artists set stage_name=$1,legal_name=$2,bio=$3,country=$4,city=$5,photo_url=$6 where user_id=$7 returning id,stage_name,legal_name,bio,country,city,photo_url,verification_status`,[String(stageName).trim().slice(0,200),String(legalName||'').trim().slice(0,200)||null,String(bio||'').trim().slice(0,10000)||null,String(country||'').trim().slice(0,100)||null,String(city||'').trim().slice(0,100)||null,String(photoUrl||'').trim().slice(0,1000)||null,req.user!.id]);
+  if(!q.rows[0]) return res.status(404).json({error:'Perfil de artista não encontrado'});
+  const sync=await queueArtistProfileSync(q.rows[0].id,req.user!.id);
+  const profiles=(await pool.query(`select app.*,p.code,p.name from artist_platform_profiles app join distribution_platforms p on p.id=app.platform_id where app.artist_id=$1 order by p.name`,[q.rows[0].id])).rows;
+  res.json({artist:q.rows[0],profiles,syncQueued:sync.queued});
+});
+app.post('/api/artists/me/profile/verification-request',auth,artistOnly,async(req:AuthedRequest,res)=>{
+  const q=await pool.query(`update artists set verification_status=case when verification_status='VERIFIED' then 'VERIFIED' else 'PENDING_REVIEW' end where user_id=$1 returning id,stage_name,verification_status`,[req.user!.id]);
+  if(!q.rows[0]) return res.status(404).json({error:'Perfil de artista não encontrado'});
+  await queueArtistProfileSync(q.rows[0].id,req.user!.id);
+  res.json({artist:q.rows[0],message:q.rows[0].verification_status==='VERIFIED'?'A conta já está verificada.':'Pedido de verificação enviado para análise.'});
+});
 app.put('/api/artists/me', auth, artistOnly, async (req:AuthedRequest,res) => {
   const {stageName,legalName,bio,country,city,photoUrl}=req.body||{};
   const q=await pool.query(`update artists set stage_name=coalesce($1,stage_name),legal_name=$2,bio=$3,country=$4,city=$5,photo_url=$6 where user_id=$7 returning id,stage_name,legal_name,bio,country,city,photo_url,verification_status`,[stageName,legalName||null,bio||null,country||null,city||null,photoUrl||null,req.user!.id]);
@@ -1891,6 +1912,51 @@ app.get('/api/artists/me/spotify/artist/:artistId',auth,artistOnly,async(req:Aut
     res.json({artist:{id:a.id,name:a.name,url:a.external_urls?.spotify||'',image:a.images?.[0]?.url||'',followers:a.followers?.total||0,genres:a.genres||[]}});
   }catch(e:any){console.error('Spotify artist:',e);res.status(502).json({error:e?.message||'Não foi possível validar o artista no Spotify.'});}
 });
+// ===== V10.4.23 Artist Profile Hub + automatic profile sync =====
+async function queueArtistProfileSync(artistId:string,actorUserId?:string){
+  const artist=(await pool.query(`select id,stage_name,legal_name,bio,country,city,photo_url,verification_status from artists where id=$1`,[artistId])).rows[0];
+  if(!artist) return {queued:0};
+  const profiles=(await pool.query(`select app.id,app.platform_id,app.profile_mode,app.mapping_status,app.external_artist_id,app.profile_url,p.code platform_code,p.name platform_name from artist_platform_profiles app join distribution_platforms p on p.id=app.platform_id where app.artist_id=$1`,[artistId])).rows;
+  let queued=0;
+  const payload={operation:'UPDATE_ARTIST_PROFILE',artist:{id:artist.id,stageName:artist.stage_name,legalName:artist.legal_name,bio:artist.bio,country:artist.country,city:artist.city,photoUrl:artist.photo_url,verificationStatus:artist.verification_status},updatedAt:new Date().toISOString()};
+  for(const profile of profiles){
+    if(profile.profile_mode!=='EXISTING' && profile.mapping_status!=='VERIFIED') continue;
+    const key=`${profile.id}:${new Date().toISOString().slice(0,10)}:${crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex').slice(0,24)}`;
+    await pool.query(`insert into artist_profile_sync_jobs(artist_id,artist_platform_profile_id,platform_id,status,idempotency_key,payload,last_error,created_at,updated_at) values($1,$2,$3,'QUEUED',$4,$5::jsonb,null,now(),now()) on conflict(idempotency_key) do update set payload=excluded.payload,status='QUEUED',last_error=null,updated_at=now()`,[artistId,profile.id,profile.platform_id,key,JSON.stringify(payload)]);
+    queued++;
+    if(actorUserId) await audit(actorUserId,'ARTIST_PROFILE_SYNC_QUEUED','ARTIST_PLATFORM_PROFILE',profile.id,{platform:profile.platform_code});
+    // If the partner exposes a JSON connector, attempt the update immediately. DDEX partners remain queued until their profile-update contract is configured.
+    try{
+      const connector=await resolveDistributionConnector(profile.platform_id,profile.platform_code);
+      if(connector.url && connector.protocol==='JSON'){
+        const jr=(await pool.query(`select id from artist_profile_sync_jobs where artist_platform_profile_id=$1 and status='QUEUED' order by created_at desc limit 1`,[profile.id])).rows[0];
+        if(jr) await dispatchArtistProfileSyncJob(String(jr.id),actorUserId);
+      }
+    }catch(e){ console.error('Artist profile sync:',e); }
+  }
+  return {queued};
+}
+async function dispatchArtistProfileSyncJob(jobId:string,actorUserId?:string){
+  const job=(await pool.query(`select j.*,p.code platform_code,p.name platform_name,pc.endpoint_url,pc.protocol,pc.auth_env_key,pc.active from artist_profile_sync_jobs j join distribution_platforms p on p.id=j.platform_id left join distribution_platform_connectors pc on pc.platform_id=j.platform_id and pc.active=true where j.id=$1`,[jobId])).rows[0];
+  if(!job) throw new Error('Job de sincronização não encontrado.');
+  if(job.status==='SYNCED') return {ok:true,status:'SYNCED'};
+  const protocol=String(job.protocol||'').toUpperCase(); const url=String(job.endpoint_url||''); const token=job.auth_env_key?String(process.env[job.auth_env_key]||''):'';
+  if(!url || protocol!=='JSON') { await pool.query(`update artist_profile_sync_jobs set status='QUEUED',last_error=$1,updated_at=now() where id=$2`,['Aguardando conector JSON de atualização de perfil.',jobId]); return {ok:false,status:'QUEUED'}; }
+  const requestId=crypto.randomUUID();
+  await pool.query(`update artist_profile_sync_jobs set status='SYNCING',attempt_count=coalesce(attempt_count,0)+1,request_id=$1,started_at=now(),updated_at=now() where id=$2`,[requestId,jobId]);
+  try{
+    const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-BaBuLo-Request-Id':requestId,'X-BaBuLo-Operation':'UPDATE_ARTIST_PROFILE',...(token?{Authorization:'Bearer '+token}:{})},body:JSON.stringify(job.payload)});
+    const body=(await response.text()).slice(0,12000);
+    if(!response.ok) throw new Error(body||`HTTP ${response.status}`);
+    await pool.query(`update artist_profile_sync_jobs set status='SYNCED',last_http_status=$1,last_error=null,finished_at=now(),updated_at=now() where id=$2`,[response.status,jobId]);
+    if(actorUserId) await audit(actorUserId,'ARTIST_PROFILE_SYNCED','ARTIST_PLATFORM_PROFILE',job.artist_platform_profile_id,{platform:job.platform_code,httpStatus:response.status});
+    return {ok:true,status:'SYNCED'};
+  }catch(e:any){
+    await pool.query(`update artist_profile_sync_jobs set status='FAILED',last_error=$1,finished_at=now(),updated_at=now() where id=$2`,[e?.message||'Falha de sincronização',jobId]);
+    return {ok:false,status:'FAILED',message:e?.message||'Falha de sincronização'};
+  }
+}
+
 // ===== V10.4.17 Artist Mapping =====
 app.get('/api/artists/me/platform-profiles',auth,artistOnly,async(req:AuthedRequest,res)=>{
   const artist=(await pool.query('select id,stage_name from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];
