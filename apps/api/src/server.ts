@@ -1957,11 +1957,14 @@ async function dispatchArtistProfileSyncJob(jobId:string,actorUserId?:string){
   }
 }
 
+// ===== V10.4.24 — Social destinations do not create artist profiles =====
+const SOCIAL_CONTENT_DESTINATION_CODES=new Set(['TIKTOK','INSTAGRAM','FACEBOOK','YOUTUBE_SHORTS','YOUTUBE']);
+
 // ===== V10.4.17 Artist Mapping =====
 app.get('/api/artists/me/platform-profiles',auth,artistOnly,async(req:AuthedRequest,res)=>{
   const artist=(await pool.query('select id,stage_name from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];
   if(!artist) return res.status(404).json({error:'Perfil de artista não encontrado'});
-  const platforms=(await pool.query(`select id,code,name,active from distribution_platforms where active=true order by name`)).rows;
+  const platforms=(await pool.query(`select id,code,name,active from distribution_platforms where active=true order by name`)).rows.filter((p:any)=>!SOCIAL_CONTENT_DESTINATION_CODES.has(String(p.code||'').toUpperCase()));
   const profiles=(await pool.query(`select app.*,p.code,p.name from artist_platform_profiles app join distribution_platforms p on p.id=app.platform_id where app.artist_id=$1 order by p.name`,[artist.id])).rows;
   res.json({artist,platforms,profiles});
 });
@@ -1971,6 +1974,7 @@ app.put('/api/artists/me/platform-profiles/:platformId',auth,artistOnly,async(re
   const artist=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];
   const platform=(await pool.query('select id,code,name from distribution_platforms where id=$1 and active=true',[req.params.platformId])).rows[0];
   if(!artist||!platform) return res.status(404).json({error:'Artista ou plataforma não encontrada'});
+  if(SOCIAL_CONTENT_DESTINATION_CODES.has(String(platform.code||'').toUpperCase())) return res.status(400).json({error:'Esta plataforma social não utiliza perfil de artista criado pela BaBuLo. A música será tratada como destino de conteúdo/biblioteca.'});
   if(String(profileMode)==='EXISTING'&&!String(profileUrl||'').trim()&&!String(externalArtistId||'').trim()) return res.status(400).json({error:'Para um perfil existente, informe o link do perfil ou o ID oficial do artista.'});
   const status=String(profileMode)==='NEW'?'PENDING':'PENDING';
   const q=await pool.query(`insert into artist_platform_profiles(artist_id,platform_id,profile_mode,profile_url,external_artist_id,mapping_status,notes) values($1,$2,$3,$4,$5,$6,$7) on conflict(artist_id,platform_id) do update set profile_mode=excluded.profile_mode,profile_url=excluded.profile_url,external_artist_id=excluded.external_artist_id,mapping_status=excluded.mapping_status,verified_by=null,verified_at=null,notes=excluded.notes,updated_at=now() returning *`,[artist.id,platform.id,String(profileMode),String(profileUrl||'').trim()||null,String(externalArtistId||'').trim()||null,status,String(notes||'').trim()||null]);
