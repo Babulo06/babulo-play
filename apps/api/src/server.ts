@@ -1968,6 +1968,52 @@ app.get('/api/artists/me/platform-profiles',auth,artistOnly,async(req:AuthedRequ
   const profiles=(await pool.query(`select app.*,p.code,p.name from artist_platform_profiles app join distribution_platforms p on p.id=app.platform_id where app.artist_id=$1 order by p.name`,[artist.id])).rows;
   res.json({artist,platforms,profiles});
 });
+app.post('/api/artists/me/platform-profiles/auto-discover',auth,artistOnly,async(req:AuthedRequest,res)=>{
+  try{
+    const artist=(await pool.query('select id,stage_name from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];
+    if(!artist) return res.status(404).json({error:'Perfil de artista não encontrado'});
+    const platforms=(await pool.query(`select id,code,name,active from distribution_platforms where active=true order by name`)).rows.filter((p:any)=>!SOCIAL_CONTENT_DESTINATION_CODES.has(String(p.code||'').toUpperCase()));
+    let discovered=0,review=0;
+    const discoveryUrl=String(process.env.ARTIST_DISCOVERY_URL||'').trim();
+    if(discoveryUrl){
+      const token=String(process.env.ARTIST_DISCOVERY_TOKEN||'');
+      const rr=await fetch(discoveryUrl,{method:'POST',headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},body:JSON.stringify({artist:{id:artist.id,stageName:artist.stage_name},platforms:platforms.map((p:any)=>({code:p.code,name:p.name}))})});
+      if(rr.ok){
+        const d:any=await rr.json();
+        for(const x of Array.isArray(d.profiles)?d.profiles:[]){
+          const p=platforms.find((v:any)=>String(v.code).toUpperCase()===String(x.platformCode||x.code||'').toUpperCase());
+          if(!p) continue;
+          const externalArtistId=String(x.externalArtistId||x.id||'').trim();
+          const profileUrl=String(x.profileUrl||x.url||'').trim();
+          if(!externalArtistId&&!profileUrl) continue;
+          await pool.query(`insert into artist_platform_profiles(artist_id,platform_id,profile_mode,profile_url,external_artist_id,mapping_status,notes) values($1,$2,'EXISTING',$3,$4,'PENDING',$5) on conflict(artist_id,platform_id) do update set profile_mode='EXISTING',profile_url=excluded.profile_url,external_artist_id=excluded.external_artist_id,mapping_status='PENDING',updated_at=now()`,[artist.id,p.id,profileUrl||null,externalArtistId||null,'Identificado automaticamente; aguarda confirmação oficial.']);
+          discovered++;
+        }
+      } else review++;
+    }
+    const spotify=platforms.find((p:any)=>String(p.code).toUpperCase()==='SPOTIFY');
+    const st=await spotifyToken();
+    if(spotify&&st){
+      const q=String(artist.stage_name||'').trim();
+      if(q.length>=2){
+        const rr=await fetch(`https://api.spotify.com/v1/search?type=artist&limit=10&q=${encodeURIComponent(q)}`,{headers:{Authorization:`Bearer ${st}`}});
+        if(rr.ok){
+          const d:any=await rr.json(); const items=d.artists?.items||[];
+          const norm=(v:string)=>v.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^\p{L}\p{N}\s]/gu,'').replace(/\s+/g,' ').trim();
+          const exact=items.filter((a:any)=>norm(String(a.name||''))===norm(q));
+          if(exact.length===1){
+            const a=exact[0];
+            await pool.query(`insert into artist_platform_profiles(artist_id,platform_id,profile_mode,profile_url,external_artist_id,mapping_status,notes) values($1,$2,'EXISTING',$3,$4,'PENDING',$5) on conflict(artist_id,platform_id) do update set profile_mode='EXISTING',profile_url=excluded.profile_url,external_artist_id=excluded.external_artist_id,mapping_status='PENDING',updated_at=now()`,[artist.id,spotify.id,a.external_urls?.spotify||null,a.id,'Identificado automaticamente no Spotify; aguarda confirmação.']);
+            discovered++;
+          } else if(items.length) review++;
+        }
+      }
+    }
+    await audit(req.user!.id,'ARTIST_PLATFORM_PROFILES_AUTO_DISCOVERED','ARTIST',artist.id,{discovered,review});
+    res.json({ok:true,discovered,review,message:discovered?`${discovered} perfil(is) identificado(s) automaticamente. Os restantes ficam a verificar.`:'Nenhum perfil pôde ser confirmado automaticamente com as integrações disponíveis. A BaBuLo não pede links individuais.'});
+  }catch(e:any){console.error('Auto discover artist profiles:',e);res.status(502).json({error:e?.message||'Não foi possível identificar os perfis automaticamente.'});}
+});
+
 app.put('/api/artists/me/platform-profiles/:platformId',auth,artistOnly,async(req:AuthedRequest,res)=>{
   const {profileMode='NEW',profileUrl='',externalArtistId='',notes=''}=req.body||{};
   if(!['NEW','EXISTING'].includes(String(profileMode))) return res.status(400).json({error:'Modo de perfil inválido'});
