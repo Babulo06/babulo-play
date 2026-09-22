@@ -1986,7 +1986,7 @@ app.post('/api/artists/me/platform-profiles/auto-discover',auth,artistOnly,async
           const externalArtistId=String(x.externalArtistId||x.id||'').trim();
           const profileUrl=String(x.profileUrl||x.url||'').trim();
           if(!externalArtistId&&!profileUrl) continue;
-          await pool.query(`insert into artist_platform_profiles(artist_id,platform_id,profile_mode,profile_url,external_artist_id,mapping_status,notes) values($1,$2,'EXISTING',$3,$4,'PENDING',$5) on conflict(artist_id,platform_id) do update set profile_mode='EXISTING',profile_url=excluded.profile_url,external_artist_id=excluded.external_artist_id,mapping_status='PENDING',updated_at=now()`,[artist.id,p.id,profileUrl||null,externalArtistId||null,'Identificado automaticamente; aguarda confirmação oficial.']);
+          await pool.query(`insert into artist_platform_profiles(artist_id,platform_id,profile_mode,profile_url,external_artist_id,mapping_status,notes) values($1,$2,'EXISTING',$3,$4,'PENDING',$5) on conflict(artist_id,platform_id) do update set profile_mode='EXISTING',profile_url=excluded.profile_url,external_artist_id=excluded.external_artist_id,mapping_status=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then 'VERIFIED' else 'PENDING' end,verified_by=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then artist_platform_profiles.verified_by else null end,verified_at=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then artist_platform_profiles.verified_at else null end,updated_at=now()`,[artist.id,p.id,profileUrl||null,externalArtistId||null,'Identificado automaticamente; aguarda confirmação oficial.']);
           discovered++;
         }
       } else review++;
@@ -2003,7 +2003,7 @@ app.post('/api/artists/me/platform-profiles/auto-discover',auth,artistOnly,async
           const exact=items.filter((a:any)=>norm(String(a.name||''))===norm(q));
           if(exact.length===1){
             const a=exact[0];
-            await pool.query(`insert into artist_platform_profiles(artist_id,platform_id,profile_mode,profile_url,external_artist_id,mapping_status,notes) values($1,$2,'EXISTING',$3,$4,'PENDING',$5) on conflict(artist_id,platform_id) do update set profile_mode='EXISTING',profile_url=excluded.profile_url,external_artist_id=excluded.external_artist_id,mapping_status='PENDING',updated_at=now()`,[artist.id,spotify.id,a.external_urls?.spotify||null,a.id,'Identificado automaticamente no Spotify; aguarda confirmação.']);
+            await pool.query(`insert into artist_platform_profiles(artist_id,platform_id,profile_mode,profile_url,external_artist_id,mapping_status,notes) values($1,$2,'EXISTING',$3,$4,'PENDING',$5) on conflict(artist_id,platform_id) do update set profile_mode='EXISTING',profile_url=excluded.profile_url,external_artist_id=excluded.external_artist_id,mapping_status=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then 'VERIFIED' else 'PENDING' end,verified_by=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then artist_platform_profiles.verified_by else null end,verified_at=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then artist_platform_profiles.verified_at else null end,updated_at=now()`,[artist.id,spotify.id,a.external_urls?.spotify||null,a.id,'Identificado automaticamente no Spotify; aguarda confirmação.']);
             discovered++;
           } else if(items.length) review++;
         }
@@ -2027,6 +2027,40 @@ app.put('/api/artists/me/platform-profiles/:platformId',auth,artistOnly,async(re
   await audit(req.user!.id,'ARTIST_PLATFORM_PROFILE_SAVED','ARTIST_PLATFORM_PROFILE',q.rows[0].id,{platform:platform.code,profileMode});
   res.json({profile:q.rows[0],message:String(profileMode)==='EXISTING'?'Perfil guardado e enviado para validação de Artist Mapping.':'A BaBuLo criará/mappingeará um novo perfil quando o conector oficial estiver disponível.'});
 });
+// V10.4.28 — confirmação do perfil externo pelo próprio artista.
+// Esta confirmação é uma declaração do artista para o Artist Mapping operacional;
+// não substitui a verificação oficial da plataforma externa.
+app.post('/api/artists/me/platform-profiles/:platformId/confirm',auth,artistOnly,async(req:AuthedRequest,res)=>{
+  const artist=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];
+  if(!artist) return res.status(404).json({error:'Perfil de artista não encontrado'});
+  const p=(await pool.query(`select app.*,dp.code,dp.name from artist_platform_profiles app join distribution_platforms dp on dp.id=app.platform_id where app.artist_id=$1 and app.platform_id=$2 limit 1`,[artist.id,req.params.platformId])).rows[0];
+  if(!p) return res.status(404).json({error:'Perfil externo não encontrado'});
+  if(String(p.profile_mode)!=='EXISTING') return res.status(400).json({error:'A confirmação aplica-se a perfis externos existentes.'});
+  if(!String(p.profile_url||'').trim()&&!String(p.external_artist_id||'').trim()) return res.status(400).json({error:'Este perfil ainda não tem link ou ID externo.'});
+  const q=await pool.query(`update artist_platform_profiles set mapping_status='VERIFIED',verified_by=$1,verified_at=now(),notes=coalesce(nullif(notes,''),'') || case when coalesce(notes,'')='' then 'Confirmado pelo próprio artista.' else ' Confirmado pelo próprio artista.' end,updated_at=now() where id=$2 returning *`,[req.user!.id,p.id]);
+  // Liberta entregas que estavam bloqueadas apenas por este mapping.
+  await pool.query(`update distribution_deliveries set mapping_status='VERIFIED',status='READY',error_code=null,error_message=null,updated_at=now() where artist_profile_id=$1 and status='MAPPING_REQUIRED'`,[p.id]);
+  // Se todas as entregas de um pedido estiverem prontas, o pedido volta a READY.
+  await pool.query(`update distribution_orders o set status='READY',updated_at=now()
+    where o.id in (select distinct d.order_id from distribution_deliveries d where d.artist_profile_id=$1)
+      and not exists (select 1 from distribution_deliveries d2 where d2.order_id=o.id and d2.status='MAPPING_REQUIRED')`,[p.id]);
+  await audit(req.user!.id,'ARTIST_PLATFORM_PROFILE_CONFIRMED','ARTIST_PLATFORM_PROFILE',p.id,{platform:p.code,method:'ARTIST_SELF_CONFIRMATION'});
+  res.json({ok:true,profile:q.rows[0],message:`Perfil ${p.name} confirmado por ti. Agora este perfil pode ser usado no Artist Mapping.`});
+});
+
+app.post('/api/artists/me/platform-profiles/:platformId/reject',auth,artistOnly,async(req:AuthedRequest,res)=>{
+  const artist=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];
+  if(!artist) return res.status(404).json({error:'Perfil de artista não encontrado'});
+  const p=(await pool.query(`select app.*,dp.code,dp.name from artist_platform_profiles app join distribution_platforms dp on dp.id=app.platform_id where app.artist_id=$1 and app.platform_id=$2 limit 1`,[artist.id,req.params.platformId])).rows[0];
+  if(!p) return res.status(404).json({error:'Perfil externo não encontrado'});
+  const reason=String(req.body?.reason||'Perfil rejeitado pelo artista').trim()||'Perfil rejeitado pelo artista';
+  const q=await pool.query(`update artist_platform_profiles set mapping_status='REJECTED',verified_by=$1,verified_at=now(),notes=$2,updated_at=now() where id=$3 returning *`,[req.user!.id,reason,p.id]);
+  await pool.query(`update distribution_deliveries set mapping_status='REJECTED',status='MAPPING_REQUIRED',error_code='ARTIST_MAPPING_REJECTED',error_message=$1,updated_at=now() where artist_profile_id=$2`,[reason,p.id]);
+  await pool.query(`update distribution_orders o set status='MAPPING_REQUIRED',updated_at=now() where o.id in (select distinct d.order_id from distribution_deliveries d where d.artist_profile_id=$1)`,[p.id]);
+  await audit(req.user!.id,'ARTIST_PLATFORM_PROFILE_REJECTED','ARTIST_PLATFORM_PROFILE',p.id,{platform:p.code,reason});
+  res.json({ok:true,profile:q.rows[0],message:`Perfil ${p.name} rejeitado. Podes associar outro perfil.`});
+});
+
 app.delete('/api/artists/me/platform-profiles/:platformId',auth,artistOnly,async(req:AuthedRequest,res)=>{
   const artist=(await pool.query('select id from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];
   await pool.query('delete from artist_platform_profiles where artist_id=$1 and platform_id=$2',[artist?.id,req.params.platformId]);

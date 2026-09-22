@@ -1,0 +1,5 @@
+-- V10.4.28 — Artist Mapping: confirmação/rejeição pelo próprio artista
+-- O estado VERIFIED continua a ser usado pelo motor de distribuição, mas a confirmação
+-- do artista é uma declaração operacional e não uma verificação oficial da DSP.
+-- Não são necessárias alterações de schema: artist_platform_profiles já suporta
+-- PENDING / VERIFIED / REJECTED / NOT_FOUND e verified_by / verified_at.
