@@ -100,7 +100,7 @@ async function ensureDatabaseSchema() {
       .trim();
     await pool.query(schema);
 
-    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql', '024_rights_splits_payouts.sql', '025_rights_matching_scan.sql', '026_existing_artist_email_verification.sql', '027_admin_payroll_attendance.sql', '028_admin_attendance_workflow.sql', '029_admin_attendance_notifications.sql', '030_admin_advertising_workflow.sql', '031_account_management_approvals.sql', '032_admin_internal_email_verification.sql', '033_artist_mapping_distribution.sql', '034_distribution_engine_jobs.sql', '035_ddex_delivery.sql', '036_distribution_partner_connectors.sql','037_artist_profile_sync.sql']) {
+    for (const file of ['001_preflight_isrc.sql', '002_rights_approval.sql', '003_royalties_ledger.sql', '004_payment_engine.sql', '005_distribution_engine.sql', '006_track_metadata.sql', '007_track_order.sql', '008_release_payment.sql', '009_v103_media_distribution.sql', '010_wallet_release_payments.sql', '011_artist_idle_sessions.sql', '012_artist_auth_sessions.sql', '013_v104_analytics.sql', '014_owner_bootstrap.sql', '015_admin_user_management.sql', '016_admin_permissions.sql', '017_secure_auth.sql', '018_admin_profile.sql', '019_financial_approvals.sql', '020_owner_finance_control.sql', '021_owner_advertising.sql', '022_admin_profile_extended.sql', '023_admin_module_permissions.sql', '024_rights_splits_payouts.sql', '025_rights_matching_scan.sql', '026_existing_artist_email_verification.sql', '027_admin_payroll_attendance.sql', '028_admin_attendance_workflow.sql', '029_admin_attendance_notifications.sql', '030_admin_advertising_workflow.sql', '031_account_management_approvals.sql', '032_admin_internal_email_verification.sql', '033_artist_mapping_distribution.sql', '034_distribution_engine_jobs.sql', '035_ddex_delivery.sql', '036_distribution_partner_connectors.sql','037_artist_profile_sync.sql','038_artist_platform_profile_visual_identity.sql']) {
       const migrationPath = path.join(migrationsDir, file);
       if (!fs.existsSync(migrationPath)) throw new Error(`Migração não encontrada: ${migrationPath}`);
       await pool.query(fs.readFileSync(migrationPath, 'utf8'));
@@ -1965,19 +1965,41 @@ app.get('/api/artists/me/platform-profiles',auth,artistOnly,async(req:AuthedRequ
   const artist=(await pool.query('select id,stage_name from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];
   if(!artist) return res.status(404).json({error:'Perfil de artista não encontrado'});
   const platforms=(await pool.query(`select id,code,name,active from distribution_platforms where active=true order by name`)).rows.filter((p:any)=>!SOCIAL_CONTENT_DESTINATION_CODES.has(String(p.code||'').toUpperCase()));
-  const profiles=(await pool.query(`select app.*,p.code,p.name from artist_platform_profiles app join distribution_platforms p on p.id=app.platform_id where app.artist_id=$1 order by p.name`,[artist.id])).rows;
+  let profiles=(await pool.query(`select app.*,p.code,p.name from artist_platform_profiles app join distribution_platforms p on p.id=app.platform_id where app.artist_id=$1 order by p.name`,[artist.id])).rows;
+  for(const profile of profiles){ if(String(profile.code).toUpperCase()==='SPOTIFY' && profile.external_artist_id && !profile.profile_image_url){ await enrichSpotifyProfileIdentity(profile); } }
+  profiles=(await pool.query(`select app.*,p.code,p.name from artist_platform_profiles app join distribution_platforms p on p.id=app.platform_id where app.artist_id=$1 order by p.name`,[artist.id])).rows;
   res.json({artist,platforms,profiles});
 });
+async function enrichSpotifyProfileIdentity(profile:any){
+  if(String(profile?.platform_code||profile?.code||'').toUpperCase()!=='SPOTIFY') return profile;
+  const artistId=String(profile?.external_artist_id||'').trim();
+  if(!artistId) return profile;
+  try{
+    const token=await spotifyToken();
+    if(!token) return profile;
+    const r=await fetch(`https://api.spotify.com/v1/artists/${encodeURIComponent(artistId)}`,{headers:{Authorization:`Bearer ${token}`}});
+    if(!r.ok) return profile;
+    const a:any=await r.json();
+    const image=a.images?.[0]?.url||null;
+    const url=a.external_urls?.spotify||profile.profile_url||null;
+    await pool.query(`update artist_platform_profiles set profile_image_url=$1,external_artist_name=$2,profile_url=coalesce($3,profile_url),updated_at=now() where id=$4`,[image,a.name||null,url,profile.id]);
+    return {...profile,profile_image_url:image,external_artist_name:a.name||profile.external_artist_name,profile_url:url};
+  }catch{return profile;}
+}
+
 app.post('/api/artists/me/platform-profiles/auto-discover',auth,artistOnly,async(req:AuthedRequest,res)=>{
   try{
     const artist=(await pool.query('select id,stage_name from artists where user_id=$1 limit 1',[req.user!.id])).rows[0];
     if(!artist) return res.status(404).json({error:'Perfil de artista não encontrado'});
     const platforms=(await pool.query(`select id,code,name,active from distribution_platforms where active=true order by name`)).rows.filter((p:any)=>!SOCIAL_CONTENT_DESTINATION_CODES.has(String(p.code||'').toUpperCase()));
     let discovered=0,review=0;
+    const existingProfiles=(await pool.query(`select app.id,app.platform_id,app.profile_mode,app.mapping_status,app.external_artist_id,app.profile_url,app.profile_image_url,app.external_artist_name,p.code platform_code,p.name platform_name from artist_platform_profiles app join distribution_platforms p on p.id=app.platform_id where app.artist_id=$1 order by p.name`,[artist.id])).rows;
+    const confirmedProfiles=existingProfiles.filter((x:any)=>String(x.mapping_status).toUpperCase()==='VERIFIED');
+    const discoverySeeds=existingProfiles.filter((x:any)=>String(x.profile_mode).toUpperCase()==='EXISTING' && (String(x.profile_url||'').trim()||String(x.external_artist_id||'').trim())).map((x:any)=>({platformCode:x.platform_code,platformName:x.platform_name,externalArtistId:x.external_artist_id||null,profileUrl:x.profile_url||null,profileImageUrl:x.profile_image_url||null,externalArtistName:x.external_artist_name||null,mappingStatus:x.mapping_status}));
     const discoveryUrl=String(process.env.ARTIST_DISCOVERY_URL||'').trim();
     if(discoveryUrl){
       const token=String(process.env.ARTIST_DISCOVERY_TOKEN||'');
-      const rr=await fetch(discoveryUrl,{method:'POST',headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},body:JSON.stringify({artist:{id:artist.id,stageName:artist.stage_name},platforms:platforms.map((p:any)=>({code:p.code,name:p.name}))})});
+      const rr=await fetch(discoveryUrl,{method:'POST',headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},body:JSON.stringify({artist:{id:artist.id,stageName:artist.stage_name,legalName:(await pool.query('select legal_name from artists where id=$1',[artist.id])).rows[0]?.legal_name||null,country:(await pool.query('select country from artists where id=$1',[artist.id])).rows[0]?.country||null,city:(await pool.query('select city from artists where id=$1',[artist.id])).rows[0]?.city||null},seedProfiles:discoverySeeds,confirmedProfiles:confirmedProfiles.map((x:any)=>({platformCode:x.platform_code,externalArtistId:x.external_artist_id||null,profileUrl:x.profile_url||null,profileImageUrl:x.profile_image_url||null,externalArtistName:x.external_artist_name||null})),platforms:platforms.map((p:any)=>({code:p.code,name:p.name}))})});
       if(rr.ok){
         const d:any=await rr.json();
         for(const x of Array.isArray(d.profiles)?d.profiles:[]){
@@ -1985,8 +2007,10 @@ app.post('/api/artists/me/platform-profiles/auto-discover',auth,artistOnly,async
           if(!p) continue;
           const externalArtistId=String(x.externalArtistId||x.id||'').trim();
           const profileUrl=String(x.profileUrl||x.url||'').trim();
+          const profileImageUrl=String(x.profileImageUrl||x.image||x.imageUrl||'').trim();
+          const externalArtistName=String(x.externalArtistName||x.name||'').trim();
           if(!externalArtistId&&!profileUrl) continue;
-          await pool.query(`insert into artist_platform_profiles(artist_id,platform_id,profile_mode,profile_url,external_artist_id,mapping_status,notes) values($1,$2,'EXISTING',$3,$4,'PENDING',$5) on conflict(artist_id,platform_id) do update set profile_mode='EXISTING',profile_url=excluded.profile_url,external_artist_id=excluded.external_artist_id,mapping_status=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then 'VERIFIED' else 'PENDING' end,verified_by=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then artist_platform_profiles.verified_by else null end,verified_at=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then artist_platform_profiles.verified_at else null end,updated_at=now()`,[artist.id,p.id,profileUrl||null,externalArtistId||null,'Identificado automaticamente; aguarda confirmação oficial.']);
+          await pool.query(`insert into artist_platform_profiles(artist_id,platform_id,profile_mode,profile_url,external_artist_id,profile_image_url,external_artist_name,mapping_status,notes) values($1,$2,'EXISTING',$3,$4,$5,$6,'PENDING',$7) on conflict(artist_id,platform_id) do update set profile_mode='EXISTING',profile_url=excluded.profile_url,external_artist_id=excluded.external_artist_id,profile_image_url=excluded.profile_image_url,external_artist_name=excluded.external_artist_name,mapping_status=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then 'VERIFIED' else 'PENDING' end,verified_by=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then artist_platform_profiles.verified_by else null end,verified_at=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then artist_platform_profiles.verified_at else null end,updated_at=now()`,[artist.id,p.id,profileUrl||null,externalArtistId||null,profileImageUrl||null,externalArtistName||null,'Identificado automaticamente; usa o perfil central e os perfis já encontrados como referência; aguarda confirmação.']);
           discovered++;
         }
       } else review++;
@@ -2003,7 +2027,7 @@ app.post('/api/artists/me/platform-profiles/auto-discover',auth,artistOnly,async
           const exact=items.filter((a:any)=>norm(String(a.name||''))===norm(q));
           if(exact.length===1){
             const a=exact[0];
-            await pool.query(`insert into artist_platform_profiles(artist_id,platform_id,profile_mode,profile_url,external_artist_id,mapping_status,notes) values($1,$2,'EXISTING',$3,$4,'PENDING',$5) on conflict(artist_id,platform_id) do update set profile_mode='EXISTING',profile_url=excluded.profile_url,external_artist_id=excluded.external_artist_id,mapping_status=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then 'VERIFIED' else 'PENDING' end,verified_by=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then artist_platform_profiles.verified_by else null end,verified_at=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then artist_platform_profiles.verified_at else null end,updated_at=now()`,[artist.id,spotify.id,a.external_urls?.spotify||null,a.id,'Identificado automaticamente no Spotify; aguarda confirmação.']);
+            await pool.query(`insert into artist_platform_profiles(artist_id,platform_id,profile_mode,profile_url,external_artist_id,profile_image_url,external_artist_name,mapping_status,notes) values($1,$2,'EXISTING',$3,$4,$5,$6,'PENDING',$7) on conflict(artist_id,platform_id) do update set profile_mode='EXISTING',profile_url=excluded.profile_url,external_artist_id=excluded.external_artist_id,profile_image_url=excluded.profile_image_url,external_artist_name=excluded.external_artist_name,mapping_status=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then 'VERIFIED' else 'PENDING' end,verified_by=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then artist_platform_profiles.verified_by else null end,verified_at=case when artist_platform_profiles.mapping_status='VERIFIED' and (coalesce(artist_platform_profiles.external_artist_id,'')=coalesce(excluded.external_artist_id,'') or coalesce(artist_platform_profiles.profile_url,'')=coalesce(excluded.profile_url,'')) then artist_platform_profiles.verified_at else null end,updated_at=now()`,[artist.id,spotify.id,a.external_urls?.spotify||null,a.id,a.images?.[0]?.url||null,a.name||null,'Identificado automaticamente no Spotify; usa nome, ID e imagem como referência para a varredura das restantes plataformas.']);
             discovered++;
           } else if(items.length) review++;
         }
@@ -2014,6 +2038,12 @@ app.post('/api/artists/me/platform-profiles/auto-discover',auth,artistOnly,async
   }catch(e:any){console.error('Auto discover artist profiles:',e);res.status(502).json({error:e?.message||'Não foi possível identificar os perfis automaticamente.'});}
 });
 
+function extractSpotifyArtistId(value:string){
+  const v=String(value||'').trim();
+  const m=v.match(/spotify\.com\/(?:intl-[^/]+\/)?artist\/([A-Za-z0-9]+)/i);
+  return m?.[1]||'';
+}
+
 app.put('/api/artists/me/platform-profiles/:platformId',auth,artistOnly,async(req:AuthedRequest,res)=>{
   const {profileMode='NEW',profileUrl='',externalArtistId='',notes=''}=req.body||{};
   if(!['NEW','EXISTING'].includes(String(profileMode))) return res.status(400).json({error:'Modo de perfil inválido'});
@@ -2022,8 +2052,24 @@ app.put('/api/artists/me/platform-profiles/:platformId',auth,artistOnly,async(re
   if(!artist||!platform) return res.status(404).json({error:'Artista ou plataforma não encontrada'});
   if(SOCIAL_CONTENT_DESTINATION_CODES.has(String(platform.code||'').toUpperCase())) return res.status(400).json({error:'Esta plataforma social não utiliza perfil de artista criado pela BaBuLo. A música será tratada como destino de conteúdo/biblioteca.'});
   if(String(profileMode)==='EXISTING'&&!String(profileUrl||'').trim()&&!String(externalArtistId||'').trim()) return res.status(400).json({error:'Para um perfil existente, informe o link do perfil ou o ID oficial do artista.'});
+  let normalizedExternalArtistId=String(externalArtistId||'').trim();
+  let externalArtistName:string|null=null;
+  let profileImageUrl:string|null=null;
+  let normalizedProfileUrl=String(profileUrl||'').trim()||null;
+  if(String(platform.code).toUpperCase()==='SPOTIFY' && String(profileMode)==='EXISTING'){
+    if(!normalizedExternalArtistId && normalizedProfileUrl) normalizedExternalArtistId=extractSpotifyArtistId(normalizedProfileUrl);
+    if(normalizedExternalArtistId){
+      try{
+        const tokenSpotify=await spotifyToken();
+        if(tokenSpotify){
+          const sr=await fetch(`https://api.spotify.com/v1/artists/${encodeURIComponent(normalizedExternalArtistId)}`,{headers:{Authorization:`Bearer ${tokenSpotify}`}});
+          if(sr.ok){ const sa:any=await sr.json(); externalArtistName=sa.name||null; profileImageUrl=sa.images?.[0]?.url||null; normalizedProfileUrl=sa.external_urls?.spotify||normalizedProfileUrl; }
+        }
+      }catch{}
+    }
+  }
   const status=String(profileMode)==='NEW'?'PENDING':'PENDING';
-  const q=await pool.query(`insert into artist_platform_profiles(artist_id,platform_id,profile_mode,profile_url,external_artist_id,mapping_status,notes) values($1,$2,$3,$4,$5,$6,$7) on conflict(artist_id,platform_id) do update set profile_mode=excluded.profile_mode,profile_url=excluded.profile_url,external_artist_id=excluded.external_artist_id,mapping_status=excluded.mapping_status,verified_by=null,verified_at=null,notes=excluded.notes,updated_at=now() returning *`,[artist.id,platform.id,String(profileMode),String(profileUrl||'').trim()||null,String(externalArtistId||'').trim()||null,status,String(notes||'').trim()||null]);
+  const q=await pool.query(`insert into artist_platform_profiles(artist_id,platform_id,profile_mode,profile_url,external_artist_id,profile_image_url,external_artist_name,mapping_status,notes) values($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict(artist_id,platform_id) do update set profile_mode=excluded.profile_mode,profile_url=excluded.profile_url,external_artist_id=excluded.external_artist_id,profile_image_url=coalesce(excluded.profile_image_url,artist_platform_profiles.profile_image_url),external_artist_name=coalesce(excluded.external_artist_name,artist_platform_profiles.external_artist_name),mapping_status=excluded.mapping_status,verified_by=null,verified_at=null,notes=excluded.notes,updated_at=now() returning *`,[artist.id,platform.id,String(profileMode),normalizedProfileUrl,normalizedExternalArtistId||null,profileImageUrl,externalArtistName,status,String(notes||'').trim()||null]);
   await audit(req.user!.id,'ARTIST_PLATFORM_PROFILE_SAVED','ARTIST_PLATFORM_PROFILE',q.rows[0].id,{platform:platform.code,profileMode});
   res.json({profile:q.rows[0],message:String(profileMode)==='EXISTING'?'Perfil guardado e enviado para validação de Artist Mapping.':'A BaBuLo criará/mappingeará um novo perfil quando o conector oficial estiver disponível.'});
 });
@@ -2037,6 +2083,7 @@ app.post('/api/artists/me/platform-profiles/:platformId/confirm',auth,artistOnly
   if(!p) return res.status(404).json({error:'Perfil externo não encontrado'});
   if(String(p.profile_mode)!=='EXISTING') return res.status(400).json({error:'A confirmação aplica-se a perfis externos existentes.'});
   if(!String(p.profile_url||'').trim()&&!String(p.external_artist_id||'').trim()) return res.status(400).json({error:'Este perfil ainda não tem link ou ID externo.'});
+  if(String(p.code).toUpperCase()==='SPOTIFY' && p.external_artist_id){ await enrichSpotifyProfileIdentity(p); }
   const q=await pool.query(`update artist_platform_profiles set mapping_status='VERIFIED',verified_by=$1,verified_at=now(),notes=coalesce(nullif(notes,''),'') || case when coalesce(notes,'')='' then 'Confirmado pelo próprio artista.' else ' Confirmado pelo próprio artista.' end,updated_at=now() where id=$2 returning *`,[req.user!.id,p.id]);
   // Liberta entregas que estavam bloqueadas apenas por este mapping.
   await pool.query(`update distribution_deliveries set mapping_status='VERIFIED',status='READY',error_code=null,error_message=null,updated_at=now() where artist_profile_id=$1 and status='MAPPING_REQUIRED'`,[p.id]);

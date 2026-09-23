@@ -1,6 +1,6 @@
 {
   "name": "babulo-play",
-  "version": "0.10.4.27",
+  "version": "0.10.4.29",
   "private": true,
   "description": "BaBuLo Play monorepo — streaming, distribuição e promoção musical",
   "workspaces": [
